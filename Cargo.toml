@@ -1,0 +1,63 @@
+[package]
+name = "a4aa"
+description = "Adapter-For-All-Agents — unified agent client adapter: process supervision, stdio/PTY transports, JSON-RPC and ACP lanes, CLI drivers, and a stdio sidecar for hosts in other languages."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Adapter-For-All-Agents"
+readme = "README.md"
+keywords = ["agent", "acp", "json-rpc", "pty", "subprocess"]
+categories = ["asynchronous", "network-programming", "os"]
+
+[lib]
+name = "a4aa"
+path = "src/lib.rs"
+
+[[bin]]
+name = "a4aa"
+path = "src/bin/a4aa.rs"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# ACP lane: the official Agent Client Protocol implementation. Executor
+# agnostic; driven on the caller's tokio runtime.
+agent-client-protocol = "3.3.0"
+
+# Cross-platform supervised process trees (process groups on Unix, Job
+# Objects on Windows) with a tokio-facing child handle.
+command-group = { version = "5.0.1", features = ["with-tokio"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Dialect fixtures used by the mechanism tests: the workspace's own
+# per-agent descriptor crates exercise the engine end-to-end.
+a4aa-codex = { path = "crates/a4aa-codex" }
+a4aa-claude = { path = "crates/a4aa-claude" }
+a4aa-cursor = { path = "crates/a4aa-cursor" }
+a4aa-gemini = { path = "crates/a4aa-gemini" }
+a4aa-pi = { path = "crates/a4aa-pi" }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"

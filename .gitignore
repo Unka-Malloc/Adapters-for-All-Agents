@@ -1,0 +1,29 @@
+# Build output
+/target/
+build/
+build-*/
+dist/
+out/
+coverage/
+.cache/
+*.log
+*.tmp
+
+# Temporary reports and plans
+docs/plans/
+docs/reports/
+tmp/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo

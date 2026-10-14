@@ -1,0 +1,44 @@
+[package]
+name = "a4aa-dialects"
+description = "Convenience registry over the a4aa-<agent> dialect crates: name lookup and full enumeration for multi-agent hosts. Single-agent hosts should depend on the individual a4aa-<agent> crate directly instead."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Adapter-For-All-Agents"
+keywords = ["a4aa", "agent", "dialect", "registry", "profile"]
+categories = ["asynchronous"]
+
+[lib]
+name = "a4aa_dialects"
+path = "src/lib.rs"
+
+[dependencies]
+a4aa = { path = "../..", version = "0.1.0" }
+a4aa-antigravity = { path = "../a4aa-antigravity", version = "0.1.0" }
+a4aa-augment = { path = "../a4aa-augment", version = "0.1.0" }
+a4aa-claude = { path = "../a4aa-claude", version = "0.1.0" }
+a4aa-code-buddy = { path = "../a4aa-code-buddy", version = "0.1.0" }
+a4aa-codex = { path = "../a4aa-codex", version = "0.1.0" }
+a4aa-command-code = { path = "../a4aa-command-code", version = "0.1.0" }
+a4aa-craft-agent = { path = "../a4aa-craft-agent", version = "0.1.0" }
+a4aa-cursor = { path = "../a4aa-cursor", version = "0.1.0" }
+a4aa-devin = { path = "../a4aa-devin", version = "0.1.0" }
+a4aa-dsh = { path = "../a4aa-dsh", version = "0.1.0" }
+a4aa-factory = { path = "../a4aa-factory", version = "0.1.0" }
+a4aa-gemini = { path = "../a4aa-gemini", version = "0.1.0" }
+a4aa-grok = { path = "../a4aa-grok", version = "0.1.0" }
+a4aa-hermes = { path = "../a4aa-hermes", version = "0.1.0" }
+a4aa-iflow = { path = "../a4aa-iflow", version = "0.1.0" }
+a4aa-kilo-code = { path = "../a4aa-kilo-code", version = "0.1.0" }
+a4aa-kimi-code = { path = "../a4aa-kimi-code", version = "0.1.0" }
+a4aa-kiro = { path = "../a4aa-kiro", version = "0.1.0" }
+a4aa-lingma = { path = "../a4aa-lingma", version = "0.1.0" }
+a4aa-open-claw = { path = "../a4aa-open-claw", version = "0.1.0" }
+a4aa-opencode = { path = "../a4aa-opencode", version = "0.1.0" }
+a4aa-pi = { path = "../a4aa-pi", version = "0.1.0" }
+a4aa-qoder = { path = "../a4aa-qoder", version = "0.1.0" }
+a4aa-qwen = { path = "../a4aa-qwen", version = "0.1.0" }
+a4aa-roo-code = { path = "../a4aa-roo-code", version = "0.1.0" }
+a4aa-trae = { path = "../a4aa-trae", version = "0.1.0" }
+a4aa-windsurf = { path = "../a4aa-windsurf", version = "0.1.0" }
