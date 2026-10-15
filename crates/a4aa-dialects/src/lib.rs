@@ -17,9 +17,7 @@ use a4aa::Dialect;
 /// Names match each adapter's `Dialect::id`.
 static DIALECTS: &[(&str, &Dialect)] = &[
     ("antigravity", a4aa_antigravity::dialect()),
-    ("augment", a4aa_augment::dialect()),
     ("claude", a4aa_claude::dialect()),
-    ("codebuddy", a4aa_code_buddy::dialect()),
     ("codex", a4aa_codex::dialect()),
     ("commandcode", a4aa_command_code::dialect()),
     ("craftagent", a4aa_craft_agent::dialect()),
@@ -30,18 +28,12 @@ static DIALECTS: &[(&str, &Dialect)] = &[
     ("gemini", a4aa_gemini::dialect()),
     ("grok", a4aa_grok::dialect()),
     ("hermes", a4aa_hermes::dialect()),
-    ("iflow", a4aa_iflow::dialect()),
     ("kilocode", a4aa_kilo_code::dialect()),
     ("kimicode", a4aa_kimi_code::dialect()),
     ("kiro", a4aa_kiro::dialect()),
-    ("lingma", a4aa_lingma::dialect()),
     ("openclaw", a4aa_open_claw::dialect()),
     ("opencode", a4aa_opencode::dialect()),
     ("pi", a4aa_pi::dialect()),
-    ("qoder", a4aa_qoder::dialect()),
-    ("qwen", a4aa_qwen::dialect()),
-    ("roocode", a4aa_roo_code::dialect()),
-    ("trae", a4aa_trae::dialect()),
 ];
 
 /// Look a dialect up by id (`"codex"`, `"pi"`, `"generic"`, ...). Returns

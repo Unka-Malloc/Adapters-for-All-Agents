@@ -30,21 +30,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "a4aa-augment"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
 name = "a4aa-claude"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-code-buddy"
 version = "0.1.0"
 dependencies = [
  "a4aa",
@@ -91,9 +77,7 @@ version = "0.1.0"
 dependencies = [
  "a4aa",
  "a4aa-antigravity",
- "a4aa-augment",
  "a4aa-claude",
- "a4aa-code-buddy",
  "a4aa-codex",
  "a4aa-command-code",
  "a4aa-craft-agent",
@@ -104,18 +88,12 @@ dependencies = [
  "a4aa-gemini",
  "a4aa-grok",
  "a4aa-hermes",
- "a4aa-iflow",
  "a4aa-kilo-code",
  "a4aa-kimi-code",
  "a4aa-kiro",
- "a4aa-lingma",
  "a4aa-open-claw",
  "a4aa-opencode",
  "a4aa-pi",
- "a4aa-qoder",
- "a4aa-qwen",
- "a4aa-roo-code",
- "a4aa-trae",
 ]
 
 [[package]]
@@ -154,13 +132,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "a4aa-iflow"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
 name = "a4aa-kilo-code"
 version = "0.1.0"
 dependencies = [
@@ -182,13 +153,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "a4aa-lingma"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
 name = "a4aa-open-claw"
 version = "0.1.0"
 dependencies = [
@@ -204,34 +168,6 @@ dependencies = [
 
 [[package]]
 name = "a4aa-pi"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-qoder"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-qwen"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-roo-code"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-trae"
 version = "0.1.0"
 dependencies = [
  "a4aa",
