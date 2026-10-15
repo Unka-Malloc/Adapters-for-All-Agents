@@ -175,12 +175,18 @@ impl SidecarDelegate {
             message: format!("invalid spec: {error}"),
             data: None,
         })?;
-        // A remote sidecar client may not hand the agent every host
-        // variable: inheritAll is a trusted-local-launcher option only.
-        if matches!(spec.command.env, a4aa::EnvPolicy::InheritAll { .. }) {
+        // A remote sidecar client may not read host variables by name:
+        // InheritAll is a trusted-local-launcher option, and per-name
+        // inheritance or `hostEnv` indirections are confined to the spawn
+        // allowlist — otherwise any client could exfiltrate host
+        // credentials through the agent's environment.
+        if !env_admitted_over_sidecar(&spec.command.env) {
             return Err(RpcErrorObject {
                 code: -32602,
-                message: "inheritAll env policy is not admitted over the sidecar".into(),
+                message: "env policy not admitted over the sidecar: inheritAll, \
+                          non-allowlisted inherit names, hostEnv outside the allowlist, \
+                          and secret references are refused"
+                    .into(),
                 data: None,
             });
         }
@@ -599,4 +605,24 @@ fn fixture_agent() -> i32 {
         }
     }
     0
+}
+
+/// Whether a spec's env policy may cross the sidecar boundary. The remote
+/// client is a same-uid peer we must not hand host state to: only the
+/// documented spawn allowlist may be inherited by name.
+fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy) -> bool {
+    let allowed = |name: &str| a4aa::env::INHERITED_ENV.contains(&name);
+    match env {
+        a4aa::EnvPolicy::InheritAll { .. } => false,
+        a4aa::EnvPolicy::Sanitized { inherit, set } => {
+            inherit.iter().all(|name| allowed(name))
+                && set.values().all(|value| match value {
+                    a4aa::EnvValue::Literal(_) => true,
+                    a4aa::EnvValue::Source(a4aa::EnvSource::HostEnv { host_env }) => {
+                        allowed(host_env)
+                    }
+                    a4aa::EnvValue::Source(a4aa::EnvSource::Secret { .. }) => false,
+                })
+        }
+    }
 }
