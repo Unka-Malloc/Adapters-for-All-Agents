@@ -294,16 +294,19 @@ fn emit_hooks(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) 
                 match map.iter().find(|(event, _)| *event == hook.event) {
                     Some((_, name)) => {
                         any = true;
+                        let mut entry = serde_json::json!({
+                            "command": hook.command,
+                            "type": "command",
+                        });
+                        if let Some(timeout) = hook.timeout {
+                            entry["timeout"] = serde_json::json!(timeout);
+                        }
                         bundle
                             .entry(name.to_string())
                             .or_insert_with(|| serde_json::json!([]))
                             .as_array_mut()
                             .expect("bundle list")
-                            .push(serde_json::json!({
-                                "command": hook.command,
-                                "timeout": hook.timeout,
-                                "type": "command",
-                            }));
+                            .push(entry);
                         plan.report(item(hook), Support::Adapted, None);
                     }
                     None => plan.report(
@@ -433,13 +436,14 @@ fn emit_hooks(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) 
 fn claude_hook_fragment(hooks: &[&HookDecl]) -> serde_json::Value {
     let mut events = serde_json::Map::new();
     for hook in hooks {
-        let mut entry = serde_json::json!({
-            "hooks": [{
-                "type": "command",
-                "command": hook.command,
-                "timeout": hook.timeout,
-            }]
+        let mut command = serde_json::json!({
+            "type": "command",
+            "command": hook.command,
         });
+        if let Some(timeout) = hook.timeout {
+            command["timeout"] = serde_json::json!(timeout);
+        }
+        let mut entry = serde_json::json!({ "hooks": [command] });
         if let Some(matcher) = &hook.matcher {
             entry["matcher"] = serde_json::json!(matcher);
         }
@@ -669,12 +673,12 @@ fn emit_plugins(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan
                 Support::Unsupported,
                 Some("plugin installation is host-managed for this dialect"),
             ),
-            PluginSurface::ManifestFile { extension, .. } => match &plugin.source {
-                Some(source) if source.ends_with(extension) => plan.report(
-                    item,
-                    Support::Adapted,
-                    Some("host installs the referenced file under the plugin directory"),
-                ),
+            PluginSurface::ManifestFile { dir, extension } => match &plugin.source {
+                Some(source) if source.ends_with(extension) => {
+                    let note =
+                        format!("host installs {source} under {dir} (verbatim file, no rewrite)");
+                    plan.report(item, Support::Adapted, Some(&note));
+                }
                 _ => plan.report(
                     item,
                     Support::Unsupported,

@@ -191,19 +191,12 @@ pub struct MechanismSet {
 }
 
 impl HookEvent {
-    /// Kebab-case name — the report item suffix and the wire form.
-    pub fn kebab_name(self) -> &'static str {
-        match self {
-            HookEvent::SessionStart => "session-start",
-            HookEvent::SessionEnd => "session-end",
-            HookEvent::UserPromptSubmit => "user-prompt-submit",
-            HookEvent::PreToolUse => "pre-tool-use",
-            HookEvent::PostToolUse => "post-tool-use",
-            HookEvent::Stop => "stop",
-            HookEvent::SubagentStart => "subagent-start",
-            HookEvent::SubagentStop => "subagent-stop",
-            HookEvent::PermissionRequest => "permission-request",
-            HookEvent::Notification => "notification",
+    /// Kebab-case name — the report item suffix and the wire form. Derived
+    /// from the serde `kebab-case` rename so the two can never drift.
+    pub fn kebab_name(self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(name)) => name,
+            _ => unreachable!("unit variant serializes to its rename string"),
         }
     }
 }
@@ -242,10 +235,23 @@ impl MechanismSet {
             AdapterError::permanent("mechanism_malformed", "mechanisms/validate")
                 .with_detail(item.to_owned())
         };
+        // Names land inside artifact paths (`<dir>/<name>/SKILL.md`,
+        // `<name>.toml`): a separator, `..` or control byte would let a
+        // declaration escape the dialect's target directory.
+        let path_safe = |name: &str| {
+            !name.is_empty()
+                && name != ".."
+                && name != "."
+                && !name.contains(['/', '\\'])
+                && name.chars().all(|c| !c.is_control())
+        };
         let mut names = BTreeMap::new();
         for rule in &self.rules {
             if rule.name.trim().is_empty() || rule.content.trim().is_empty() {
                 return Err(malformed("rule requires a non-empty name and content"));
+            }
+            if !path_safe(&rule.name) {
+                return Err(malformed("rule name is not path-safe"));
             }
             if names.insert(format!("rules:{}", rule.name), ()).is_some() {
                 return Err(malformed("duplicate rule name"));
@@ -255,6 +261,9 @@ impl MechanismSet {
             if skill.name.trim().is_empty() || skill.content.trim().is_empty() {
                 return Err(malformed("skill requires a non-empty name and content"));
             }
+            if !path_safe(&skill.name) {
+                return Err(malformed("skill name is not path-safe"));
+            }
             if names.insert(format!("skills:{}", skill.name), ()).is_some() {
                 return Err(malformed("duplicate skill name"));
             }
@@ -262,6 +271,9 @@ impl MechanismSet {
         for command in &self.commands {
             if command.name.trim().is_empty() || command.content.trim().is_empty() {
                 return Err(malformed("command requires a non-empty name and content"));
+            }
+            if !path_safe(&command.name) {
+                return Err(malformed("command name is not path-safe"));
             }
             if names
                 .insert(format!("commands:{}", command.name), ())
@@ -275,6 +287,9 @@ impl MechanismSet {
                 return Err(malformed(
                     "subagent requires a non-empty name and instructions",
                 ));
+            }
+            if !path_safe(&subagent.name) {
+                return Err(malformed("subagent name is not path-safe"));
             }
             if names
                 .insert(format!("subagents:{}", subagent.name), ())

@@ -7,7 +7,7 @@ rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/Unka-Malloc/Adapter-For-All-Agents"
 keywords = ["a4aa", "agent", "codebuddy", "dialect", "profile"]
-categories = ["asynchronous", "no-std::no-std"]
+categories = ["development-tools"]
 
 [lib]
 name = "a4aa_code_buddy"
