@@ -197,8 +197,7 @@ impl CliLane {
         // closed — silently running a fresh process would lose the host's
         // session. `resume_args` or a `{sessionId}` placeholder inside the
         // argv template both count as an expressible binding.
-        let resume_expressible = !self.lane.resume_args.is_empty()
-            || self.lane.args.iter().any(|arg| arg.contains("{sessionId}"));
+        let resume_expressible = self.lane.capabilities().session_resume;
         if request
             .resume
             .as_deref()
@@ -315,17 +314,16 @@ impl CliLane {
                 Err(mut error) => {
                     // Keep failed receipt evidence; the external turn may have
                     // completed, so this error must never invite whole-turn replay.
+                    let mut details = error.detail.take().into_iter().collect::<Vec<_>>();
                     if let Err(turn_error) = &outcome {
-                        error.detail = Some(format!(
-                            "turn error: {} [{}]",
-                            turn_error.code, turn_error.stage
-                        ));
+                        details.push(format!("turn error: {turn_error}"));
                     } else if let Ok(done) = &outcome {
                         if done.stop_reason != "end_turn" {
-                            error.detail = Some(format!("turn stop reason: {}", done.stop_reason));
+                            details.push(format!("turn stop reason: {}", done.stop_reason));
                         }
                     }
-                    let _ = directory.keep();
+                    details.push(format!("receipt evidence: {}", directory.keep().display()));
+                    error.detail = Some(details.join("; "));
                     return Err(error);
                 }
             };
@@ -337,8 +335,12 @@ impl CliLane {
                     }
                 }
             }
-            if outcome.is_err() {
-                let _ = directory.keep();
+            if let Err(error) = &mut outcome {
+                let evidence = format!("receipt evidence: {}", directory.keep().display());
+                error.detail = Some(match error.detail.take() {
+                    Some(detail) => format!("{detail}; {evidence}"),
+                    None => evidence,
+                });
             } else {
                 directory
                     .close()
@@ -670,6 +672,9 @@ impl CliLane {
         state: &mut TurnCollect,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
+        if state.output_truncated {
+            return;
+        }
         let remaining = self
             .max_output_bytes
             .map(|limit| limit.saturating_sub(state.output.len()));
@@ -681,6 +686,7 @@ impl CliLane {
             });
         }
         if retained.len() < text.len() {
+            state.output_truncated = true;
             signal_truncated(state, events);
         }
     }
@@ -692,6 +698,7 @@ struct TurnCollect {
     /// Cap-retained stream text — the outcome's fallback when no
     /// result record supplied authoritative text.
     output: String,
+    output_truncated: bool,
     truncated: bool,
     /// NDJSON carry for `jsonLines`: a line split across reads waits for
     /// its newline; an unterminated tail at EOF is still one record.
@@ -968,5 +975,40 @@ mod receipt_file_type_tests {
         assert!(receive
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("receipt read blocked on a special file"));
+    }
+}
+
+#[cfg(test)]
+mod output_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn later_ascii_cannot_fill_a_cut_multibyte_prefix() {
+        let lane = CliLane {
+            command: CommandSpec {
+                program: "fixture".into(),
+                args: vec![],
+                cwd: None,
+                env: Default::default(),
+            },
+            lane: CliLaneSpec::default(),
+            secrets: std::sync::Arc::new(crate::env::NoSecrets),
+            observer: None,
+            max_output_bytes: Some(4),
+            cancelled: std::sync::Arc::new(watch::channel(()).0),
+            observed: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        let (send, mut receive) = mpsc::unbounded_channel();
+        let mut state = TurnCollect::default();
+        lane.retain_text("界界", &mut state, &send);
+        lane.retain_text("a", &mut state, &send);
+        assert_eq!(state.output, "界");
+        assert!(state.truncated);
+        assert_eq!(
+            receive.try_recv().unwrap(),
+            AgentEvent::MessageChunk { text: "界".into() }
+        );
+        assert_eq!(receive.try_recv().unwrap(), AgentEvent::Truncated);
+        assert!(receive.try_recv().is_err());
     }
 }

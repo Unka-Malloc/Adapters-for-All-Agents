@@ -1,11 +1,10 @@
 //! Lane-honoring tests for the card-declared surfaces, using `sh` fixtures
-//! shaped like the real agents' wire protocols. No network, no real agents.
+//! exercising the production descriptor crates. No network, no real agents.
 
 use a4aa::{
-    Adapter, AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvPolicy, LaneSpec, PromptChannel,
-    RpcCallSpec, RpcCompletionSpec, RpcLaneSpec, SessionConfig, SessionRequest, TurnRequest,
+    Adapter, AgentEvent, AgentSpec, CommandSpec, EnvPolicy, LaneSpec, SessionConfig,
+    SessionRequest, TurnRequest,
 };
-use serde_json::json;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -65,54 +64,9 @@ while IFS= read -r line; do
   esac
 done
 "#;
-    AgentSpec {
-        id: "fixture-codex".into(),
-        client_name: None,
-        lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
-            initialize: Some(RpcCallSpec {
-                method: "initialize".into(),
-                params: json!({"clientInfo": {"name": "a4aa-test"}}),
-            }),
-            initialized: Some("initialized".into()),
-            session_open: Some(RpcCallSpec {
-                method: "thread/start".into(),
-                params: json!({"cwd": "{cwd}", "developerInstructions": "{instructions}"}),
-            }),
-            session_resume: Some(RpcCallSpec {
-                method: "thread/resume".into(),
-                params: json!({"threadId": "{sessionId}"}),
-            }),
-            prompt: RpcCallSpec {
-                method: "turn/start".into(),
-                params: json!({
-                    "threadId": "{sessionId}",
-                    "input": [{"type": "text", "text": "{prompt}"}],
-                    "model": "{model}",
-                }),
-            },
-            completion: Some(RpcCompletionSpec {
-                method: "turn/completed".into(),
-                turn_id_path: Some("turn.id".into()),
-                status_path: Some("turn.status".into()),
-                status_value: None,
-            }),
-            cancel: Some(RpcCallSpec {
-                method: "turn/interrupt".into(),
-                params: json!({"threadId": "{sessionId}", "turnId": "{turnId}"}),
-            }),
-            session_close: None,
-            text_event_method: Some("item/agentMessage/delta".into()),
-            text_path: None,
-            result_text_path: None,
-            pre_turn: vec![],
-            session_scope: Default::default(),
-            kill_on_cancel: false,
-            envelope: None,
-            passthrough: vec!["model/list".into()],
-        })),
-        command: sh(script),
-        max_output_bytes: None,
-    }
+    let mut spec = a4aa_codex::spec();
+    spec.command = sh(script);
+    spec
 }
 
 /// Claude-shaped cli surface: stream-json in on stdin, NDJSON events out.
@@ -120,7 +74,9 @@ fn claude_like_spec() -> AgentSpec {
     let script = r#"
 sid="claude-fresh-1"
 resumed=""
-if [ "$1" = "--resume" ]; then sid="claude-fresh-1"; resumed="$2"; fi
+while [ $# -gt 0 ]; do
+  case "$1" in --resume) resumed="$2"; shift 2 ;; *) shift ;; esac
+done
 IFS= read -r _prompt
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}],"usage":{"input_tokens":9,"output_tokens":4}}}\n'
@@ -130,38 +86,14 @@ else
   printf '{"type":"result","subtype":"success","result":"first","session_id":"%s","usage":{"input_tokens":120,"cache_read_input_tokens":30,"cache_creation_input_tokens":7,"output_tokens":45}}\n' "$sid"
 fi
 "#;
-    AgentSpec {
-        id: "fixture-claude".into(),
-        client_name: None,
-        lane: LaneSpec::Cli(Box::new(CliLaneSpec {
-            args: vec![],
-            prompt_channel: PromptChannel::Stdin,
-            stream: Default::default(),
-            resume_args: vec!["--resume".into(), "{sessionId}".into()],
-            stdin_template: Some(json!({
-                "type": "user",
-                "message": {"role": "user", "content": [{"type": "text", "text": "{prompt}"}]}
-            })),
-            json_lines: true,
-            session_id_path: Some("session_id".into()),
-            usage_path: Some("usage".into()),
-            open_args: vec![],
-            binding_file_env: None,
-            binding_receipt_shape: Default::default(),
-            result_selector: None,
-            result_selector_field: None,
-            result_path: None,
-            execution_modes: vec![],
-            permission_modes: vec![],
-        })),
-        command: CommandSpec {
-            program: "sh".into(),
-            args: vec!["-c".into(), script.to_owned(), "sh".into()],
-            cwd: None,
-            env: EnvPolicy::default(),
-        },
-        max_output_bytes: None,
-    }
+    let mut spec = a4aa_claude::spec();
+    spec.command = CommandSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.to_owned(), "sh".into()],
+        cwd: None,
+        env: EnvPolicy::default(),
+    };
+    spec
 }
 
 #[tokio::test]
@@ -312,63 +244,9 @@ while IFS= read -r line; do
   esac
 done
 "#;
-    AgentSpec {
-        id: "fixture-pi".into(),
-        client_name: None,
-        lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
-            initialize: None,
-            initialized: None,
-            session_open: Some(RpcCallSpec {
-                method: "get_state".into(),
-                params: json!({}),
-            }),
-            session_resume: Some(RpcCallSpec {
-                method: "switch_session".into(),
-                params: json!({"sessionPath": "{sessionId}"}),
-            }),
-            prompt: RpcCallSpec {
-                method: "prompt".into(),
-                params: json!({"message": "{prompt}"}),
-            },
-            completion: Some(RpcCompletionSpec {
-                method: "agent_settled".into(),
-                turn_id_path: None,
-                status_path: None,
-                status_value: None,
-            }),
-            cancel: None,
-            session_close: None,
-            text_event_method: Some("message_update".into()),
-            text_path: Some("assistantMessageEvent.delta".into()),
-            result_text_path: None,
-            pre_turn: vec![
-                RpcCallSpec {
-                    method: "set_model".into(),
-                    params: json!({"provider": "{modelProvider}", "modelId": "{modelId}"}),
-                },
-                RpcCallSpec {
-                    method: "set_thinking_level".into(),
-                    params: json!({"level": "{effort}"}),
-                },
-            ],
-            session_scope: Default::default(),
-            kill_on_cancel: true,
-            envelope: Some(a4aa::RpcEnvelopeSpec {
-                method_field: "type".into(),
-                string_ids: true,
-                params_inline: true,
-                response_method: Some("response".into()),
-                data_field: Some("data".into()),
-                result_field: Some("data".into()),
-                error_field: Some("error".into()),
-                success_field: Some("success".into()),
-                command_field: Some("command".into()),
-            }),
-            passthrough: vec!["get_last_assistant_text".into()],
-        })),
-        command: sh(script),
-        max_output_bytes: None,
-    }
+    let mut spec = a4aa_pi::spec();
+    spec.command = sh(script);
+    spec
 }
 
 /// DeepSeek-Harness-shaped rpc surface: `initialize` handshake, a
@@ -393,52 +271,9 @@ while IFS= read -r line; do
   esac
 done
 "#;
-    AgentSpec {
-        id: "fixture-dsh".into(),
-        client_name: None,
-        lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
-            initialize: Some(RpcCallSpec {
-                method: "initialize".into(),
-                params: json!({
-                    "cwd": "{cwd}",
-                    "provider": "{provider}",
-                    "model": "{model}",
-                    "reasoningEffort": "{effort}",
-                }),
-            }),
-            initialized: None,
-            session_open: None,
-            session_resume: None,
-            prompt: RpcCallSpec {
-                method: "session/prompt".into(),
-                params: json!({
-                    "sessionId": "{sessionId}",
-                    "contentBlocks": [{"type": "text", "text": "{prompt}"}],
-                }),
-            },
-            completion: Some(RpcCompletionSpec {
-                method: "session.status".into(),
-                turn_id_path: None,
-                status_path: Some("status".into()),
-                status_value: Some("idle".into()),
-            }),
-            cancel: None,
-            session_close: Some(RpcCallSpec {
-                method: "shutdown".into(),
-                params: json!({}),
-            }),
-            text_event_method: Some("session.event".into()),
-            text_path: Some("event.data.message.content".into()),
-            result_text_path: None,
-            pre_turn: vec![],
-            session_scope: a4aa::SessionScope::Process,
-            kill_on_cancel: true,
-            envelope: None,
-            passthrough: vec![],
-        })),
-        command: sh(script),
-        max_output_bytes: None,
-    }
+    let mut spec = a4aa_dsh::spec();
+    spec.command = sh(script);
+    spec
 }
 
 /// Cursor-shaped cli surface: `create-chat` mints the binding at open;
@@ -459,50 +294,18 @@ printf '{"type":"init","session_id":"%s"}\n' "$sid"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]},"session_id":"%s"}\n' "$sid"
 printf '{"type":"result","result":"answer for %s","session_id":"%s"}\n' "$prev" "$sid"
 "#;
-    AgentSpec {
-        id: "fixture-cursor".into(),
-        client_name: None,
-        lane: LaneSpec::Cli(Box::new(CliLaneSpec {
-            args: vec![
-                "--print".into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--resume".into(),
-                "{sessionId}".into(),
-                "{prompt}".into(),
-            ],
-            prompt_channel: PromptChannel::ArgOnly,
-            stream: Default::default(),
-            resume_args: vec![],
-            stdin_template: None,
-            json_lines: true,
-            session_id_path: Some("session_id".into()),
-            usage_path: None,
-            open_args: vec!["create-chat".into()],
-            binding_file_env: None,
-            binding_receipt_shape: Default::default(),
-            result_selector: Some("result".into()),
-            result_selector_field: None,
-            result_path: Some("result".into()),
-            execution_modes: vec![],
-            permission_modes: vec![],
-        })),
-        // `sh -c '<turn>' sh create-chat` runs the open command: the script
-        // below branches on whether `create-chat` heads the tail args.
-        command: CommandSpec {
-            program: "sh".into(),
-            args: vec![
-                "-c".into(),
-                format!(
-                    "if [ \"$1\" = create-chat ]; then {open_script}; exit 0; fi; shift; {turn_script}"
-                ),
-                "sh".into(),
-            ],
-            cwd: None,
-            env: EnvPolicy::default(),
-        },
-        max_output_bytes: None,
-    }
+    let mut spec = a4aa_cursor::spec();
+    spec.command = CommandSpec {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!("if [ \"$1\" = create-chat ]; then {open_script}; exit 0; fi; {turn_script}"),
+            "sh".into(),
+        ],
+        cwd: None,
+        env: EnvPolicy::default(),
+    };
+    spec
 }
 
 /// Use the real Antigravity card with a deterministic shell process in place

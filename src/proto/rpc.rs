@@ -4,7 +4,7 @@
 //! `{sessionId}`, `{turnId}`, `{model}`, `{effort}`, `{instructions}`,
 //! `{cwd}` are substituted into string leaves of the params value). Inbound
 //! notifications map onto [`AgentEvent`]: the configured `textEvents` method
-//! carries text, any other notification arrives raw — nothing is dropped.
+//! carries text, other notifications arrive raw within the configured output budget.
 //!
 //! Turn semantics: `session/open` (if configured) runs once at open —
 //! `sessionResume` replaces it when the request carries a binding;
@@ -13,9 +13,9 @@
 //! configured) is sent as a notification on explicit cancel only.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, Notify};
 
 use crate::bounds;
 use crate::env::SecretResolver;
@@ -61,8 +61,6 @@ pub struct RpcSession {
     session_effort: Option<String>,
     session_id: Option<String>,
     cwd: String,
-    /// Inbound notifications, for awaiting declared completion methods.
-    notifications: TurnNotifications,
     /// One turn's identity and explicit cancellation intent; cleared on every
     /// return path, including setup/transport errors.
     control: std::sync::Mutex<TurnControl>,
@@ -78,22 +76,11 @@ struct TurnControl {
     pending_cancel: bool,
     killed: bool,
 }
-struct TurnScope<'a>(&'a std::sync::Mutex<TurnControl>);
+struct TurnScope<'a>(&'a std::sync::Mutex<TurnControl>, &'a TurnDelivery);
 impl Drop for TurnScope<'_> {
     fn drop(&mut self) {
         *self.0.lock().unwrap() = TurnControl::default();
-    }
-}
-
-// Bounded backpressure for relevant turn notifications; terminal messages
-// share reliable delivery and are never dropped to make room for telemetry.
-const TURN_NOTIFICATION_CAPACITY: usize = 64;
-type TurnNotifications = Arc<std::sync::Mutex<Option<mpsc::Sender<(String, Value)>>>>;
-
-struct TurnSubscription(TurnNotifications);
-impl Drop for TurnSubscription {
-    fn drop(&mut self) {
-        self.0.lock().unwrap().take();
+        self.1.state.lock().unwrap().progress = None;
     }
 }
 
@@ -107,77 +94,272 @@ fn cancelled_outcome(text: String, truncated: bool) -> TurnOutcome {
     }
 }
 
-struct DeliveryBudget {
+// Ingress owns turn state and the bounded event queue. The generic peer gets
+// at most one wake-up record, never the original notification payload. Keeping
+// this step synchronous leaves responses/permission calls independent of slow
+// async event callbacks; awaiting a response inside a callback cannot deadlock.
+struct TurnProgress {
+    text: String,
+    text_truncated: bool,
+    terminals: PendingTerminals,
+    expected: Option<String>,
+}
+struct DeliveryState {
     remaining: Option<usize>,
     truncated: bool,
+    queue: VecDeque<AgentEvent>,
+    wake_queued: bool,
+    issued: u64,
+    completed: u64,
+    failed: bool,
+    closed: bool,
+    progress: Option<TurnProgress>,
 }
-impl DeliveryBudget {
-    fn new(remaining: Option<usize>) -> Self {
-        Self {
-            remaining,
-            truncated: false,
+impl DeliveryState {
+    fn push(&mut self, event: AgentEvent) {
+        self.queue.push_back(event);
+        self.issued += 1;
+    }
+    fn truncate(&mut self) {
+        if !self.truncated {
+            self.truncated = true;
+            self.push(AgentEvent::Truncated);
         }
     }
-    fn truncate(&mut self) -> bool {
-        let first = !self.truncated;
-        self.truncated = true;
-        first
-    }
-}
-
-struct TurnDelivery {
-    delegate: Arc<dyn RpcSessionDelegate>,
-    budget: std::sync::Mutex<DeliveryBudget>,
-}
-impl TurnDelivery {
-    fn truncated(&self) -> bool {
-        self.budget.lock().unwrap().truncated
-    }
-    fn prepare(&self, event: AgentEvent) -> (Option<AgentEvent>, bool) {
-        let mut budget = self.budget.lock().unwrap();
+    fn retain(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::MessageChunk { text } => {
-                let prefix = bounds::bounded_prefix(&text, budget.remaining);
+                let prefix = bounds::bounded_prefix(&text, self.remaining);
                 let length = prefix.len();
-                let event = (!prefix.is_empty()).then(|| AgentEvent::MessageChunk {
-                    text: prefix.to_owned(),
-                });
-                if let Some(remaining) = &mut budget.remaining {
+                let retained = (!prefix.is_empty()).then(|| prefix.to_owned());
+                if let Some(remaining) = &mut self.remaining {
                     *remaining -= length;
                 }
-                let truncated = length < text.len() && budget.truncate();
-                (event, truncated)
+                if let Some(text) = retained {
+                    self.push(AgentEvent::MessageChunk { text });
+                }
+                if length < text.len() {
+                    // Once the prefix ends, later ASCII must not fill the
+                    // bytes left over from a partial multibyte character.
+                    self.remaining = Some(0);
+                    self.truncate();
+                }
             }
             AgentEvent::Raw { raw } => {
-                if let Some(remaining) = budget.remaining {
-                    // Once exhausted, do not serialize discarded telemetry.
+                if let Some(remaining) = self.remaining {
                     let length = if remaining == 0 {
                         0
                     } else {
                         raw.to_string().len()
                     };
                     if remaining == 0 || length > remaining {
-                        budget.remaining = Some(0);
-                        return (None, budget.truncate());
+                        self.remaining = Some(0);
+                        self.truncate();
+                        return;
                     }
-                    budget.remaining = Some(remaining - length);
+                    self.remaining = Some(remaining - length);
                 }
-                (Some(AgentEvent::Raw { raw }), false)
+                self.push(AgentEvent::Raw { raw });
             }
-            event => (Some(event), false),
+            _ => unreachable!("ingress only retains text and raw notifications"),
         }
     }
-    async fn dispatch(&self, (event, truncated): (Option<AgentEvent>, bool)) {
-        if let Some(event) = event {
+}
+struct TurnDelivery {
+    delegate: Arc<dyn RpcSessionDelegate>,
+    spec: RpcLaneSpec,
+    limit: Option<usize>,
+    state: std::sync::Mutex<DeliveryState>,
+    changed: Notify,
+}
+impl TurnDelivery {
+    fn new(delegate: Arc<dyn RpcSessionDelegate>, spec: RpcLaneSpec, limit: Option<usize>) -> Self {
+        Self {
+            delegate,
+            spec,
+            limit,
+            state: std::sync::Mutex::new(DeliveryState {
+                remaining: limit,
+                truncated: false,
+                queue: VecDeque::new(),
+                wake_queued: false,
+                issued: 0,
+                completed: 0,
+                failed: false,
+                closed: false,
+                progress: None,
+            }),
+            changed: Notify::new(),
+        }
+    }
+    fn truncated(&self) -> bool {
+        self.state.lock().unwrap().truncated
+    }
+    async fn begin(&self) -> Result<(), AdapterError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.failed {
+                    return Err(delivery_failure());
+                }
+                if state.completed == state.issued {
+                    state.remaining = self.limit;
+                    state.truncated = false;
+                    state.progress = Some(TurnProgress {
+                        text: String::new(),
+                        text_truncated: false,
+                        expected: None,
+                        terminals: PendingTerminals::new(
+                            self.limit
+                                .map(|limit| limit.max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)),
+                        ),
+                    });
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
+    }
+    async fn fence(&self, issued: u64) -> Result<(), AdapterError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                if state.failed {
+                    return Err(delivery_failure());
+                }
+                if state.completed >= issued {
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
+    }
+    fn snapshot(&self) -> (String, bool, u64) {
+        let state = self.state.lock().unwrap();
+        (
+            state
+                .progress
+                .as_ref()
+                .map_or_else(String::new, |p| p.text.clone()),
+            state.truncated,
+            state.issued,
+        )
+    }
+    fn ingest(&self, method: &str, params: Value) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.failed {
+            return false;
+        }
+        let text = (Some(method) == self.spec.text_event_method.as_deref())
+            .then(|| notification_text(&params, self.spec.text_path.as_deref()))
+            .flatten();
+        if let Some(progress) = &mut state.progress {
+            if let Some(text) = &text {
+                if !progress.text_truncated {
+                    let remaining = self.limit.map(|n| n.saturating_sub(progress.text.len()));
+                    let prefix = bounds::bounded_prefix(text, remaining);
+                    progress.text.push_str(prefix);
+                    progress.text_truncated = prefix.len() < text.len();
+                }
+            }
+            if let Some(done) = self
+                .spec
+                .completion
+                .as_ref()
+                .filter(|done| done.method == method)
+            {
+                let status = extract_text(&params, done.status_path.as_deref());
+                if done
+                    .status_value
+                    .as_deref()
+                    .is_none_or(|want| status.as_deref() == Some(want))
+                {
+                    let id = extract_text(&params, done.turn_id_path.as_deref());
+                    if progress.expected.is_none() || id == progress.expected {
+                        progress.terminals.insert(
+                            id,
+                            status.unwrap_or_else(|| "end_turn".into()),
+                            progress.text.len(),
+                        );
+                    }
+                }
+            }
+        }
+        state.retain(match text {
+            Some(text) => AgentEvent::MessageChunk { text },
+            None => AgentEvent::Raw {
+                raw: serde_json::json!({"method": method, "params": params}),
+            },
+        });
+        let wake = !state.wake_queued && !state.queue.is_empty();
+        if wake {
+            state.wake_queued = true;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        wake
+    }
+    async fn drain(&self) {
+        loop {
+            let event = {
+                let mut state = self.state.lock().unwrap();
+                match state.queue.pop_front() {
+                    Some(event) => event,
+                    None => {
+                        state.wake_queued = false;
+                        return;
+                    }
+                }
+            };
+            // If host code panics, fences fail explicitly instead of hanging
+            // or returning a successful turn with silently lost callbacks.
+            let mut guard = DeliveryGuard {
+                delivery: self,
+                complete: false,
+            };
             self.delegate.on_event(event).await;
-        }
-        if truncated {
-            self.delegate.on_event(AgentEvent::Truncated).await;
+            self.state.lock().unwrap().completed += 1;
+            guard.complete = true;
+            self.changed.notify_waiters();
         }
     }
-    async fn mark_truncated(&self) {
-        let first = self.budget.lock().unwrap().truncate();
-        self.dispatch((None, first)).await;
+}
+struct DeliveryGuard<'a> {
+    delivery: &'a TurnDelivery,
+    complete: bool,
+}
+impl Drop for DeliveryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.delivery.state.lock().unwrap().failed = true;
+            self.delivery.changed.notify_waiters();
+        }
+    }
+}
+fn delivery_failure() -> AdapterError {
+    AdapterError::uncertain("agent_event_delivery_failed", "rpc/events")
+}
+#[async_trait::async_trait]
+impl RpcDelegate for TurnDelivery {
+    async fn on_request(&self, method: &str, params: Value) -> Result<Value, RpcErrorObject> {
+        self.delegate.on_request(method, params).await
+    }
+    fn prepare_notification(&self, method: String, params: Value) -> Option<(String, Value)> {
+        self.ingest(&method, params)
+            .then(|| (String::new(), Value::Null))
+    }
+    async fn on_notification(&self, _method: &str, _params: Value) {
+        self.drain().await;
+    }
+    fn on_input_closed(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.changed.notify_waiters();
     }
 }
 
@@ -240,6 +422,13 @@ impl RpcLane {
         request: SessionRequest,
         delegate: Arc<dyn RpcSessionDelegate>,
     ) -> Result<RpcSession, AdapterError> {
+        let resume = request.resume.as_deref().filter(|v| !v.trim().is_empty());
+        if resume.is_some() && !self.spec.capabilities().session_resume {
+            return Err(AdapterError::permanent(
+                "agent_session_resume_unsupported",
+                "session/open",
+            ));
+        }
         let env = crate::env::resolve(&self.command.env, &request.env, &*self.secrets).await?;
         let mut command = SupervisedChild::command(&self.command, &env, request.cwd.as_deref());
         let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
@@ -247,78 +436,16 @@ impl RpcLane {
         if let Some(stderr) = stderr {
             tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
         }
-        let text_method = self.spec.text_event_method.clone();
-        let observer = self.observer.clone();
-        let notifications: TurnNotifications = Arc::new(std::sync::Mutex::new(None));
-        let delivery = Arc::new(TurnDelivery {
-            delegate: delegate.clone(),
-            budget: std::sync::Mutex::new(DeliveryBudget::new(self.max_output_bytes)),
-        });
-        struct Inner {
-            delegate: Arc<dyn RpcSessionDelegate>,
-            text_method: Option<String>,
-            text_path: Option<String>,
-            completion_method: Option<String>,
-            notifications: TurnNotifications,
-            delivery: Arc<TurnDelivery>,
-        }
-        #[async_trait::async_trait]
-        impl RpcDelegate for Inner {
-            async fn on_request(
-                &self,
-                method: &str,
-                params: Value,
-            ) -> Result<Value, RpcErrorObject> {
-                self.delegate.on_request(method, params).await
-            }
-            async fn on_closed(&self) {
-                let sink = self.notifications.lock().unwrap().clone();
-                if let Some(sink) = sink {
-                    let _ = sink.send((String::new(), Value::Null)).await;
-                }
-            }
-            async fn on_notification(&self, method: &str, params: Value) {
-                let forwarded = if Some(method) == self.text_method.as_deref()
-                    || Some(method) == self.completion_method.as_deref()
-                {
-                    Some(params.clone())
-                } else {
-                    None
-                };
-                let event = if Some(method) == self.text_method.as_deref() {
-                    notification_text(&params, self.text_path.as_deref())
-                        .map(|text| AgentEvent::MessageChunk { text })
-                } else {
-                    None
-                };
-                let prepared = self.delivery.prepare(event.unwrap_or(AgentEvent::Raw {
-                    raw: serde_json::json!({"method": method, "params": params}),
-                }));
-                if let Some(params) = forwarded {
-                    let sink = self.notifications.lock().unwrap().clone();
-                    if let Some(sink) = sink {
-                        let _ = sink.send((method.to_owned(), params)).await;
-                    }
-                }
-                self.delivery.dispatch(prepared).await;
-            }
-        }
+        let delivery = Arc::new(TurnDelivery::new(
+            delegate,
+            self.spec.clone(),
+            self.max_output_bytes,
+        ));
         let peer = JsonRpcPeer::spawn_with_envelope(
             stdout,
             stdin,
-            Arc::new(Inner {
-                delegate,
-                text_method,
-                text_path: self.spec.text_path.clone(),
-                completion_method: self
-                    .spec
-                    .completion
-                    .as_ref()
-                    .map(|done| done.method.clone()),
-                notifications: notifications.clone(),
-                delivery: delivery.clone(),
-            }),
-            observer,
+            delivery.clone(),
+            self.observer.clone(),
             crate::framing::DEFAULT_MAX_MESSAGE_BYTES,
             self.spec.envelope.clone(),
         );
@@ -351,24 +478,11 @@ impl RpcLane {
             }
         }
 
-        let resume = request.resume.as_deref().filter(|v| !v.trim().is_empty());
         let instructions = request.config.instructions.as_deref();
         let permission = request.config.permission.as_deref();
         let model = request.config.model.as_deref();
         let effort = request.config.effort.as_deref();
         let mode = request.config.mode.as_deref();
-        // A requested resume binding the agent cannot express fails closed —
-        // silently opening a fresh session would misattribute the host's
-        // session state. A `Process`-scoped lane can always seed the wire
-        // id from the binding, so it accepts resume without a resume call.
-        let resume_expressible =
-            self.spec.session_resume.is_some() || self.spec.session_scope == SessionScope::Process;
-        if resume.is_some() && !resume_expressible {
-            return Err(AdapterError::permanent(
-                "agent_session_resume_unsupported",
-                "session/open",
-            ));
-        }
         let open_call = resume
             .and(self.spec.session_resume.as_ref())
             .or(self.spec.session_open.as_ref());
@@ -407,7 +521,6 @@ impl RpcLane {
             session_effort: request.config.effort.clone(),
             session_id,
             cwd,
-            notifications,
             control: std::sync::Mutex::new(TurnControl::default()),
             turn_lock: Mutex::new(()),
         })
@@ -439,7 +552,8 @@ impl RpcSession {
             active: true,
             ..Default::default()
         };
-        let _turn_scope = TurnScope(&self.control);
+        let _turn_scope = TurnScope(&self.control, &self.delivery);
+        self.delivery.begin().await?;
         let model = model.or(self.session_model.as_deref());
         let effort = effort.or(self.session_effort.as_deref());
         let vars = vars(VarSpec {
@@ -460,26 +574,30 @@ impl RpcSession {
             if empty && !template_empty {
                 continue;
             }
-            self.peer
-                .call(&pre.method, params)
-                .await
-                .map_err(call_failure)?;
+            match self.peer.call(&pre.method, params).await {
+                Ok(_) => {}
+                Err(_) if self.control.lock().unwrap().killed => {
+                    return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
+                }
+                Err(error) => return Err(call_failure(error)),
+            }
+            let cancelled = {
+                let control = self.control.lock().unwrap();
+                control.pending_cancel || control.killed
+            };
+            if cancelled {
+                return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
+            }
         }
         {
             let mut control = self.control.lock().unwrap();
-            if control.pending_cancel {
+            if control.pending_cancel || control.killed {
                 return Ok(cancelled_outcome(String::new(), false));
             }
             control.dispatched = true;
         }
-        *self.delivery.budget.lock().unwrap() = DeliveryBudget::new(self.max_output_bytes);
-        // Install the reliable per-turn feed before the prompt request. The
-        // receiver is drained while awaiting its acknowledgement as well.
         if let Some(done) = &self.spec.completion {
-            let (sink, feed) = mpsc::channel(TURN_NOTIFICATION_CAPACITY);
-            *self.notifications.lock().unwrap() = Some(sink);
-            let _subscription = TurnSubscription(self.notifications.clone());
-            return self.await_completion(done, feed, &vars).await;
+            return self.await_completion(done, &vars).await;
         }
         let result = match call(&self.peer, &self.spec.prompt, &vars).await {
             Ok(result) => result,
@@ -496,8 +614,11 @@ impl RpcSession {
         let text = extract_text(&result, self.spec.result_text_path.as_deref())
             .unwrap_or_else(|| result.to_string());
         let retained = bounds::bounded_prefix(&text, self.max_output_bytes);
-        if retained.len() < text.len() {
-            self.delivery.mark_truncated().await;
+        let fence = self.delivery.snapshot().2;
+        self.delivery.fence(fence).await?;
+        if retained.len() < text.len() && !self.delivery.truncated() {
+            self.delivery.state.lock().unwrap().truncated = true;
+            self.delivery.delegate.on_event(AgentEvent::Truncated).await;
         }
         Ok(TurnOutcome {
             stop_reason,
@@ -508,48 +629,68 @@ impl RpcSession {
         })
     }
 
-    /// Collect text and reliable terminal messages concurrently with the
-    /// acknowledgement. Notification bursts cannot overwrite a completed turn.
+    /// Await the acknowledgement and ingress-owned terminal state. Output
+    /// callbacks run independently and drain before a successful turn returns.
     async fn await_completion(
         &self,
         done: &crate::model::RpcCompletionSpec,
-        mut feed: mpsc::Receiver<(String, Value)>,
         vars: &Vars,
     ) -> Result<TurnOutcome, AdapterError> {
         let reply = call(&self.peer, &self.spec.prompt, vars);
         tokio::pin!(reply);
         let mut acknowledged = false;
         let mut turn_id = None;
-        let mut text = String::new();
-        // A terminal may precede its acknowledgement. Preserve its turn id and
-        // text boundary until the response identifies the requested turn.
-        let mut terminals = PendingTerminals::new(
-            self.max_output_bytes
-                .map(|limit| limit.max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)),
-        );
         loop {
-            if acknowledged {
-                if let Some((status, end)) = terminals.take(if done.turn_id_path.is_some() {
-                    turn_id.as_deref()
+            let changed = self.delivery.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let terminal = {
+                let mut state = self.delivery.state.lock().unwrap();
+                if state.failed {
+                    return Err(delivery_failure());
+                }
+                let truncated = state.truncated;
+                let issued = state.issued;
+                let progress = state.progress.as_mut().expect("active turn");
+                let terminal = if acknowledged {
+                    let terminal = progress.terminals.take(turn_id.as_deref());
+                    if terminal.is_none() && progress.terminals.overflowed {
+                        return Err(AdapterError::uncertain(
+                            "agent_completion_buffer_exceeded",
+                            "rpc/read",
+                        ));
+                    }
+                    progress.terminals.clear();
+                    terminal
                 } else {
                     None
-                }) {
-                    text.truncate(end);
-                    return Ok(TurnOutcome {
-                        stop_reason: status,
-                        text,
-                        truncated: self.delivery.truncated(),
-                        exit_code: None,
-                        usage: None,
-                    });
-                }
-                if terminals.overflowed {
+                };
+                let result = terminal.map(|(status, end)| {
+                    (status, progress.text[..end].to_owned(), truncated, issued)
+                });
+                if result.is_none() && acknowledged && state.closed {
+                    if self.control.lock().unwrap().killed {
+                        return Ok(cancelled_outcome(
+                            state.progress.as_ref().unwrap().text.clone(),
+                            state.truncated,
+                        ));
+                    }
                     return Err(AdapterError::uncertain(
-                        "agent_completion_buffer_exceeded",
+                        "agent_transport_failed",
                         "rpc/read",
                     ));
                 }
-                terminals.clear();
+                result
+            };
+            if let Some((status, text, truncated, fence)) = terminal {
+                self.delivery.fence(fence).await?;
+                return Ok(TurnOutcome {
+                    stop_reason: status,
+                    text,
+                    truncated,
+                    exit_code: None,
+                    usage: None,
+                });
             }
             tokio::select! {
                 biased;
@@ -557,11 +698,16 @@ impl RpcSession {
                     let result = match result {
                         Ok(result) => result,
                         Err(_) if self.control.lock().unwrap().killed => {
-                            return Ok(cancelled_outcome(text, self.delivery.truncated()));
+                            let (text, truncated, _) = self.delivery.snapshot();
+                            return Ok(cancelled_outcome(text, truncated));
                         }
                         Err(error) => return Err(error),
                     };
-                    turn_id = binding(&result);
+                    turn_id = if done.turn_id_path.is_some() {
+                        Some(binding(&result).filter(|id| !id.trim().is_empty()).ok_or_else(||
+                            AdapterError::uncertain("agent_turn_id_missing", "rpc/prompt"))?)
+                    } else { None };
+                    self.delivery.state.lock().unwrap().progress.as_mut().unwrap().expected = turn_id.clone();
                     let pending_cancel = {
                         let mut control = self.control.lock().unwrap();
                         control.turn_id = turn_id.clone();
@@ -570,29 +716,7 @@ impl RpcSession {
                     acknowledged = true;
                     if pending_cancel { self.send_cancel(turn_id.as_deref())?; }
                 }
-                notification = feed.recv() => {
-                    let Some((method, params)) = notification.filter(|(method, _)| !method.is_empty()) else {
-                        if self.control.lock().unwrap().killed {
-                            return Ok(cancelled_outcome(text, self.delivery.truncated()));
-                        }
-                        return Err(AdapterError::uncertain("agent_transport_failed", "rpc/read"));
-                    };
-                    if method == done.method {
-                        let status = extract_text(&params, done.status_path.as_deref());
-                        if done.status_value.as_deref().is_some_and(|want| status.as_deref() != Some(want)) {
-                            continue;
-                        }
-                        let id = extract_text(&params, done.turn_id_path.as_deref());
-                        if !acknowledged || done.turn_id_path.is_none() || turn_id.is_none() || id == turn_id {
-                            terminals.insert(id, status.unwrap_or_else(|| "end_turn".to_owned()), text.len());
-                        }
-                    } else if Some(method.as_str()) == self.spec.text_event_method.as_deref() {
-                        if let Some(chunk) = notification_text(&params, self.spec.text_path.as_deref()) {
-                            let remaining = self.max_output_bytes.map(|limit| limit.saturating_sub(text.len()));
-                            text.push_str(bounds::bounded_prefix(&chunk, remaining));
-                        }
-                    }
-                }
+                _ = &mut changed => {}
             }
         }
     }
@@ -608,14 +732,14 @@ impl RpcSession {
             if !control.active {
                 return Ok(());
             }
-            if !control.dispatched {
-                control.pending_cancel = true;
-                return Ok(());
-            }
             if self.spec.kill_on_cancel {
                 control.killed = true;
                 (true, None)
             } else {
+                if !control.dispatched {
+                    control.pending_cancel = true;
+                    return Ok(());
+                }
                 let cancel = self.spec.cancel.as_ref().ok_or_else(|| {
                     AdapterError::permanent("agent_cancel_unsupported", "session/cancel")
                 })?;
@@ -817,5 +941,148 @@ mod completion_budget_tests {
             Some(("completed".into(), 12))
         );
         assert!(pending.take(Some("not-retained")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[derive(Default)]
+    struct SlowHost {
+        started: Notify,
+        release: Notify,
+        seen: AtomicUsize,
+        peer: std::sync::Mutex<Option<std::sync::Weak<JsonRpcPeer>>>,
+    }
+    #[async_trait::async_trait]
+    impl RpcSessionDelegate for SlowHost {
+        async fn on_event(&self, _: AgentEvent) {
+            if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+                let peer = self
+                    .peer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                assert_eq!(peer.call("nested", json!({})).await.unwrap(), json!("ok"));
+            }
+        }
+        async fn on_request(&self, _: &str, _: Value) -> Result<Value, RpcErrorObject> {
+            Ok(json!("denied"))
+        }
+    }
+
+    #[tokio::test]
+    async fn ingress_bounds_pending_payload_while_callback_awaits_response() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let host = Arc::new(SlowHost::default());
+            let spec = RpcLaneSpec {
+                text_event_method: Some("text".into()), text_path: Some("text".into()),
+                completion: Some(crate::model::RpcCompletionSpec {
+                    method: "done".into(), turn_id_path: Some("turn".into()),
+                    status_path: Some("status".into()), status_value: None,
+                }), ..Default::default()
+            };
+            let delivery = Arc::new(TurnDelivery::new(host.clone(), spec, Some(4096)));
+            delivery.begin().await.unwrap();
+            let (client, server) = tokio::io::duplex(128 * 1024);
+            let (reader, writer) = tokio::io::split(client);
+            let peer = JsonRpcPeer::spawn(reader, writer, delivery.clone(), None,
+                crate::framing::DEFAULT_MAX_MESSAGE_BYTES);
+            *host.peer.lock().unwrap() = Some(Arc::downgrade(&peer));
+            let server = tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(server);
+                let mut reader = BufReader::new(reader);
+                let request = crate::framing::read_frame(&mut reader, 1024).await.unwrap().unwrap().unwrap();
+                let burst = json!({"jsonrpc":"2.0","method":"text","params":{"text":"x".repeat(65536)}});
+                for _ in 0..256 {
+                    crate::framing::write_frame(&mut writer, &burst).await.unwrap();
+                }
+                crate::framing::write_frame(&mut writer, &json!({"jsonrpc":"2.0","method":"done","params":{"turn":"t","status":"completed"}})).await.unwrap();
+                crate::framing::write_frame(&mut writer, &json!({"jsonrpc":"2.0","id":request["id"],"result":{"id":"t"}})).await.unwrap();
+                crate::framing::write_frame(&mut writer, &json!({"jsonrpc":"2.0","id":"permission","method":"permit","params":{}})).await.unwrap();
+                let mut nested = false;
+                let mut permission = false;
+                while !nested || !permission {
+                    let frame = crate::framing::read_frame(&mut reader, 1024).await.unwrap().unwrap().unwrap();
+                    if frame["method"] == "nested" {
+                        nested = true;
+                        crate::framing::write_frame(&mut writer, &json!({"jsonrpc":"2.0","id":frame["id"],"result":"ok"})).await.unwrap();
+                    } else {
+                        assert_eq!(frame["id"], "permission");
+                        assert_eq!(frame["result"], "denied");
+                        permission = true;
+                    }
+                }
+                writer.shutdown().await.unwrap();
+            });
+            let request_peer = peer.clone();
+            let reply = tokio::spawn(async move { request_peer.call("prompt", json!({})).await });
+            host.started.notified().await;
+            // Ack is after the complete 16 MiB burst. It must arrive while
+            // the callback is paused, without enqueueing that burst's payload.
+            assert_eq!(reply.await.unwrap().unwrap(), json!({"id":"t"}));
+            let fence = {
+                let state = delivery.state.lock().unwrap();
+                let queued_bytes: usize = state.queue.iter().map(|event| match event {
+                    AgentEvent::MessageChunk { text } => text.len(),
+                    AgentEvent::Raw { raw } => raw.to_string().len(),
+                    _ => 0,
+                }).sum();
+                assert!(queued_bytes <= 4096);
+                assert!(state.queue.len() <= 2);
+                assert_eq!(state.issued, 2); // first chunk in flight + Truncated
+                assert!(state.wake_queued); // one coalesced peer notification
+                let progress = state.progress.as_ref().unwrap();
+                assert_eq!(progress.text.len(), 4096);
+                assert!(progress.terminals.entries.contains_key(&Some("t".into())));
+                state.issued
+            };
+            host.release.notify_one();
+            delivery.fence(fence).await.unwrap();
+            server.await.unwrap();
+            loop {
+                let changed = delivery.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if delivery.state.lock().unwrap().closed { break; }
+                changed.await;
+            }
+            assert_eq!(host.seen.load(Ordering::SeqCst), 2);
+            peer.close().await;
+        }).await.expect("ingress/response deadlock");
+    }
+
+    #[test]
+    fn utf8_truncation_keeps_a_prefix_across_later_chunks() {
+        struct Sink;
+        #[async_trait::async_trait]
+        impl RpcSessionDelegate for Sink {}
+        let delivery = TurnDelivery::new(
+            Arc::new(Sink),
+            RpcLaneSpec {
+                text_event_method: Some("text".into()),
+                ..Default::default()
+            },
+            Some(4),
+        );
+        assert!(delivery.ingest("text", json!({"text":"界界"})));
+        assert!(!delivery.ingest("text", json!({"text":"a"})));
+        let state = delivery.state.lock().unwrap();
+        assert_eq!(
+            state.queue.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                AgentEvent::MessageChunk { text: "界".into() },
+                AgentEvent::Truncated
+            ]
+        );
     }
 }

@@ -13,8 +13,8 @@
 //! `.agents/skills`) for hosts driving an agent with no dedicated crate.
 
 use crate::mechanisms::{
-    AdaptationPlan, ArtifactScope, CommandDecl, HookDecl, HookEvent, MechanismSet, SubagentDecl,
-    Support, WriteMode,
+    AdaptationPlan, ArtifactScope, CommandDecl, HookDecl, HookEvent, HookIntent, MechanismSet,
+    SubagentDecl, Support, WriteMode,
 };
 
 // ----------------------------- descriptor ---------------------------------
@@ -365,6 +365,11 @@ fn emit_hooks(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) 
             ExtensionKind::Pi => {
                 let mut emitted = Vec::new();
                 for hook in &set.hooks {
+                    if hook.intent != HookIntent::Notify {
+                        plan.report(item(hook), Support::Unsupported,
+                            Some("generated event observers support Notify only; no veto or output injection"));
+                        continue;
+                    }
                     match map.iter().find(|(event, _)| *event == hook.event) {
                         Some((_, event)) => {
                             emitted.push((*event, hook));
@@ -397,6 +402,11 @@ fn emit_hooks(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) 
             ExtensionKind::OpenCode => {
                 let mut emitted = Vec::new();
                 for hook in &set.hooks {
+                    if hook.intent != HookIntent::Notify {
+                        plan.report(item(hook), Support::Unsupported,
+                            Some("generated event observers support Notify only; no veto or output injection"));
+                        continue;
+                    }
                     match map.iter().find(|(event, _)| *event == hook.event) {
                         Some((_, event)) => {
                             emitted.push((*event, hook));

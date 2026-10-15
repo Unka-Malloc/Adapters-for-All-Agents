@@ -155,7 +155,7 @@ pub const AGENT: AgentCard = AgentCard {
             "dontAsk",
             "bypassPermissions",
         ],
-        permission_default: Some("bypassPermissions"),
+        permission_default: None,
         attachments: AttachmentSupport::None,
         effort: true,
         steer: false,

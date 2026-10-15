@@ -337,6 +337,17 @@ impl Adapter {
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<AgentSession, AdapterError> {
         validate_session_config(&self.spec, &request)?;
+        if request
+            .resume
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+            && !self.capabilities().session_resume
+        {
+            return Err(AdapterError::permanent(
+                "agent_session_resume_unsupported",
+                "session/open",
+            ));
+        }
         match &self.spec.lane {
             LaneSpec::Acp {
                 mcp_servers,

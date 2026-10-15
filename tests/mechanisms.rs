@@ -31,8 +31,8 @@ fn support(plan: &AdaptationPlan, item: &str) -> Option<Support> {
 fn kilo_nonempty_mechanisms_use_kilo_paths_and_merge_contracts() {
     let set: MechanismSet = serde_json::from_value(serde_json::json!({
         "hooks": [
-            {"event":"session-start","command":"start.sh"},
-            {"event":"pre-tool-use","command":"guard.sh"}
+            {"event":"session-start","command":"start.sh","intent":"notify"},
+            {"event":"pre-tool-use","command":"guard.sh","intent":"notify"}
         ],
         "skills":[{"name":"audit","content":"Review."}],
         "commands":[{"name":"ship","content":"Ship."}],
@@ -495,7 +495,10 @@ fn antigravity_named_bundle_and_unsupported_events() {
 fn pi_hooks_become_extension_stub() {
     let set = MechanismSet {
         hooks: vec![
-            hook(HookEvent::SessionStart, "start.sh"),
+            HookDecl {
+                intent: HookIntent::Notify,
+                ..hook(HookEvent::SessionStart, "start.sh")
+            },
             hook(HookEvent::PreToolUse, "guard.sh"),
         ],
         plugins: vec![PluginDecl {
@@ -583,4 +586,34 @@ fn adaptation_plan_serializes_for_foreign_hosts() {
     assert_eq!(value["dialect"], "codex");
     assert!(value["artifacts"].is_array());
     assert_eq!(value["report"][0]["support"], "native");
+}
+
+#[test]
+fn generated_observers_never_claim_enforcement_or_injection() {
+    for dialect in [
+        a4aa_dialects::dialect("kilocode").unwrap(),
+        a4aa_opencode::dialect(),
+        a4aa_pi::dialect(),
+    ] {
+        for intent in [HookIntent::Enforce, HookIntent::Inject, HookIntent::Rewrite] {
+            let plan = dialect.adapt(&MechanismSet {
+                hooks: vec![
+                    HookDecl {
+                        intent,
+                        ..hook(HookEvent::SessionStart, "guard.sh")
+                    },
+                    HookDecl {
+                        intent,
+                        ..hook(HookEvent::PreToolUse, "guard.sh")
+                    },
+                ],
+                ..Default::default()
+            });
+            assert!(plan.artifacts.is_empty(), "{}", dialect.id);
+            assert!(plan
+                .report
+                .iter()
+                .all(|entry| entry.support == Support::Unsupported));
+        }
+    }
 }

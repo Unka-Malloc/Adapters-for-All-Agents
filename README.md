@@ -128,3 +128,15 @@ scripts/verify.sh   # fmt + clippy + cargo test --all-targets
 
 The crate is named `a4aa` (Apache-2.0); the sidecar protocol is versioned
 as `a4aa.v1`.
+
+RPC lane output limits apply before notification delivery is queued. Slow event
+callbacks do not stop response or permission processing, including an RPC call
+made from a callback. Successful turns wait for their admitted callbacks, and
+new turns drain earlier admitted events before resetting the output budget.
+`max_output_bytes: None` explicitly permits unbounded output retention. Generic
+`JsonRpcPeer` delegates can use `prepare_notification` for synchronous ingress
+admission; its default retains all notifications without a queue budget.
+
+Generated Pi/OpenCode-style extension hooks are observers: only `Notify` intent
+is adapted. `Enforce`, `Inject` and `Rewrite` are reported as `Unsupported` and
+produce no observer artifact pretending to implement those semantics.

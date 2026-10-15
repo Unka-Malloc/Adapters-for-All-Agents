@@ -869,6 +869,11 @@ async fn cli_receipt_failures_are_visible_and_keep_evidence() {
         assert!(path.exists());
         assert_eq!(session.session_id(), "");
         let directory = path.parent().unwrap();
+        assert!(error
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains(directory.to_str().unwrap()));
         assert!(directory.starts_with(std::env::temp_dir()));
         assert!(directory
             .file_name()
@@ -906,4 +911,142 @@ async fn cli_missing_optional_receipt_is_allowed() {
     assert_eq!(result.stop_reason, "end_turn");
     assert_eq!(session.session_id(), "");
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpc_correlated_completion_rejects_missing_or_empty_ack_id() {
+    for ack in ["{}", r#"{"turn":{"id":""}}"#, r#"{"turn":{"id":"   "}}"#] {
+        let script = format!(
+            r#"
+import json,sys
+for line in sys.stdin:
+    m=json.loads(line)
+    print(json.dumps({{'jsonrpc':'2.0','method':'done','params':{{'turn':'stale','status':'completed'}}}}),flush=True)
+    print(json.dumps({{'jsonrpc':'2.0','id':m['id'],'result':json.loads('{ack}')}}),flush=True)
+"#
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(rpc_fixture(&script, Some(1024)))
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        let error = session
+            .prompt(TurnRequest {
+                text: "run".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent_turn_id_missing");
+        assert!(error.uncertain_effect);
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rpc_process_cancel_terminates_a_hung_pre_turn_call() {
+    let script = r#"
+import json,sys
+for line in sys.stdin:
+    m=json.loads(line)
+    assert m['method']=='configure', 'prompt was dispatched after cancel'
+    print(json.dumps({'jsonrpc':'2.0','method':'ready','params':{}}),flush=True)
+"#;
+    let mut spec = rpc_fixture(script, Some(1024));
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.pre_turn = vec![a4aa::RpcCallSpec {
+        method: "configure".into(),
+        params: serde_json::json!({}),
+    }];
+    lane.kill_on_cancel = true;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+        text: "run".into(),
+        ..Default::default()
+    }));
+    loop {
+        tokio::select! {
+            result = &mut prompt => panic!("setup ended before cancellation: {result:?}"),
+            event = rx.recv() => if matches!(event, Some(a4aa::AgentEvent::Raw { ref raw }) if raw["method"]=="ready") { break; }
+        }
+    }
+    session.cancel().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), prompt)
+            .await
+            .unwrap()
+            .unwrap()
+            .stop_reason,
+        "cancelled"
+    );
+}
+
+#[tokio::test]
+async fn cli_resume_is_rejected_before_open_spawns_or_reports_a_binding() {
+    let mut spec = cli("exit 99", StreamMode::Stdio, false);
+    spec.command.program = "missing-fixture-executable".into();
+    let LaneSpec::Cli(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.open_args = vec!["create-chat".into()];
+    let adapter = Adapter::new(spec);
+    assert!(!adapter.capabilities().session_resume);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let result = adapter
+        .open_session(
+            SessionRequest {
+                resume: Some("existing".into()),
+                ..Default::default()
+            },
+            tx,
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("unsupported resume was accepted")
+    };
+    assert_eq!(error.code, "agent_session_resume_unsupported");
+    assert_eq!(error.stage, "session/open");
+}
+
+#[tokio::test]
+async fn claude_permission_bypass_requires_an_explicit_selection() {
+    assert_eq!(a4aa_claude::card().features.permission_default, None);
+    for permission in [None, Some("bypassPermissions")] {
+        let mut spec = a4aa_claude::spec();
+        spec.command = CommandSpec { program: "python3".into(), args: vec!["-c".into(),
+            "import sys,json;sys.stdin.readline();print(json.dumps({'type':'result','result':json.dumps(sys.argv[1:])}))".into()],
+            cwd: None, env: EnvPolicy::default() };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(spec)
+            .open_session(
+                SessionRequest {
+                    config: a4aa::SessionConfig {
+                        permission: permission.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        let outcome = session
+            .prompt(TurnRequest {
+                text: "run".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let args: Vec<String> = serde_json::from_str(&outcome.text).unwrap();
+        assert_eq!(
+            args.iter().any(|arg| arg == "bypassPermissions"),
+            permission.is_some()
+        );
+    }
 }

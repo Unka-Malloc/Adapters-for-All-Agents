@@ -60,6 +60,19 @@ pub trait RpcDelegate: Send + Sync {
 
     async fn on_notification(&self, _method: &str, _params: Value) {}
 
+    /// Synchronous ingress admission, before the ordered callback queue.
+    /// A delegate may retain bounded state and return a small wake-up record,
+    /// or consume the notification with `None`. Must not block: responses and
+    /// permission requests on this transport must remain serviceable while
+    /// an asynchronous notification callback is waiting for them.
+    /// The default preserves every notification without a queue budget.
+    fn prepare_notification(&self, method: String, params: Value) -> Option<(String, Value)> {
+        Some((method, params))
+    }
+
+    /// Transport closure observed at ingress, independently of queued callbacks.
+    fn on_input_closed(&self) {}
+
     /// A malformed inbound frame arrived. The stream continues.
     async fn on_protocol_error(&self, _error: String) {}
 
@@ -210,6 +223,7 @@ impl JsonRpcPeer {
                 }
             }
             reader_peer.fail_pending("peer_closed");
+            delegate.on_input_closed();
             let _ = reader_peer.notifications.send(None);
         });
         *peer.reader.lock().unwrap() = Some(reader_task);
@@ -292,7 +306,9 @@ impl JsonRpcPeer {
                 });
             }
             None => {
-                let _ = self.notifications.send(Some((method, params)));
+                if let Some(notification) = delegate.prepare_notification(method, params) {
+                    let _ = self.notifications.send(Some(notification));
+                }
             }
         }
     }
@@ -407,7 +423,9 @@ impl JsonRpcPeer {
                 });
             }
             None => {
-                let _ = self.notifications.send(Some((method, params)));
+                if let Some(notification) = delegate.prepare_notification(method, params) {
+                    let _ = self.notifications.send(Some(notification));
+                }
             }
         }
     }

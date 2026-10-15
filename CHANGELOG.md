@@ -17,8 +17,14 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Honor explicit CLI cancellation during prompt writes and after output EOF.
 - Bound retained structured CLI output, drain oversized records, and continue
   reading session bindings and usage after the output budget is exhausted.
-- Apply output budgets to RPC results and delivered events without cancelling
-  the turn. Preserve cancellation requested before the prompt acknowledgement.
+- Apply RPC output budgets at notification ingress, before slow host callbacks
+  can accumulate payloads. Preserve response/permission progress and event order.
+- Require valid acknowledgement IDs for correlated completion; preserve explicit
+  cancellation before acknowledgements and during per-turn configuration.
+- Reject unsupported resume requests at open, before spawning or reporting a binding.
+- Keep Claude permission bypass opt-in. Generated extension observers support
+  Notify hooks only; enforcement, injection and rewriting report Unsupported.
+- Retain failed receipt evidence with its location in the typed error.
 - Pump CLI input and output concurrently with bounded terminal read queues.
 - Expand templates once without interpreting placeholder-like user data.
 - Protect flat RPC control fields from parameter overrides, and surface
