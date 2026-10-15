@@ -41,7 +41,7 @@ let plan = a4aa_pi::adapt(&mechanisms); // or a4aa::adapt(a4aa_pi::dialect(), &s
 | Crate | Agent knowledge it owns |
 | --- | --- |
 | `a4aa` (this crate) | Shared vocabulary only: `MechanismSet`, `Dialect`/`HookSurface`/surface types, the `adapt` engine, `Dialect::generic()` |
-| `crates/a4aa-<agent>` × 25 | That agent's `Dialect` const: hook-store shape, skills/commands/subagents paths, permission/MCP config surfaces |
+| `crates/a4aa-<agent>` × 15 | That agent's `Dialect` const: hook-store shape, skills/commands/subagents paths, permission/MCP config surfaces |
 | `crates/a4aa-dialects` | Optional name→`Dialect` registry for multi-agent hosts. Pulls in all adapters; single-agent hosts should not use it |
 
 Every adapter crate is independently installable and independently
