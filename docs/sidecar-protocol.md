@@ -19,21 +19,30 @@ crate's adapters verbatim — one subprocess per host process.
 | Method | Params | Result |
 | --- | --- | --- |
 | `ping` | `{}` | `{protocol: "a4aa.v1", version: <crate version>}` |
-| `session/open` | `{spec: AgentSpec, cwd?, env?: {K: V}, resume?}` | `{sessionId, nativeSessionId, capabilities}` |
-| `session/prompt` | `{sessionId, text, model?, effort?}` | `TurnOutcome` (`{stopReason, text?}`) |
+| `session/open` | `{spec: AgentSpec, cwd?, env?: {K: V}, resume?, options?: {model?, mode?, effort?, permission?}}` | `{sessionId, nativeSessionId, capabilities, agentInfo, sessionState}` |
+| `session/prompt` | `{sessionId, text, model?, effort?}` | `TurnOutcome` (`{stopReason, text?, usage?}`) |
 | `session/cancel` | `{sessionId}` | `{}` |
 | `session/close` | `{sessionId}` | `{}` (idempotent) |
 
-`AgentSpec` is the crate's canonical spec (serde, `snake_case` internals
+`AgentSpec` is the crate's canonical spec (serde, `camelCase` fields
 documented in `model.rs`): `id`, `clientName?`, `command{program,args,cwd?,
 env}`, `maxOutputBytes?`, plus the flattened lane — `"lane": "acp" | "rpc" |
 "cli"` with the lane's own fields.
 
+Session options select the agent's model, reasoning effort, execution mode,
+and permission preset. A lane rejects unsupported selectors before starting
+work. ACP choices are negotiated with the agent; `agentInfo` and `sessionState`
+contain the returned agent metadata and configuration, or `null` for other
+lanes. Typed adapter errors appear in the JSON-RPC error's `data` object as
+`code`, `stage`, `retryable`, and `uncertainEffect`.
+
 ## Traffic (sidecar → host)
 
 - `session/event` notification — `{sessionId, event: AgentEvent}` streamed
-  while a prompt is in flight (`MessageChunk`, `ToolCall`, `Raw`, …).
-- `permission/request` request — `{sessionId, prompt: PermissionPrompt}`;
+  while a prompt is in flight (`MessageChunk`, `ToolCall`, `Usage`, `Raw`, …).
+  Event variants use their serde wire representation from `model.rs`.
+- `permission/request` request — `{sessionId, toolCallId, title, kind,
+  contentTexts, options, raw}`;
   the host responds `{cancelled: true}` or `{selected: "<optionId>"}`.
   Unanswered permissions fail closed (the agent sees `cancelled`).
 

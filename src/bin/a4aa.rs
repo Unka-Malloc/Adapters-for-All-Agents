@@ -3,11 +3,18 @@
 //! `a4aa serve` runs an NDJSON JSON-RPC 2.0 service on its own stdio so
 //! hosts in any language reuse this crate's adapters verbatim:
 //!
-//! - `session/open`   `{spec: AgentSpec, cwd?, env?}` → `{sessionId, lane, capabilities}`
+//! - `session/open`   `{spec: AgentSpec, cwd?, env?, resume?, options?}`
+//!   → `{sessionId, nativeSessionId, capabilities, agentInfo?, sessionState?}`
+//!   where `options` is `{model?, mode?, effort?, permission?}` applied
+//!   after session establishment on lanes that support it.
 //! - `session/prompt` `{sessionId, text, model?, effort?}` → `TurnOutcome`
 //! - `session/cancel` `{sessionId}` → `{}`
 //! - `session/close`  `{sessionId}` → `{}`
 //! - `ping`           `{}` → `{protocol: "a4aa.v1", version}`
+//!
+//! Errors carry `{code, stage, retryable, uncertainEffect}` in `data` so
+//! hosts distinguish recovery-required transport failures from permanent
+//! configuration errors without parsing message text.
 //!
 //! During a prompt the server streams `session/event` notifications
 //! `{sessionId, event}` and may call `permission/request` (client→answer
@@ -19,7 +26,7 @@
 //! cancel paths on magic words, and never touches the network.
 
 use a4aa::{
-    Adapter, AgentEvent, AgentSession, AgentSpec, JsonRpcPeer, PermissionDecision,
+    Adapter, AdapterError, AgentEvent, AgentSession, AgentSpec, JsonRpcPeer, PermissionDecision,
     PermissionHandler, PermissionPrompt, RpcDelegate, RpcErrorObject, SessionRequest, TurnRequest,
 };
 use serde_json::{json, Value};
@@ -165,6 +172,22 @@ impl RpcDelegate for SidecarDelegate {
     }
 }
 
+/// The sidecar-visible form of a typed `AdapterError`: the host reads
+/// `data.code`/`data.stage` to decide recovery policy instead of parsing
+/// message text.
+fn adapter_error(error: &AdapterError) -> RpcErrorObject {
+    RpcErrorObject {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({
+            "code": error.code,
+            "stage": error.stage,
+            "retryable": error.retryable,
+            "uncertainEffect": error.uncertain_effect,
+        })),
+    }
+}
+
 impl SidecarDelegate {
     async fn session_open(&self, params: Value) -> Result<Value, RpcErrorObject> {
         let spec: AgentSpec = serde_json::from_value(
@@ -203,6 +226,24 @@ impl SidecarDelegate {
         if let Some(resume) = params.get("resume").and_then(Value::as_str) {
             request.resume = Some(resume.to_owned());
         }
+        if let Some(options) = params.get("options").and_then(Value::as_object) {
+            request.config.model = options
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            request.config.mode = options
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            request.config.effort = options
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            request.config.permission = options
+                .get("permission")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
 
         let id = format!(
             "a4aa-{}",
@@ -218,17 +259,22 @@ impl SidecarDelegate {
         let session = adapter
             .open_session(request, events)
             .await
-            .map_err(|error| RpcErrorObject {
-                code: -32603,
-                message: error.to_string(),
-                data: None,
-            })?;
+            .map_err(|error| adapter_error(&error))?;
         let capabilities = serde_json::to_value(match session.lane() {
             a4aa::LaneSession::Acp(session) => session.capabilities().clone(),
             a4aa::LaneSession::Rpc(session) => session.capabilities(),
             a4aa::LaneSession::Cli(_) => adapter.capabilities(),
         })
         .unwrap_or(Value::Null);
+        let (agent_info, session_state) = match session.lane() {
+            a4aa::LaneSession::Acp(session) => (
+                session
+                    .agent_info()
+                    .map(|info| json!({"name": info.name, "version": info.version})),
+                Some(session.session_state()),
+            ),
+            _ => (None, None),
+        };
         let native_session_id = session.session_id().to_owned();
         self.sessions
             .inner
@@ -239,6 +285,8 @@ impl SidecarDelegate {
             "sessionId": id,
             "nativeSessionId": native_session_id,
             "capabilities": capabilities,
+            "agentInfo": agent_info.unwrap_or(Value::Null),
+            "sessionState": session_state.unwrap_or(Value::Null),
         }))
     }
 
@@ -278,11 +326,7 @@ impl SidecarDelegate {
                     .map(str::to_owned),
             })
             .await
-            .map_err(|error| RpcErrorObject {
-                code: -32603,
-                message: error.to_string(),
-                data: None,
-            })?;
+            .map_err(|error| adapter_error(&error))?;
         Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
     }
 
@@ -297,11 +341,10 @@ impl SidecarDelegate {
         };
         match session {
             Some(session) => {
-                session.cancel().await.map_err(|error| RpcErrorObject {
-                    code: -32603,
-                    message: error.to_string(),
-                    data: None,
-                })?;
+                session
+                    .cancel()
+                    .await
+                    .map_err(|error| adapter_error(&error))?;
                 Ok(json!({}))
             }
             None => Err(RpcErrorObject {
@@ -325,11 +368,7 @@ impl SidecarDelegate {
                     Ok(session) => session.close().await,
                     Err(_) => Ok(()), // still referenced by an in-flight turn
                 }
-                .map_err(|error| RpcErrorObject {
-                    code: -32603,
-                    message: error.to_string(),
-                    data: None,
-                })?;
+                .map_err(|error| adapter_error(&error))?;
                 Ok(json!({}))
             }
             None => Ok(json!({})),
@@ -375,9 +414,19 @@ async fn serve() -> i32 {
 ///
 /// Behaviors:
 /// - `initialize` → protocolVersion 1, loadSession true.
-/// - `session/new|load|resume` → fixed/echoed session id.
+/// - `session/new|load|resume` → fixed/echoed session id plus the fixture's
+///   configuration surfaces: `configOptions` (select lists for `model`,
+///   `mode`, `thought_level`, `permissions`) and legacy `modes`/`models`
+///   states. `A4AA_FIXTURE_LEGACY` drops the `model`/`mode` configOptions
+///   so only the legacy surfaces carry those slots.
+/// - `session/set_config_option`, `session/set_mode`, `session/set_model`
+///   update the fixture's advertised state and echo it back.
+/// - `A4AA_FIXTURE_AUTH` advertises auth method `fixture-auth` and fails
+///   session establishment until `authenticate` succeeds for it.
 /// - `session/prompt` → two `agent_message_chunk` updates echoing the text,
 ///   then `{"stopReason":"end_turn"}`. Magic words:
+///   - `config-check` → echoes the current selections as
+///     `config:model=X,mode=Y,effort=Z,permission=W`.
 ///   - contains `permission` → first issues `session/request_permission`
 ///     (option `allow`/`deny`); `deny` selection ends with `refusal`.
 ///   - contains `wait-for-cancel` → streams chunks until `session/cancel`,
@@ -385,6 +434,78 @@ async fn serve() -> i32 {
 fn fixture_agent() -> i32 {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    let legacy = std::env::var_os("A4AA_FIXTURE_LEGACY").is_some();
+    let require_auth = std::env::var_os("A4AA_FIXTURE_AUTH").is_some();
+    let mut authenticated = !require_auth;
+    // Current session configuration selections, keyed by slot.
+    let mut selections = std::collections::BTreeMap::<String, String>::from([
+        ("model".to_owned(), "fixture-small".to_owned()),
+        ("mode".to_owned(), "code".to_owned()),
+        ("thought_level".to_owned(), "low".to_owned()),
+        ("permissions".to_owned(), "safe".to_owned()),
+    ]);
+    let option_id = |slot: &str| format!("cfg-{slot}");
+    let option_values = |slot: &str| -> Vec<(&str, &str)> {
+        match slot {
+            "model" => vec![
+                ("fixture-small", "Fixture Small"),
+                ("fixture-large", "Fixture Large"),
+            ],
+            "mode" => vec![("code", "Code"), ("ask", "Ask")],
+            "thought_level" => vec![("low", "Low"), ("high", "High")],
+            "permissions" => vec![("safe", "Safe"), ("open", "Open")],
+            _ => vec![],
+        }
+    };
+    let config_options = |selections: &std::collections::BTreeMap<String, String>, legacy: bool| {
+        let mut options = Vec::new();
+        for slot in ["model", "mode", "thought_level", "permissions"] {
+            if legacy && (slot == "model" || slot == "mode") {
+                continue;
+            }
+            let values = option_values(slot)
+                .into_iter()
+                .map(|(value, name)| json!({"value": value, "name": name}))
+                .collect::<Vec<_>>();
+            options.push(json!({
+                "id": option_id(slot),
+                "name": slot,
+                "category": slot,
+                "type": "select",
+                "currentValue": selections.get(slot).cloned().unwrap_or_default(),
+                "options": values,
+            }));
+        }
+        Value::Array(options)
+    };
+    let modes_state = |selections: &std::collections::BTreeMap<String, String>| {
+        json!({
+            "currentModeId": selections.get("mode").cloned().unwrap_or_default(),
+            "availableModes": [
+                {"id": "code", "name": "Code"},
+                {"id": "ask", "name": "Ask"}
+            ]
+        })
+    };
+    let models_state = |selections: &std::collections::BTreeMap<String, String>| {
+        json!({
+            "currentModelId": selections.get("model").cloned().unwrap_or_default(),
+            "availableModels": [
+                {"modelId": "fixture-small", "name": "Fixture Small"},
+                {"modelId": "fixture-large", "name": "Fixture Large"}
+            ]
+        })
+    };
+    let session_state = |session_id: Value,
+                         selections: &std::collections::BTreeMap<String, String>,
+                         legacy: bool| {
+        json!({
+            "sessionId": session_id,
+            "configOptions": config_options(selections, legacy),
+            "modes": modes_state(selections),
+            "models": models_state(selections),
+        })
+    };
     // A prompt that streams until `session/cancel` arrives: the response is
     // deferred and answered with `cancelled`.
     let mut deferred_prompt: Option<(Value, String)> = None;
@@ -490,24 +611,120 @@ fn fixture_agent() -> i32 {
                             "mcpCapabilities": {"http": false, "sse": false}
                         },
                         "agentInfo": {"name": "a4aa-fixture", "version": VERSION},
-                        "authMethods": []
+                        "authMethods": if require_auth {
+                            json!([{"id": "fixture-auth", "name": "Fixture Auth"}])
+                        } else {
+                            json!([])
+                        }
                     }
                 }),
             ),
-            "session/new" => write(
-                &stdout,
-                json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"sessionId": "fixture-session-1"}
-                }),
-            ),
-            "session/load" | "session/resume" => write(
-                &stdout,
-                json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"sessionId": params.get("sessionId").cloned().unwrap_or(json!("fixture-resumed"))}
-                }),
-            ),
+            "authenticate" => {
+                let ok = params.get("methodId").and_then(Value::as_str) == Some("fixture-auth");
+                if ok {
+                    authenticated = true;
+                }
+                write(
+                    &stdout,
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {}
+                    }),
+                );
+            }
+            "session/new" => {
+                if !authenticated {
+                    write(
+                        &stdout,
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32000, "message": "authentication required"}
+                        }),
+                    );
+                    continue;
+                }
+                write(
+                    &stdout,
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": session_state(json!("fixture-session-1"), &selections, legacy)
+                    }),
+                );
+            }
+            "session/load" | "session/resume" => {
+                if !authenticated {
+                    write(
+                        &stdout,
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32000, "message": "authentication required"}
+                        }),
+                    );
+                    continue;
+                }
+                write(
+                    &stdout,
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": session_state(
+                            params.get("sessionId").cloned().unwrap_or(json!("fixture-resumed")),
+                            &selections, legacy)
+                    }),
+                );
+            }
+            "session/set_config_option" => {
+                let config_id = params.get("configId").and_then(Value::as_str).unwrap_or("");
+                let value = params.get("value").and_then(Value::as_str).unwrap_or("");
+                let slot = config_id.strip_prefix("cfg-").unwrap_or("");
+                if option_values(slot).iter().any(|(v, _)| *v == value) {
+                    selections.insert(slot.to_owned(), value.to_owned());
+                    write(
+                        &stdout,
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"configOptions": config_options(&selections, legacy)}
+                        }),
+                    );
+                } else {
+                    write(
+                        &stdout,
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32602, "message": format!("unknown option value: {config_id}")}
+                        }),
+                    );
+                }
+            }
+            "session/set_mode" => {
+                let mode = params.get("modeId").and_then(Value::as_str).unwrap_or("");
+                if option_values("mode").iter().any(|(v, _)| *v == mode) {
+                    selections.insert("mode".to_owned(), mode.to_owned());
+                    write(&stdout, json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+                } else {
+                    write(
+                        &stdout,
+                        json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32602, "message": format!("unknown mode: {mode}")}}),
+                    );
+                }
+            }
+            "session/set_model" => {
+                let model = params.get("modelId").and_then(Value::as_str).unwrap_or("");
+                if option_values("model").iter().any(|(v, _)| *v == model) {
+                    selections.insert("model".to_owned(), model.to_owned());
+                    write(
+                        &stdout,
+                        json!({"jsonrpc": "2.0", "id": id,
+                            "result": {"models": models_state(&selections)}}),
+                    );
+                } else {
+                    write(
+                        &stdout,
+                        json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32602, "message": format!("unknown model: {model}")}}),
+                    );
+                }
+            }
             "session/cancel" => {
                 if let Some((prompt_id, _)) = deferred_prompt.take() {
                     write(
@@ -533,6 +750,23 @@ fn fixture_agent() -> i32 {
                     .and_then(Value::as_str)
                     .unwrap_or("fixture-session-1")
                     .to_owned();
+
+                if prompt_text.contains("config-check") {
+                    finish_prompt(
+                        &stdout,
+                        id.unwrap_or(Value::Null),
+                        &session_id,
+                        &format!(
+                            "config:model={},mode={},effort={},perm={}",
+                            selections.get("model").cloned().unwrap_or_default(),
+                            selections.get("mode").cloned().unwrap_or_default(),
+                            selections.get("thought_level").cloned().unwrap_or_default(),
+                            selections.get("permissions").cloned().unwrap_or_default(),
+                        ),
+                        false,
+                    );
+                    continue;
+                }
 
                 if prompt_text.contains("permission") {
                     // Issue a permission request; the response frame arrives

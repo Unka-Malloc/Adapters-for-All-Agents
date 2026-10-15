@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::framing::{self, FrameError};
+use crate::model::RpcEnvelopeSpec;
 use crate::observe::{Direction, SharedObserver};
 
 /// Wire error object for a failed request.
@@ -76,7 +77,16 @@ pub enum CallFailure {
 }
 
 struct Pending {
-    map: HashMap<u64, oneshot::Sender<Result<Value, CallFailure>>>,
+    /// Pending calls keyed by the normalized wire id — numeric and string
+    /// ids share one map because both render to the same key string.
+    map: HashMap<String, oneshot::Sender<Result<Value, CallFailure>>>,
+}
+
+/// Normalized pending-call key for a wire id of either shape.
+fn id_key(id: &Value) -> Option<String> {
+    id.as_u64()
+        .map(|n| n.to_string())
+        .or_else(|| id.as_str().map(str::to_owned))
 }
 
 /// One JSON-RPC peer. Cheap to clone? No — one peer per transport; share via
@@ -90,6 +100,9 @@ pub struct JsonRpcPeer {
     reader: Mutex<Option<JoinHandle<()>>>,
     writer_task: Mutex<Option<JoinHandle<io::Result<()>>>>,
     closed: std::sync::atomic::AtomicBool,
+    notifications: mpsc::UnboundedSender<Option<(String, Value)>>,
+    /// Non-stock envelope conventions (`None` = plain JSON-RPC 2.0).
+    envelope: Option<RpcEnvelopeSpec>,
 }
 
 impl JsonRpcPeer {
@@ -101,6 +114,23 @@ impl JsonRpcPeer {
         delegate: Arc<dyn RpcDelegate>,
         observer: SharedObserver,
         max_message_bytes: usize,
+    ) -> Arc<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::spawn_with_envelope(reader, writer, delegate, observer, max_message_bytes, None)
+    }
+
+    /// Start the peer with explicit wire conventions. `envelope: None` is
+    /// plain JSON-RPC 2.0; a spec describes flat `{type,id,…}` envelopes.
+    pub fn spawn_with_envelope<R, W>(
+        reader: R,
+        writer: W,
+        delegate: Arc<dyn RpcDelegate>,
+        observer: SharedObserver,
+        max_message_bytes: usize,
+        envelope: Option<RpcEnvelopeSpec>,
     ) -> Arc<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -120,6 +150,18 @@ impl JsonRpcPeer {
             Ok(())
         });
 
+        // Preserve notification order without blocking responses or inbound
+        // requests. EOF is queued after the last event, so completion cannot
+        // be overtaken by the transport closing.
+        let (notifications, mut notification_rx) =
+            mpsc::unbounded_channel::<Option<(String, Value)>>();
+        let event_delegate = delegate.clone();
+        tokio::spawn(async move {
+            while let Some(Some((method, params))) = notification_rx.recv().await {
+                event_delegate.on_notification(&method, params).await;
+            }
+            event_delegate.on_closed().await;
+        });
         let peer = Arc::new(Self {
             writer: Mutex::new(Some(writer_tx)),
             pending: Mutex::new(Pending {
@@ -129,6 +171,8 @@ impl JsonRpcPeer {
             reader: Mutex::new(None),
             writer_task: Mutex::new(Some(writer_task)),
             closed: std::sync::atomic::AtomicBool::new(false),
+            notifications,
+            envelope,
         });
 
         let reader_peer = Arc::clone(&peer);
@@ -166,23 +210,26 @@ impl JsonRpcPeer {
                 }
             }
             reader_peer.fail_pending("peer_closed");
-            delegate.on_closed().await;
+            let _ = reader_peer.notifications.send(None);
         });
         *peer.reader.lock().unwrap() = Some(reader_task);
         peer
     }
 
     /// Route one inbound frame. Responses complete pending calls inline;
-    /// requests and notifications each run on their own task so a slow
-    /// delegate can never block the read loop (a `session/prompt` request
+    /// requests run on independent tasks and notifications use an ordered
+    /// queue, so a slow delegate never blocks the read loop (a `session/prompt` request
     /// must not starve a concurrent `session/cancel`).
     fn dispatch(self: &Arc<Self>, frame: Value, delegate: Arc<dyn RpcDelegate>) {
+        if self.envelope.is_some() {
+            return self.dispatch_envelope(frame, delegate);
+        }
         let is_response = frame.get("id").is_some()
             && frame.get("method").is_none()
             && (frame.get("result").is_some() || frame.get("error").is_some());
         if is_response {
-            let id = frame.get("id").and_then(Value::as_u64);
-            let reply = id.and_then(|id| self.pending.lock().unwrap().map.remove(&id));
+            let key = frame.get("id").and_then(id_key);
+            let reply = key.and_then(|id| self.pending.lock().unwrap().map.remove(&id));
             if let Some(reply) = reply {
                 let outcome = if let Some(error) = frame.get("error") {
                     Err(CallFailure::Remote(RpcErrorObject {
@@ -245,9 +292,155 @@ impl JsonRpcPeer {
                 });
             }
             None => {
+                let _ = self.notifications.send(Some((method, params)));
+            }
+        }
+    }
+
+    /// Inbound classification for a declared non-stock envelope: a frame
+    /// whose `method_field` equals `response_method` completes a pending
+    /// call; any other `id`-bearing frame is an agent→host request; an
+    /// id-less frame is a notification.
+    fn dispatch_envelope(&self, frame: Value, delegate: Arc<dyn RpcDelegate>) {
+        let Some(envelope) = &self.envelope else {
+            return;
+        };
+        let data_field = envelope.data_field.as_deref().unwrap_or("params");
+        let method = frame
+            .get(envelope.method_field.as_str())
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let id = frame.get("id").cloned();
+        let params = frame.get(data_field).cloned().unwrap_or(Value::Null);
+        let is_response =
+            id.is_some() && envelope.response_method.as_deref() == Some(method.as_str());
+        if let (Some(id), true) = (id.clone(), is_response) {
+            let reply = id_key(&id).and_then(|key| self.pending.lock().unwrap().map.remove(&key));
+            if let Some(reply) = reply {
+                let failed = envelope
+                    .success_field
+                    .as_deref()
+                    .is_some_and(|field| frame.get(field) == Some(&Value::Bool(false)));
+                let outcome = if failed {
+                    let error = frame
+                        .get(envelope.error_field.as_deref().unwrap_or("error"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    Err(CallFailure::Remote(RpcErrorObject {
+                        code: error.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+                        message: error
+                            .as_str()
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_else(|| "remote error".to_owned()),
+                        data: (!error.is_null()).then_some(error),
+                    }))
+                } else {
+                    Ok(frame
+                        .get(envelope.result_field.as_deref().unwrap_or("result"))
+                        .cloned()
+                        .unwrap_or(Value::Null))
+                };
+                let _ = reply.send(outcome);
+            }
+            return;
+        }
+        match id {
+            Some(id) => {
+                let Some(writer) = self.writer.lock().unwrap().clone() else {
+                    return;
+                };
+                let method_field = envelope.method_field.clone();
+                let response_method = envelope.response_method.clone();
+                let command_field = envelope.command_field.clone();
+                let result_field = envelope
+                    .result_field
+                    .clone()
+                    .unwrap_or_else(|| "result".to_owned());
+                let error_field = envelope
+                    .error_field
+                    .clone()
+                    .unwrap_or_else(|| "error".to_owned());
+                let success_field = envelope.success_field.clone();
+                let request_method = method.clone();
                 tokio::spawn(async move {
-                    delegate.on_notification(&method, params).await;
+                    let outcome = match tokio::spawn(async move {
+                        delegate.on_request(&request_method, params).await
+                    })
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(_) => Err(RpcErrorObject::internal("delegate panicked")),
+                    };
+                    let mut response = serde_json::Map::new();
+                    if let Some(marker) = response_method {
+                        response.insert(method_field, Value::String(marker));
+                    }
+                    if let Some(field) = &command_field {
+                        response.insert(field.clone(), json!(method));
+                    }
+                    response.insert("id".into(), id);
+                    match outcome {
+                        Ok(result) => {
+                            if let Some(field) = &success_field {
+                                response.insert(field.clone(), json!(true));
+                            }
+                            response.insert(result_field, result);
+                        }
+                        Err(error) => {
+                            if let Some(field) = &success_field {
+                                response.insert(field.clone(), json!(false));
+                            }
+                            response.insert(
+                                error_field,
+                                json!({"code": error.code, "message": error.message, "data": error.data}),
+                            );
+                        }
+                    }
+                    let _ = writer.send(Value::Object(response));
                 });
+            }
+            None => {
+                let _ = self.notifications.send(Some((method, params)));
+            }
+        }
+    }
+
+    /// Encode one outbound frame under the active envelope.
+    fn encode_frame(&self, method: &str, params: Value, id: Option<Value>) -> Value {
+        match &self.envelope {
+            None => {
+                let mut frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
+                if let Some(id) = id {
+                    frame["id"] = id;
+                }
+                frame
+            }
+            Some(envelope) => {
+                let mut frame = serde_json::Map::new();
+                frame.insert(
+                    envelope.method_field.clone(),
+                    Value::String(method.to_owned()),
+                );
+                if let Some(id) = id {
+                    frame.insert("id".into(), id);
+                }
+                if envelope.params_inline {
+                    if let Value::Object(map) = params {
+                        frame.extend(map);
+                    } else if !params.is_null() {
+                        frame.insert("params".into(), params);
+                    }
+                } else {
+                    frame.insert("params".into(), params);
+                }
+                Value::Object(frame)
             }
         }
     }
@@ -260,7 +453,17 @@ impl JsonRpcPeer {
         let Some(writer) = self.writer.lock().unwrap().clone() else {
             return Err(CallFailure::Transport("peer_closed".into()));
         };
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let serial = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (wire_id, key) = if self
+            .envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.string_ids)
+        {
+            let wire = format!("a4aa-{serial}");
+            (json!(wire.clone()), wire)
+        } else {
+            (json!(serial), serial.to_string())
+        };
         let (tx, rx) = oneshot::channel();
         {
             // `closed` is set before fail_pending drains the map, so once
@@ -271,11 +474,11 @@ impl JsonRpcPeer {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(CallFailure::Transport("peer_closed".into()));
             }
-            pending.map.insert(id, tx);
+            pending.map.insert(key.clone(), tx);
         }
-        let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let frame = self.encode_frame(method, params, Some(wire_id));
         if writer.send(frame).is_err() {
-            self.pending.lock().unwrap().map.remove(&id);
+            self.pending.lock().unwrap().map.remove(&key);
             return Err(CallFailure::Transport("writer_closed".into()));
         }
         match rx.await {
@@ -289,7 +492,7 @@ impl JsonRpcPeer {
         let Some(writer) = self.writer.lock().unwrap().clone() else {
             return Err(CallFailure::Transport("peer_closed".into()));
         };
-        let frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let frame = self.encode_frame(method, params, None);
         writer
             .send(frame)
             .map_err(|_| CallFailure::Transport("writer_closed".into()))
@@ -326,5 +529,6 @@ impl JsonRpcPeer {
             task.abort();
         }
         self.fail_pending("peer_closed");
+        let _ = self.notifications.send(None);
     }
 }

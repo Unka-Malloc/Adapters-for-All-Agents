@@ -3,11 +3,13 @@
 
 use a4aa::rpc::JsonRpcPeer;
 use a4aa::{
-    Adapter, AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvPolicy, LaneSpec,
+    Adapter, AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvPolicy, EnvValue, LaneSpec,
     PermissionDecision, PermissionHandler, PermissionPrompt, PromptChannel, RpcCallSpec,
-    RpcLaneSpec, SessionRequest, StreamMode, TurnRequest,
+    RpcLaneSpec, SelectorPhase, SelectorSupport, SessionConfig, SessionRequest, StreamMode,
+    TurnRequest,
 };
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -41,6 +43,8 @@ fn rpc_spec() -> AgentSpec {
         id: "fixture-rpc".into(),
         client_name: None,
         lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+            initialize: None,
+            initialized: None,
             session_open: Some(RpcCallSpec {
                 method: "session/new".into(),
                 params: json!({"cwd": "{cwd}", "mcpServers": []}),
@@ -56,9 +60,16 @@ fn rpc_spec() -> AgentSpec {
                 method: "session/cancel".into(),
                 params: json!({"sessionId": "{sessionId}"}),
             }),
+            session_resume: None,
+            completion: None,
             session_close: None,
             text_event_method: Some("session/update".into()),
+            text_path: None,
             result_text_path: Some("stopReason".into()),
+            pre_turn: vec![],
+            session_scope: Default::default(),
+            kill_on_cancel: false,
+            envelope: None,
             passthrough: vec![],
         })),
         command: fixture_command(),
@@ -82,6 +93,16 @@ fn collect_text(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> String {
         }
     }
     text
+}
+
+struct BeforeTurnCount(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl a4aa::BeforeTurn for BeforeTurnCount {
+    async fn run(&self) -> a4aa::Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 // ------------------------------- ACP --------------------------------
@@ -276,11 +297,24 @@ fn cli_spec(
     AgentSpec {
         id: "fixture-cli".into(),
         client_name: None,
-        lane: LaneSpec::Cli(CliLaneSpec {
+        lane: LaneSpec::Cli(Box::new(CliLaneSpec {
             args,
             prompt_channel: channel,
             stream,
-        }),
+            resume_args: vec![],
+            stdin_template: None,
+            json_lines: false,
+            session_id_path: None,
+            usage_path: None,
+            open_args: vec![],
+            binding_file_env: None,
+            binding_receipt_shape: Default::default(),
+            result_selector: None,
+            result_selector_field: None,
+            result_path: None,
+            execution_modes: vec![],
+            permission_modes: vec![],
+        })),
         command: CommandSpec {
             program: program.into(),
             args: vec![],
@@ -289,6 +323,459 @@ fn cli_spec(
         },
         max_output_bytes: cap,
     }
+}
+
+#[test]
+fn rpc_selector_support_distinguishes_session_defaults_from_turn_overrides() {
+    let mut spec = rpc_spec();
+    let LaneSpec::Rpc(rpc) = &mut spec.lane else {
+        unreachable!()
+    };
+    rpc.initialize = Some(RpcCallSpec {
+        method: "initialize".into(),
+        params: json!({"model": "{model}"}),
+    });
+    rpc.prompt.params = json!({
+        "prompt": "{prompt}",
+        "effort": "{effort}",
+    });
+
+    let session = spec.selector_support(SelectorPhase::Session);
+    assert_eq!(session.model, SelectorSupport::Applied);
+    assert_eq!(session.effort, SelectorSupport::Applied);
+    let turn = spec.selector_support(SelectorPhase::Turn);
+    assert_eq!(turn.model, SelectorSupport::Unsupported);
+    assert_eq!(turn.effort, SelectorSupport::Applied);
+}
+
+#[test]
+fn cli_selector_support_counts_only_reachable_stdin_templates() {
+    let mut argv_prompt = cli_spec(
+        "cat",
+        vec!["{prompt}".into()],
+        PromptChannel::ArgOnly,
+        StreamMode::Stdio,
+        None,
+    );
+    let LaneSpec::Cli(cli) = &mut argv_prompt.lane else {
+        unreachable!()
+    };
+    cli.stdin_template = Some(json!({"model": "{model}", "effort": "{effort}"}));
+    let support = argv_prompt.selector_support(SelectorPhase::Turn);
+    assert_eq!(support.model, SelectorSupport::Unsupported);
+    assert_eq!(support.effort, SelectorSupport::Unsupported);
+
+    let mut stdin_prompt = cli_spec("cat", vec![], PromptChannel::Stdin, StreamMode::Stdio, None);
+    let LaneSpec::Cli(cli) = &mut stdin_prompt.lane else {
+        unreachable!()
+    };
+    cli.stdin_template = Some(json!({"model": "{model}", "effort": "{effort}"}));
+    let support = stdin_prompt.selector_support(SelectorPhase::Turn);
+    assert_eq!(support.model, SelectorSupport::Applied);
+    assert_eq!(support.effort, SelectorSupport::Applied);
+}
+
+#[tokio::test]
+async fn rpc_session_selectors_require_a_reachable_setup_call() {
+    for (resuming, process_scope) in [(false, false), (true, false), (false, true)] {
+        for selector in ["model", "effort", "mode", "permission"] {
+            let mut spec = rpc_spec();
+            // A valid preflight must reject before this program can spawn.
+            spec.command.program = "a4aa-unreachable-setup-fixture".into();
+            let LaneSpec::Rpc(rpc) = &mut spec.lane else {
+                unreachable!()
+            };
+            let selected = RpcCallSpec {
+                method: "session/new".into(),
+                params: json!({(selector): format!("{{{selector}}}")}),
+            };
+            let unselected = RpcCallSpec {
+                method: "session/resume".into(),
+                params: json!({}),
+            };
+            if resuming || process_scope {
+                rpc.session_open = Some(selected);
+                rpc.session_resume = Some(unselected);
+            } else {
+                rpc.session_open = Some(unselected);
+                rpc.session_resume = Some(selected);
+            }
+            if process_scope {
+                rpc.session_scope = a4aa::SessionScope::Process;
+            }
+            let mut config = SessionConfig::default();
+            match selector {
+                "model" => config.model = Some("selected".into()),
+                "effort" => config.effort = Some("selected".into()),
+                "mode" => config.mode = Some("selected".into()),
+                "permission" => config.permission = Some("selected".into()),
+                _ => unreachable!(),
+            }
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let result = Adapter::new(spec)
+                .open_session(
+                    SessionRequest {
+                        resume: resuming.then(|| "prior-session".into()),
+                        config,
+                        ..Default::default()
+                    },
+                    tx,
+                )
+                .await;
+            let error = match result {
+                Ok(_) => panic!("unused setup selectors must fail before spawn"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, format!("agent_{selector}_unsupported"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn blank_selectors_fail_before_session_spawn_or_turn_reservation() {
+    let spec = cli_spec(
+        "a4aa-unreachable-selector-fixture",
+        vec![
+            "--model".into(),
+            "{model}".into(),
+            "--effort".into(),
+            "{effort}".into(),
+        ],
+        PromptChannel::Stdin,
+        StreamMode::Stdio,
+        None,
+    );
+    let reservations = Arc::new(AtomicUsize::new(0));
+    let adapter = Adapter::new(spec).before_turn(Arc::new(BeforeTurnCount(reservations.clone())));
+    for selector in ["model", "effort"] {
+        let config = SessionConfig {
+            model: (selector == "model").then(|| "  ".into()),
+            effort: (selector == "effort").then(|| "  ".into()),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = match adapter
+            .open_session(
+                SessionRequest {
+                    config,
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await
+        {
+            Ok(_) => panic!("blank session selector must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, format!("agent_{selector}_unsupported"));
+    }
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("CLI session");
+    for (model, effort, code) in [
+        (Some(" ".into()), None, "agent_model_unsupported"),
+        (None, Some(" ".into()), "agent_effort_unsupported"),
+    ] {
+        let error = session
+            .prompt(TurnRequest {
+                text: "task".into(),
+                model,
+                effort,
+            })
+            .await
+            .expect_err("blank turn selector must be rejected");
+        assert_eq!(error.code, code);
+    }
+    assert_eq!(reservations.load(Ordering::SeqCst), 0);
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn generic_rpc_turn_selectors_are_applied_by_prompt_templates() {
+    let script = r#"
+mode=""
+permission=""
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      mode=$(printf '%s' "$line" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
+      permission=$(printf '%s' "$line" | sed -n 's/.*"permission":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"generic-rpc"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      model=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+      effort=$(printf '%s' "$line" | sed -n 's/.*"effort":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"model=%s;effort=%s;mode=%s;permission=%s"}}\n' "$id" "$model" "$effort" "$mode" "$permission" ;;
+  esac
+done
+"#;
+    let mut spec = rpc_spec();
+    spec.id = "custom.rpc".into();
+    let LaneSpec::Rpc(rpc) = &mut spec.lane else {
+        unreachable!()
+    };
+    rpc.initialize = Some(RpcCallSpec {
+        method: "initialize".into(),
+        params: json!({
+            "mode": "{mode}",
+            "permission": "{permission}",
+        }),
+    });
+    rpc.initialized = Some("initialized".into());
+    rpc.prompt.params = json!({
+        "sessionId": "{sessionId}",
+        "prompt": "{prompt}",
+        "model": "{model}",
+        "effort": "{effort}",
+    });
+    rpc.result_text_path = Some("text".into());
+    spec.command = CommandSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+        env: EnvPolicy::default(),
+    };
+
+    let support = spec.selector_support(SelectorPhase::Turn);
+    assert_eq!(support.model, SelectorSupport::Applied);
+    assert_eq!(support.effort, SelectorSupport::Applied);
+    let session_support = spec.selector_support(SelectorPhase::Session);
+    assert_eq!(session_support.model, SelectorSupport::Applied);
+    assert_eq!(session_support.effort, SelectorSupport::Applied);
+    assert_eq!(session_support.mode, SelectorSupport::Applied);
+    assert_eq!(session_support.permission, SelectorSupport::Applied);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(
+            SessionRequest {
+                config: SessionConfig {
+                    model: Some("profile-model".into()),
+                    effort: Some("medium".into()),
+                    mode: Some("plan".into()),
+                    permission: Some("review".into()),
+                    ..Default::default()
+                },
+                ..SessionRequest::default()
+            },
+            tx,
+        )
+        .await
+        .expect("open generic RPC session");
+    let outcome = session
+        .prompt(turn("hello"))
+        .await
+        .expect("session model and effort fall back through turn template");
+    assert_eq!(
+        outcome.text,
+        "model=profile-model;effort=medium;mode=plan;permission=review"
+    );
+    let override_outcome = session
+        .prompt(TurnRequest {
+            text: "override".into(),
+            model: Some("model-x".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .expect("explicit turn values override session defaults");
+    assert_eq!(
+        override_outcome.text,
+        "model=model-x;effort=high;mode=plan;permission=review"
+    );
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn generic_rpc_session_defaults_apply_open_only_and_reject_turn_override() {
+    let script = r#"
+model=""
+effort=""
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"session/new"'*)
+      model=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+      effort=$(printf '%s' "$line" | sed -n 's/.*"effort":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-defaults"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"model=%s;effort=%s"}}\n' "$id" "$model" "$effort" ;;
+  esac
+done
+"#;
+    let mut spec = rpc_spec();
+    spec.id = "custom.rpc.session-defaults".into();
+    let LaneSpec::Rpc(rpc) = &mut spec.lane else {
+        unreachable!()
+    };
+    rpc.session_open = Some(RpcCallSpec {
+        method: "session/new".into(),
+        params: json!({
+            "cwd": "{cwd}",
+            "model": "{model}",
+            "effort": "{effort}",
+        }),
+    });
+    rpc.prompt.params = json!({
+        "sessionId": "{sessionId}",
+        "prompt": "{prompt}",
+    });
+    rpc.result_text_path = Some("text".into());
+    spec.command = CommandSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+        env: EnvPolicy::default(),
+    };
+    let support = spec.selector_support(SelectorPhase::Session);
+    assert_eq!(support.model, SelectorSupport::Applied);
+    assert_eq!(support.effort, SelectorSupport::Applied);
+    let support = spec.selector_support(SelectorPhase::Turn);
+    assert_eq!(support.model, SelectorSupport::Unsupported);
+    assert_eq!(support.effort, SelectorSupport::Unsupported);
+
+    let before_turn_count = Arc::new(AtomicUsize::new(0));
+    let adapter =
+        Adapter::new(spec).before_turn(Arc::new(BeforeTurnCount(before_turn_count.clone())));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(
+            SessionRequest {
+                config: SessionConfig {
+                    model: Some("profile-model".into()),
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+                ..SessionRequest::default()
+            },
+            tx,
+        )
+        .await
+        .expect("open session with setup selectors");
+    let outcome = session
+        .prompt(turn("default turn"))
+        .await
+        .expect("session defaults applied by session_open");
+    assert_eq!(outcome.text, "model=profile-model;effort=medium");
+    assert_eq!(before_turn_count.load(Ordering::SeqCst), 1);
+
+    let error = session
+        .prompt(TurnRequest {
+            text: "override".into(),
+            model: Some("operation-model".into()),
+            effort: None,
+        })
+        .await
+        .expect_err("an unconsumed operation override must fail closed");
+    assert_eq!(error.code, "agent_model_unsupported");
+    assert_eq!(before_turn_count.load(Ordering::SeqCst), 1);
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn generic_cli_selectors_follow_templates_and_fail_before_before_turn() {
+    let script = r#"printf '%s %s' "$0" "$*""#;
+    let mut spec = cli_spec(
+        "sh",
+        vec![
+            "--model".into(),
+            "{model}".into(),
+            "--effort".into(),
+            "{effort}".into(),
+            "{prompt}".into(),
+        ],
+        PromptChannel::ArgOnly,
+        StreamMode::Stdio,
+        None,
+    );
+    spec.id = "custom.agent".into();
+    spec.command.args = vec!["-c".into(), script.into()];
+    let support = spec.selector_support(SelectorPhase::Turn);
+    assert_eq!(support.model, SelectorSupport::Applied);
+    assert_eq!(support.effort, SelectorSupport::Applied);
+    let session_support = spec.selector_support(SelectorPhase::Session);
+    assert_eq!(session_support.model, SelectorSupport::Applied);
+    assert_eq!(session_support.effort, SelectorSupport::Applied);
+
+    let before_turn_count = Arc::new(AtomicUsize::new(0));
+    let adapter =
+        Adapter::new(spec).before_turn(Arc::new(BeforeTurnCount(before_turn_count.clone())));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(
+            SessionRequest {
+                config: SessionConfig {
+                    model: Some("profile-model".into()),
+                    effort: Some("medium".into()),
+                    ..Default::default()
+                },
+                ..SessionRequest::default()
+            },
+            tx,
+        )
+        .await
+        .expect("open generic CLI session");
+    let outcome = session
+        .prompt(turn("hello"))
+        .await
+        .expect("session selectors fall back through turn template");
+    assert!(outcome
+        .text
+        .contains("--model profile-model --effort medium hello"));
+    let override_outcome = session
+        .prompt(TurnRequest {
+            text: "override".into(),
+            model: Some("model-x".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .expect("explicit per-turn selectors override defaults");
+    assert!(override_outcome
+        .text
+        .contains("--model model-x --effort high override"));
+    assert_eq!(before_turn_count.load(Ordering::SeqCst), 2);
+    session.close().await.expect("close");
+
+    let mut spec = cli_spec(
+        "sh",
+        vec!["{prompt}".into()],
+        PromptChannel::ArgOnly,
+        StreamMode::Stdio,
+        None,
+    );
+    spec.id = "custom.agent".into();
+    spec.command.args = vec!["-c".into(), "printf called".into()];
+    let before_turn_count = Arc::new(AtomicUsize::new(0));
+    let adapter =
+        Adapter::new(spec).before_turn(Arc::new(BeforeTurnCount(before_turn_count.clone())));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open generic CLI session");
+    let model_error = session
+        .prompt(TurnRequest {
+            text: "hello".into(),
+            model: Some("model-x".into()),
+            effort: None,
+        })
+        .await
+        .expect_err("unconsumed model must fail closed");
+    assert_eq!(model_error.code, "agent_model_unsupported");
+    let effort_error = session
+        .prompt(TurnRequest {
+            text: "hello".into(),
+            model: None,
+            effort: Some("high".into()),
+        })
+        .await
+        .expect_err("unconsumed effort must fail closed");
+    assert_eq!(effort_error.code, "agent_effort_unsupported");
+    assert_eq!(before_turn_count.load(Ordering::SeqCst), 0);
+    session.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -520,6 +1007,295 @@ async fn sidecar_drives_fixture_end_to_end() {
     peer.call("session/close", json!({"sessionId": session_id}))
         .await
         .expect("session/close");
+    peer.close().await;
+    let _ = child.kill().await;
+}
+
+// --------------------- ACP session configuration ---------------------
+
+fn fixture_env(vars: &[(&str, &str)]) -> EnvPolicy {
+    EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: vars
+            .iter()
+            .map(|(key, value)| (key.to_string(), EnvValue::Literal((*value).to_owned())))
+            .collect(),
+    }
+}
+
+fn acp_spec_with_env(vars: &[(&str, &str)]) -> AgentSpec {
+    let mut spec = acp_spec();
+    spec.command.env = fixture_env(vars);
+    spec
+}
+
+fn options(
+    model: Option<&str>,
+    mode: Option<&str>,
+    effort: Option<&str>,
+    permission: Option<&str>,
+) -> SessionConfig {
+    SessionConfig {
+        model: model.map(str::to_owned),
+        mode: mode.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+        permission: permission.map(str::to_owned),
+        instructions: None,
+        provider: None,
+    }
+}
+
+async fn config_of(
+    session: &a4aa::AgentSession,
+    rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+) -> String {
+    session
+        .prompt(turn("config-check"))
+        .await
+        .expect("config-check prompt");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    collect_text(rx)
+}
+
+#[tokio::test]
+async fn acp_session_options_apply_via_config_options() {
+    let adapter = Adapter::new(acp_spec());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let request = SessionRequest {
+        config: options(
+            Some("fixture-large"),
+            Some("ask"),
+            Some("high"),
+            Some("open"),
+        ),
+        ..SessionRequest::default()
+    };
+    let session = adapter.open_session(request, tx).await.expect("open");
+    assert_eq!(
+        config_of(&session, &mut rx).await,
+        "echo: config:model=fixture-large,mode=ask,effort=high,perm=open"
+    );
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn acp_session_options_unadvertised_fail_closed() {
+    let adapter = Adapter::new(acp_spec());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let request = SessionRequest {
+        config: options(Some("no-such-model"), None, None, None),
+        ..SessionRequest::default()
+    };
+    let error = match adapter.open_session(request, tx).await {
+        Ok(_) => panic!("unadvertised model must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "agent_configuration_unavailable");
+}
+
+#[tokio::test]
+async fn acp_session_options_fall_back_to_legacy_surfaces() {
+    // A4AA_FIXTURE_LEGACY drops the model/mode configOptions — the legacy
+    // `models`/`modes` surfaces + `session/set_model`/`session/set_mode`
+    // carry those slots instead.
+    let adapter = Adapter::new(acp_spec_with_env(&[("A4AA_FIXTURE_LEGACY", "1")]));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let request = SessionRequest {
+        config: options(
+            Some("fixture-large"),
+            Some("ask"),
+            Some("high"),
+            Some("open"),
+        ),
+        ..SessionRequest::default()
+    };
+    let session = adapter.open_session(request, tx).await.expect("open");
+    assert_eq!(
+        config_of(&session, &mut rx).await,
+        "echo: config:model=fixture-large,mode=ask,effort=high,perm=open"
+    );
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn acp_authenticate_retries_session_establishment() {
+    // A4AA_FIXTURE_AUTH advertises `fixture-auth` and rejects session/new
+    // until `authenticate` succeeds — the lane must try the advertised
+    // methods and retry once.
+    let adapter = Adapter::new(acp_spec_with_env(&[("A4AA_FIXTURE_AUTH", "1")]));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open after authenticate");
+    let outcome = session.prompt(turn("hi")).await.expect("prompt");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn acp_turn_level_model_applies_before_prompt() {
+    let adapter = Adapter::new(acp_spec());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open");
+    let outcome = session
+        .prompt(TurnRequest {
+            text: "config-check".into(),
+            model: Some("fixture-large".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .expect("prompt");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        collect_text(&mut rx),
+        "echo: config:model=fixture-large,mode=code,effort=high,perm=safe"
+    );
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn acp_negotiated_selector_validation_precedes_before_turn() {
+    let before_turn_count = Arc::new(AtomicUsize::new(0));
+    let adapter =
+        Adapter::new(acp_spec()).before_turn(Arc::new(BeforeTurnCount(before_turn_count.clone())));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open ACP session");
+
+    let session_support = session.selector_support(SelectorPhase::Session);
+    assert_eq!(session_support.model, SelectorSupport::Applied);
+    assert_eq!(session_support.effort, SelectorSupport::Applied);
+    assert_eq!(session_support.mode, SelectorSupport::Applied);
+    assert_eq!(session_support.permission, SelectorSupport::Applied);
+    let turn_support = session.selector_support(SelectorPhase::Turn);
+    assert_eq!(turn_support.model, SelectorSupport::Applied);
+    assert_eq!(turn_support.effort, SelectorSupport::Applied);
+    assert_eq!(turn_support.mode, SelectorSupport::Unsupported);
+    assert_eq!(turn_support.permission, SelectorSupport::Unsupported);
+
+    let error = session
+        .prompt(TurnRequest {
+            text: "must not be sent".into(),
+            model: Some("not-advertised".into()),
+            effort: None,
+        })
+        .await
+        .expect_err("unadvertised ACP model must fail in preflight");
+    assert_eq!(error.code, "agent_configuration_unavailable");
+    assert_eq!(before_turn_count.load(Ordering::SeqCst), 0);
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn acp_agent_info_and_session_state_are_exposed() {
+    let adapter = Adapter::new(acp_spec());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open");
+    let a4aa::LaneSession::Acp(acp) = session.lane() else {
+        panic!("expected acp lane");
+    };
+    let info = acp.agent_info().expect("agentInfo");
+    assert_eq!(info.name, "a4aa-fixture");
+    let state = acp.session_state();
+    assert!(
+        state["configOptions"].is_array(),
+        "sessionState must carry configOptions: {state}"
+    );
+    assert_eq!(
+        state["modes"]["currentModeId"], "code",
+        "sessionState must carry the modes surface: {state}"
+    );
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn sidecar_session_options_and_structured_errors() {
+    let mut child = tokio::process::Command::new(FIXTURE)
+        .arg("serve")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn a4aa serve");
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let delegate = Arc::new(SidecarEvents {
+        notifications: notice_tx,
+        permission_granted: std::sync::atomic::AtomicBool::new(false),
+    });
+    let peer = JsonRpcPeer::spawn(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+        delegate,
+        a4aa::observe::none(),
+        a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+    );
+
+    // Open with session options: applied through the fixture's surfaces.
+    let opened = peer
+        .call(
+            "session/open",
+            json!({
+                "spec": serde_json::to_value(acp_spec()).unwrap(),
+                "options": {"model": "fixture-large", "effort": "high"}
+            }),
+        )
+        .await
+        .expect("session/open with options");
+    assert_eq!(opened["agentInfo"]["name"], "a4aa-fixture");
+    let options = opened["sessionState"]["configOptions"]
+        .as_array()
+        .expect("configOptions surface");
+    let model_option = options
+        .iter()
+        .find(|o| o["category"] == "model")
+        .expect("model option");
+    assert_eq!(model_option["currentValue"], "fixture-large");
+
+    // An unadvertised option fails with a typed data.code.
+    let failure = match peer
+        .call(
+            "session/open",
+            json!({
+                "spec": serde_json::to_value(acp_spec()).unwrap(),
+                "options": {"model": "no-such-model"}
+            }),
+        )
+        .await
+    {
+        Ok(_) => panic!("unadvertised model must error"),
+        Err(failure) => failure,
+    };
+    let a4aa::rpc::CallFailure::Remote(error) = failure else {
+        panic!("expected a remote error object, got {failure:?}");
+    };
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|d| d.get("code"))
+            .and_then(Value::as_str),
+        Some("agent_configuration_unavailable")
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|d| d.get("stage"))
+            .and_then(Value::as_str),
+        Some("session/configuration")
+    );
+
     peer.close().await;
     let _ = child.kill().await;
 }

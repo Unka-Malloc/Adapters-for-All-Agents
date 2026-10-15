@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 
 use crate::env::SecretResolver;
 use crate::error::AdapterError;
-use crate::model::{AgentEvent, AgentSpec, Capabilities, LaneSpec, SessionRequest, TurnOutcome};
+use crate::model::{
+    AgentEvent, AgentSpec, Capabilities, LaneSpec, SelectorPhase, SelectorSupport,
+    SelectorSupportSet, SessionRequest, TurnOutcome,
+};
 use crate::observe::SharedObserver;
 use crate::proto::acp::{AcpLane, AcpSession, PermissionDecision, SessionDelegate};
 use crate::proto::cli::CliLane;
@@ -62,8 +65,10 @@ pub struct CliSession {
 }
 
 impl CliSession {
+    /// The session binding the agent reported on stdout, or `""` until one
+    /// arrives (`sessionIdPath` on the lane spec enables capture).
     pub fn session_id(&self) -> &str {
-        ""
+        self.lane.observed.get().map_or("", String::as_str)
     }
 }
 
@@ -82,15 +87,39 @@ impl AgentSession {
         }
     }
 
+    /// Report this open session's selector support. ACP values reflect the
+    /// session's negotiated configuration choices; other lanes use their
+    /// active AgentSpec templates.
+    pub fn selector_support(&self, phase: SelectorPhase) -> SelectorSupportSet {
+        match &self.lane {
+            LaneSession::Acp(session) => session.selector_support(phase),
+            LaneSession::Rpc(session) => session.selector_support(phase),
+            LaneSession::Cli(session) => {
+                LaneSpec::Cli(Box::new(session.lane.lane.clone())).selector_support(phase)
+            }
+        }
+    }
+
+    /// Validate the effective AwP turn selectors without prompting the
+    /// agent. This runs before BeforeTurn, so unsupported selectors cannot
+    /// reserve paid work.
+    pub fn validate_turn_request(&self, request: &TurnRequest) -> Result<(), AdapterError> {
+        match &self.lane {
+            LaneSession::Acp(session) => session.validate_turn_request(request),
+            _ => validate_turn_selectors(self.selector_support(SelectorPhase::Turn), request),
+        }
+    }
+
     /// Submit one prompt turn to completion. The `before_turn` hook runs
     /// first on every lane; an error aborts the turn before the agent is
     /// asked anything.
     pub async fn prompt(&self, request: TurnRequest) -> Result<TurnOutcome, AdapterError> {
+        self.validate_turn_request(&request)?;
         if let Some(hook) = &self.before_turn {
             hook.run().await?;
         }
         match &self.lane {
-            LaneSession::Acp(session) => session.prompt(request.text).await,
+            LaneSession::Acp(session) => session.prompt(request).await,
             LaneSession::Rpc(session) => {
                 session
                     .prompt(
@@ -123,11 +152,11 @@ impl AgentSession {
     pub async fn cancel(&self) -> Result<(), AdapterError> {
         match &self.lane {
             LaneSession::Acp(session) => session.cancel(),
-            LaneSession::Rpc(session) => session.cancel(),
-            LaneSession::Cli(_) => Err(AdapterError::permanent(
-                "agent_cancel_unsupported",
-                "session/cancel",
-            )),
+            LaneSession::Rpc(session) => session.cancel().await,
+            LaneSession::Cli(session) => {
+                session.lane.cancelled.notify_waiters();
+                Ok(())
+            }
         }
     }
 
@@ -148,6 +177,106 @@ pub struct Adapter {
     observer: SharedObserver,
     permission: Option<Arc<dyn PermissionHandler>>,
     before_turn: Option<Arc<dyn BeforeTurn>>,
+}
+
+fn validate_session_config(spec: &AgentSpec, request: &SessionRequest) -> Result<(), AdapterError> {
+    let config = &request.config;
+    let support = match &spec.lane {
+        LaneSpec::Rpc(rpc) => rpc.session_selector_support(
+            request
+                .resume
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+        ),
+        _ => spec.selector_support(SelectorPhase::Session),
+    };
+    validate_session_selector(
+        config.model.as_deref(),
+        support.model,
+        "agent_model_unsupported",
+    )?;
+    validate_session_selector(
+        config.effort.as_deref(),
+        support.effort,
+        "agent_effort_unsupported",
+    )?;
+    validate_session_selector(
+        config.mode.as_deref(),
+        support.mode,
+        "agent_mode_unsupported",
+    )?;
+    validate_session_selector(
+        config.permission.as_deref(),
+        support.permission,
+        "agent_permission_unsupported",
+    )?;
+
+    if let LaneSpec::Cli(lane) = &spec.lane {
+        validate_cli_allowlist(
+            config.mode.as_deref(),
+            &lane.execution_modes,
+            "agent_mode_unsupported",
+        )?;
+        validate_cli_allowlist(
+            config.permission.as_deref(),
+            &lane.permission_modes,
+            "agent_permission_unsupported",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_session_selector(
+    value: Option<&str>,
+    support: SelectorSupport,
+    code: &'static str,
+) -> Result<(), AdapterError> {
+    if value.is_some_and(|value| value.trim().is_empty() || support == SelectorSupport::Unsupported)
+    {
+        return Err(AdapterError::permanent(code, "session/configuration"));
+    }
+    Ok(())
+}
+
+fn validate_cli_allowlist(
+    value: Option<&str>,
+    allowed: &[String],
+    code: &'static str,
+) -> Result<(), AdapterError> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == value) {
+            return Err(AdapterError::permanent(code, "session/configuration"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_turn_selectors(
+    support: SelectorSupportSet,
+    request: &TurnRequest,
+) -> Result<(), AdapterError> {
+    validate_turn_selector(
+        request.model.as_deref(),
+        support.model,
+        "agent_model_unsupported",
+    )?;
+    validate_turn_selector(
+        request.effort.as_deref(),
+        support.effort,
+        "agent_effort_unsupported",
+    )
+}
+
+fn validate_turn_selector(
+    value: Option<&str>,
+    support: SelectorSupport,
+    code: &'static str,
+) -> Result<(), AdapterError> {
+    if value.is_some_and(|value| value.trim().is_empty() || support == SelectorSupport::Unsupported)
+    {
+        return Err(AdapterError::permanent(code, "turn/configuration"));
+    }
+    Ok(())
 }
 
 impl Adapter {
@@ -201,13 +330,7 @@ impl Adapter {
                 detail: None,
             },
             LaneSpec::Rpc(spec) => spec.capabilities(),
-            LaneSpec::Cli(_) => Capabilities {
-                streaming: true,
-                cancellation: false,
-                session_resume: false,
-                permission_prompts: false,
-                detail: None,
-            },
+            LaneSpec::Cli(spec) => spec.capabilities(),
         }
     }
 
@@ -219,6 +342,7 @@ impl Adapter {
         request: SessionRequest,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<AgentSession, AdapterError> {
+        validate_session_config(&self.spec, &request)?;
         match &self.spec.lane {
             LaneSpec::Acp {
                 mcp_servers,
@@ -294,11 +418,22 @@ impl Adapter {
             LaneSpec::Cli(lane_spec) => {
                 let lane = CliLane {
                     command: self.spec.command.clone(),
-                    lane: lane_spec.clone(),
+                    lane: (**lane_spec).clone(),
                     secrets: self.secrets.clone(),
                     observer: self.observer.clone(),
                     max_output_bytes: self.spec.max_output_bytes,
+                    cancelled: Arc::new(tokio::sync::Notify::new()),
+                    observed: Arc::new(std::sync::OnceLock::new()),
                 };
+                // An explicitly requested resume is already the session's
+                // binding — report it before the first turn emits anything.
+                if let Some(resume) = request.resume.as_deref().filter(|v| !v.trim().is_empty()) {
+                    let _ = lane.observed.set(resume.to_owned());
+                }
+                // A declared session-creation command (`create-chat` style)
+                // runs once here when the request carries no binding; the
+                // observed id resumes every later turn of this session.
+                lane.open_binding(&request).await?;
                 Ok(AgentSession {
                     lane: LaneSession::Cli(CliSession {
                         lane: Arc::new(lane),

@@ -74,10 +74,10 @@ use tokio::sync::mpsc;
 let spec = AgentSpec {
     id: "my-agent".into(),
     client_name: None,
-    lane: LaneSpec::Cli(CliLaneSpec {
+    lane: LaneSpec::Cli(Box::new(CliLaneSpec {
         args: vec!["{prompt}".into()],
         ..Default::default()
-    }),
+    })),
     command: CommandSpec {
         program: "my-agent-cli".into(),
         ..Default::default()

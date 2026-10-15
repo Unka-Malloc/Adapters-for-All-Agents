@@ -15,13 +15,16 @@
 //!   transport hiccups never masquerade as user cancellation.
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    AuthMethodId, AuthenticateRequest, CancelNotification, ContentBlock, InitializeRequest,
+    McpServer, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
     StopReason, TextContent, ToolCallContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,13 +32,123 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::adapter::TurnRequest;
 use crate::bounds;
 use crate::env::SecretResolver;
 use crate::error::AdapterError;
-use crate::model::{AgentEvent, Capabilities, CommandSpec, SessionRequest, TurnOutcome};
+use crate::model::{
+    AgentEvent, AgentInfo, Capabilities, CommandSpec, SelectorPhase, SelectorSupport,
+    SelectorSupportSet, SessionConfig, SessionRequest, TurnOutcome,
+};
 use crate::observe::SharedObserver;
 use crate::supervision::SupervisedChild;
 use crate::transport::stdio;
+
+/// Session-establishment wire types. The official SDK types expose
+/// `session/new` but its response drops the legacy `models` surface and
+/// `_meta`; ACP v1 lets each establishment method return the same state
+/// fields, so a4aa speaks them itself and parses every observed surface.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "session/new", response = serde_json::Value)]
+struct SessionNewWire {
+    cwd: PathBuf,
+    #[serde(rename = "mcpServers")]
+    mcp_servers: Vec<McpServer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "session/load", response = serde_json::Value)]
+struct SessionLoadWire {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    cwd: PathBuf,
+    #[serde(rename = "mcpServers")]
+    mcp_servers: Vec<McpServer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "session/resume", response = serde_json::Value)]
+struct SessionResumeWire {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    cwd: PathBuf,
+    #[serde(rename = "mcpServers")]
+    mcp_servers: Vec<McpServer>,
+}
+
+/// Legacy `session/set_model` — absent from the SDK but still the only
+/// model surface on some agents.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "session/set_model", response = serde_json::Value)]
+struct SetSessionModelWire {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "modelId")]
+    model_id: String,
+}
+
+/// Legacy `models` session surface (current selection + availability).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SessionModelState {
+    current_model_id: String,
+    available_models: Vec<SessionModelEntry>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SessionModelEntry {
+    #[serde(alias = "id")]
+    model_id: String,
+    name: String,
+}
+
+/// The session-configuration surfaces observed on establishment, updated
+/// as `session/set_*` responses arrive. `None` for a surface means the
+/// agent did not report it — unknown, not empty.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SessionSetup {
+    session_id: Option<String>,
+    modes: Option<SessionModeState>,
+    config_options: Option<Vec<SessionConfigOption>>,
+    models: Option<SessionModelState>,
+    #[serde(rename = "_meta")]
+    meta: Option<Value>,
+}
+
+/// Serializable view of `SessionSetup` for hosts.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSetupView<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_options: &'a Option<Vec<SessionConfigOption>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modes: &'a Option<SessionModeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: &'a Option<SessionModelState>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: &'a Option<Value>,
+}
+
+impl SessionSetup {
+    fn parse(value: Value) -> Result<Self, AdapterError> {
+        serde_json::from_value(value).map_err(|error| {
+            AdapterError::permanent("agent_protocol_error", "session/establish").with_detail(
+                format!("session setup response could not be decoded: {error}"),
+            )
+        })
+    }
+
+    fn view(&self) -> SessionSetupView<'_> {
+        SessionSetupView {
+            config_options: &self.config_options,
+            modes: &self.modes,
+            models: &self.models,
+            meta: &self.meta,
+        }
+    }
+}
 
 /// What an agent's permission prompt looks like to the host.
 #[derive(Clone, Debug)]
@@ -86,7 +199,7 @@ impl SessionDelegate for CollectDelegate {
 
 enum SessionCommand {
     Prompt {
-        text: String,
+        request: TurnRequest,
         reply: oneshot::Sender<Result<TurnOutcome, AdapterError>>,
     },
     Close,
@@ -99,6 +212,8 @@ pub struct AcpSession {
     driver: JoinHandle<()>,
     session_id: String,
     capabilities: Capabilities,
+    agent_info: Option<AgentInfo>,
+    state: Arc<std::sync::Mutex<SessionSetup>>,
     prompt_lock: Mutex<()>,
 }
 
@@ -111,16 +226,68 @@ impl AcpSession {
         &self.capabilities
     }
 
+    /// The agent's self-reported implementation identity from `initialize`.
+    /// Self-reported — never an attestation.
+    pub fn agent_info(&self) -> Option<&AgentInfo> {
+        self.agent_info.as_ref()
+    }
+
+    /// The session's observed configuration surfaces (`configOptions`,
+    /// `modes`, legacy `models`, `_meta`) as they stand after
+    /// establishment and any applied `session/set_*` calls. Surfaces the
+    /// agent did not report are absent — unknown, not empty.
+    pub fn session_state(&self) -> Value {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        serde_json::to_value(state.view()).unwrap_or(Value::Null)
+    }
+
+    /// Report selector support from the configuration surfaces negotiated
+    /// for this ACP session.
+    pub fn selector_support(&self, phase: SelectorPhase) -> SelectorSupportSet {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match phase {
+            SelectorPhase::Session => SelectorSupportSet {
+                model: selector_support(model_selector_available(&state)),
+                effort: selector_support(config_selector_available(&state, "thought_level")),
+                mode: selector_support(mode_selector_available(&state)),
+                permission: selector_support(config_selector_available(&state, "permissions")),
+            },
+            SelectorPhase::Turn => SelectorSupportSet {
+                model: selector_support(model_selector_available(&state)),
+                effort: selector_support(config_selector_available(&state, "thought_level")),
+                mode: SelectorSupport::Unsupported,
+                permission: SelectorSupport::Unsupported,
+            },
+        }
+    }
+
+    /// Check turn-level selectors against the session's actual advertised
+    /// options without changing the active configuration.
+    pub fn validate_turn_request(&self, request: &TurnRequest) -> Result<(), AdapterError> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(model) = request.model.as_deref() {
+            if !model_value_available(&state, model) {
+                return Err(config_unavailable("model", model));
+            }
+        }
+        if let Some(effort) = request.effort.as_deref() {
+            if !config_value_available(&state, "thought_level", effort) {
+                return Err(config_unavailable("thought_level", effort));
+            }
+        }
+        Ok(())
+    }
+
     /// Submit one prompt turn. Serialized: a second `prompt` waits for the
-    /// in-flight one rather than interleaving on the wire.
-    pub async fn prompt(&self, text: impl Into<String>) -> Result<TurnOutcome, AdapterError> {
+    /// in-flight one rather than interleaving on the wire. Turn-level
+    /// `model`/`effort` values are applied through the agent's advertised
+    /// configuration surface before the prompt; a requested value the
+    /// agent cannot express fails the turn rather than being ignored.
+    pub async fn prompt(&self, request: TurnRequest) -> Result<TurnOutcome, AdapterError> {
         let _guard = self.prompt_lock.lock().await;
         let (reply, outcome) = oneshot::channel();
         self.command
-            .send(SessionCommand::Prompt {
-                text: text.into(),
-                reply,
-            })
+            .send(SessionCommand::Prompt { request, reply })
             .map_err(|_| AdapterError::uncertain("agent_connection_closed", "session/prompt"))?;
         outcome
             .await
@@ -198,6 +365,7 @@ impl AcpLane {
                 mcp_servers,
                 prefer_load,
                 resume,
+                config: request.config,
             },
             command_rx,
             ready,
@@ -212,6 +380,8 @@ impl AcpLane {
             driver,
             session_id: opened.session_id,
             capabilities: opened.capabilities,
+            agent_info: opened.agent_info,
+            state: opened.state,
             prompt_lock: Mutex::new(()),
         })
     }
@@ -221,6 +391,8 @@ struct Opened {
     connection: ConnectionTo<Agent>,
     session_id: String,
     capabilities: Capabilities,
+    agent_info: Option<AgentInfo>,
+    state: Arc<std::sync::Mutex<SessionSetup>>,
 }
 
 /// Handshake result channel — `serve` delivers `Opened` once; a connection
@@ -233,6 +405,7 @@ struct ServeContext {
     mcp_servers: Vec<Value>,
     prefer_load: bool,
     resume: Option<String>,
+    config: SessionConfig,
 }
 
 /// The connection foreground: performs the handshake, then serves turn
@@ -315,6 +488,59 @@ async fn serve(
     commands: &mut mpsc::UnboundedReceiver<SessionCommand>,
     ready: Arc<ReadySlot>,
 ) -> Result<(), AdapterError> {
+    let opened = match open_session(&connection, context).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            // Handshake failures keep their typed code/stage: deliver them
+            // through `ready` rather than the connection's error channel,
+            // which would flatten every failure into agent_protocol_failed.
+            match ready.lock().unwrap().take() {
+                Some(ready) => {
+                    let _ = ready.send(Err(error));
+                    return Ok(());
+                }
+                None => return Err(error),
+            }
+        }
+    };
+    let session_id = opened.session_id.clone();
+    let state = opened.state.clone();
+    match ready.lock().unwrap().take() {
+        Some(ready) => {
+            if ready.send(Ok(opened)).is_err() {
+                // The opener went away; unwind without serving turns.
+                return Ok(());
+            }
+        }
+        None => return Ok(()),
+    }
+
+    while let Some(command) = commands.recv().await {
+        match command {
+            SessionCommand::Prompt { request, reply } => {
+                // A std::sync::MutexGuard is not Send across `.await`:
+                // take a working copy, run the turn against it, then write
+                // the resulting session state back.
+                let mut working = state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let outcome = run_prompt(&connection, &session_id, &mut working, request).await;
+                *state.lock().unwrap_or_else(|error| error.into_inner()) = working;
+                let _ = reply.send(outcome);
+            }
+            SessionCommand::Close => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// `initialize` + session establishment + requested configuration. Every
+/// failure keeps its typed `AdapterError` for the opener.
+async fn open_session(
+    connection: &ConnectionTo<Agent>,
+    context: &ServeContext,
+) -> Result<Opened, AdapterError> {
     let initialize = InitializeRequest::new(ProtocolVersion::V1);
     let initialized = connection
         .send_request(initialize)
@@ -328,83 +554,548 @@ async fn serve(
         ));
     }
     let load_capable = initialized.agent_capabilities.load_session;
+    let resume_capable = initialized
+        .agent_capabilities
+        .session_capabilities
+        .resume
+        .is_some();
+    let agent_info = initialized.agent_info.as_ref().map(|info| AgentInfo {
+        name: info.name.clone(),
+        version: info.version.clone(),
+    });
+    let auth_methods: Vec<AuthMethodId> = initialized
+        .auth_methods
+        .iter()
+        .map(|method| method.id().clone())
+        .collect();
 
     let mcp = decode_mcp_servers(context.mcp_servers.clone())?;
-    let mut session_id = None;
-    if let Some(binding) = context.resume.as_deref() {
+    let call = if let Some(binding) = context.resume.as_deref() {
         // Load/resume responses carry no session id — the binding we sent
         // is the id.
         if context.prefer_load && load_capable {
-            let mut request = LoadSessionRequest::new(binding.to_owned(), context.cwd.clone());
-            request.mcp_servers = mcp.clone();
-            connection
-                .send_request(request)
-                .block_task()
-                .await
-                .map_err(|error| protocol_failure("session/load", error))?;
+            SessionCall::Load {
+                session_id: binding.to_owned(),
+                cwd: context.cwd.clone(),
+                mcp_servers: mcp,
+            }
+        } else if resume_capable {
+            SessionCall::Resume {
+                session_id: binding.to_owned(),
+                cwd: context.cwd.clone(),
+                mcp_servers: mcp,
+            }
+        } else if load_capable {
+            SessionCall::Load {
+                session_id: binding.to_owned(),
+                cwd: context.cwd.clone(),
+                mcp_servers: mcp,
+            }
         } else {
-            let mut request = ResumeSessionRequest::new(binding.to_owned(), context.cwd.clone());
-            request.mcp_servers = mcp.clone();
-            connection
-                .send_request(request)
-                .block_task()
-                .await
-                .map_err(|error| protocol_failure("session/resume", error))?;
+            return Err(AdapterError::permanent(
+                "agent_session_resume_unsupported",
+                "session/resume",
+            ));
         }
-        session_id = Some(binding.to_owned());
-    }
-    let session_id = match session_id {
-        Some(id) => id,
-        None => {
-            let mut request = NewSessionRequest::new(context.cwd.clone());
-            request.mcp_servers = mcp;
-            connection
-                .send_request(request)
-                .block_task()
-                .await
-                .map_err(|error| protocol_failure("session/new", error))?
-                .session_id
-                .to_string()
+    } else {
+        SessionCall::New {
+            cwd: context.cwd.clone(),
+            mcp_servers: mcp,
         }
     };
+    let restored = !matches!(call, SessionCall::New { .. });
+    let response = call_with_auth_retry(connection, &call, &auth_methods).await?;
+    let mut setup = SessionSetup::parse(response)?;
+    let session_id = match context.resume.as_deref() {
+        Some(binding) => binding.to_owned(),
+        None => setup.session_id.clone().ok_or_else(|| {
+            AdapterError::permanent("agent_protocol_error", "session/new")
+                .with_detail("session/new response did not report a sessionId")
+        })?,
+    };
 
-    let capabilities = capabilities_from(&initialized);
-    let opened = Opened {
+    apply_session_config(
+        connection,
+        &session_id,
+        &mut setup,
+        &context.config,
+        restored,
+    )
+    .await?;
+
+    Ok(Opened {
         connection: connection.clone(),
-        session_id: session_id.clone(),
-        capabilities,
-    };
-    match ready.lock().unwrap().take() {
-        Some(ready) => {
-            if ready.send(Ok(opened)).is_err() {
-                // The opener went away; unwind without serving turns.
-                return Ok(());
-            }
+        session_id,
+        capabilities: capabilities_from(&initialized),
+        agent_info,
+        state: Arc::new(std::sync::Mutex::new(setup)),
+    })
+}
+
+/// One session-establishment call; load and resume share the same params
+/// and response shape, new omits `sessionId`.
+enum SessionCall {
+    New {
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+    },
+    Load {
+        session_id: String,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+    },
+    Resume {
+        session_id: String,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+    },
+}
+
+impl SessionCall {
+    fn stage(&self) -> &'static str {
+        match self {
+            SessionCall::New { .. } => "session/new",
+            SessionCall::Load { .. } => "session/load",
+            SessionCall::Resume { .. } => "session/resume",
         }
-        None => return Ok(()),
     }
 
-    while let Some(command) = commands.recv().await {
-        match command {
-            SessionCommand::Prompt { text, reply } => {
-                let outcome = run_prompt(&connection, &session_id, text).await;
-                let _ = reply.send(outcome);
+    async fn send(
+        &self,
+        connection: &ConnectionTo<Agent>,
+    ) -> Result<Value, agent_client_protocol::Error> {
+        match self {
+            SessionCall::New { cwd, mcp_servers } => {
+                connection
+                    .send_request(SessionNewWire {
+                        cwd: cwd.clone(),
+                        mcp_servers: mcp_servers.clone(),
+                    })
+                    .block_task()
+                    .await
             }
-            SessionCommand::Close => return Ok(()),
+            SessionCall::Load {
+                session_id,
+                cwd,
+                mcp_servers,
+            } => {
+                connection
+                    .send_request(SessionLoadWire {
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        mcp_servers: mcp_servers.clone(),
+                    })
+                    .block_task()
+                    .await
+            }
+            SessionCall::Resume {
+                session_id,
+                cwd,
+                mcp_servers,
+            } => {
+                connection
+                    .send_request(SessionResumeWire {
+                        session_id: session_id.clone(),
+                        cwd: cwd.clone(),
+                        mcp_servers: mcp_servers.clone(),
+                    })
+                    .block_task()
+                    .await
+            }
+        }
+    }
+}
+
+/// Send a session-establishment request, retrying once after an
+/// `authenticate` attempt when the agent advertised auth methods.
+async fn call_with_auth_retry(
+    connection: &ConnectionTo<Agent>,
+    call: &SessionCall,
+    auth_methods: &[AuthMethodId],
+) -> Result<Value, AdapterError> {
+    let establish_error = match call.send(connection).await {
+        Ok(response) => return Ok(response),
+        Err(error) => error,
+    };
+    if auth_methods.is_empty() {
+        return Err(protocol_failure(call.stage(), establish_error));
+    }
+    let mut authenticated = false;
+    for method_id in auth_methods {
+        if connection
+            .send_request(AuthenticateRequest::new(method_id.clone()))
+            .block_task()
+            .await
+            .is_ok()
+        {
+            authenticated = true;
+            break;
+        }
+    }
+    if !authenticated {
+        return Err(protocol_failure(call.stage(), establish_error));
+    }
+    call.send(connection)
+        .await
+        .map_err(|error| protocol_failure(call.stage(), error))
+}
+
+/// Apply the host's requested session configuration against the surfaces
+/// the agent reported at establishment:
+///
+/// - `configOptions` categories win over the legacy `modes`/`models`
+///   surfaces; a selectable option that lacks the requested value fails
+///   closed rather than falling back.
+/// - On a fresh session every surface is treated as reported, so an
+///   unadvertised request fails.
+/// - On a restored session an unreported surface is *unknown*: the
+///   persisted session state stays in charge and the request is left
+///   unapplied rather than fabricating a selection.
+async fn apply_session_config(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    state: &mut SessionSetup,
+    requested: &SessionConfig,
+    restored: bool,
+) -> Result<(), AdapterError> {
+    let config_known = state.config_options.is_some();
+    if let Some(model) = requested.model.as_deref() {
+        if !(restored && !config_known && state.models.is_none()) {
+            apply_model(connection, session_id, state, model).await?;
+        }
+    }
+    if let Some(mode) = requested.mode.as_deref() {
+        if !(restored && !config_known && state.modes.is_none()) {
+            apply_mode(connection, session_id, state, mode).await?;
+        }
+    }
+    for (slot, requested_value) in [
+        ("thought_level", requested.effort.as_deref()),
+        ("permissions", requested.permission.as_deref()),
+    ] {
+        if let Some(value) = requested_value {
+            if !restored || config_known {
+                apply_config_value(connection, session_id, state, slot, value).await?;
+            }
         }
     }
     Ok(())
 }
 
+/// Apply `model` through `configOptions` ("model" category) or, absent
+/// that surface, the legacy `models`/`session/set_model` path.
+async fn apply_model(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    state: &mut SessionSetup,
+    model: &str,
+) -> Result<(), AdapterError> {
+    let options = state.config_options.as_deref().unwrap_or(&[]);
+    if let Some(option) = find_option(options, "model") {
+        if option_select(option).is_some() {
+            if !option_offers(option, model) {
+                return Err(config_unavailable("model", model));
+            }
+            if option_current(option) != Some(model) {
+                set_config_option(connection, session_id, state, "model", model).await?;
+            }
+            return Ok(());
+        }
+    }
+    let model_id = state.models.as_ref().and_then(|models| {
+        models
+            .available_models
+            .iter()
+            .find(|entry| entry.model_id == model || sanitize_model_id(&entry.model_id) == model)
+            .map(|entry| entry.model_id.clone())
+    });
+    if let Some(model_id) = model_id {
+        let current = state
+            .models
+            .as_ref()
+            .map(|models| models.current_model_id.as_str());
+        if current != Some(model_id.as_str()) {
+            set_session_model(connection, session_id, state, &model_id).await?;
+        }
+        return Ok(());
+    }
+    Err(config_unavailable("model", model))
+}
+
+/// Apply `mode` through `configOptions` ("mode" category) or the
+/// `modes`/`session/set_mode` path.
+async fn apply_mode(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    state: &mut SessionSetup,
+    mode: &str,
+) -> Result<(), AdapterError> {
+    let options = state.config_options.as_deref().unwrap_or(&[]);
+    if let Some(option) = find_option(options, "mode") {
+        if option_select(option).is_some() {
+            if !option_offers(option, mode) {
+                return Err(config_unavailable("mode", mode));
+            }
+            if option_current(option) != Some(mode) {
+                set_config_option(connection, session_id, state, "mode", mode).await?;
+            }
+            return Ok(());
+        }
+    }
+    let mode_offered = state.modes.as_ref().is_some_and(|modes| {
+        modes
+            .available_modes
+            .iter()
+            .any(|entry| &*entry.id.0 == mode)
+    });
+    if mode_offered {
+        let current = state
+            .modes
+            .as_ref()
+            .map(|modes| modes.current_mode_id.0.as_ref());
+        if current != Some(mode) {
+            let response = connection
+                .send_request(SetSessionModeRequest::new(
+                    SessionId::from(session_id.to_owned()),
+                    agent_client_protocol::schema::v1::SessionModeId::from(mode.to_owned()),
+                ))
+                .block_task()
+                .await
+                .map_err(|error| protocol_failure("session/set_mode", error))?;
+            if let Some(meta) = response.meta {
+                state.meta = Some(Value::Object(meta));
+            }
+            if let Some(modes) = &mut state.modes {
+                modes.current_mode_id =
+                    agent_client_protocol::schema::v1::SessionModeId::from(mode.to_owned());
+            }
+        }
+        return Ok(());
+    }
+    Err(config_unavailable("mode", mode))
+}
+
+/// Apply a value to one `configOptions` category (`thought_level`,
+/// `permissions`). Fails closed when the surface is missing or does not
+/// advertise the value.
+async fn apply_config_value(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    state: &mut SessionSetup,
+    slot: &str,
+    value: &str,
+) -> Result<(), AdapterError> {
+    let options = state.config_options.as_deref().unwrap_or(&[]);
+    match find_option(options, slot) {
+        Some(option) if option_select(option).is_some() => {
+            if !option_offers(option, value) {
+                return Err(config_unavailable(slot, value));
+            }
+            if option_current(option) != Some(value) {
+                set_config_option(connection, session_id, state, slot, value).await?;
+            }
+            Ok(())
+        }
+        _ => Err(config_unavailable(slot, value)),
+    }
+}
+
+async fn set_config_option(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    state: &mut SessionSetup,
+    slot: &str,
+    value: &str,
+) -> Result<(), AdapterError> {
+    let config_id = find_option(state.config_options.as_deref().unwrap_or(&[]), slot)
+        .map(|option| option.id.clone())
+        .ok_or_else(|| config_unavailable(slot, value))?;
+    let response = connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            SessionId::from(session_id.to_owned()),
+            config_id,
+            value,
+        ))
+        .block_task()
+        .await
+        .map_err(|error| protocol_failure("session/set_config_option", error))?;
+    if let Some(meta) = response.meta {
+        state.meta = Some(Value::Object(meta));
+    }
+    state.config_options = Some(response.config_options);
+    let applied = state.config_options.as_deref().unwrap_or(&[]);
+    match find_option(applied, slot).and_then(option_current) {
+        Some(current) if current == value => Ok(()),
+        _ => Err(AdapterError::permanent(
+            "agent_configuration_rejected",
+            "session/set_config_option",
+        )
+        .with_detail(format!(
+            "{slot} value {value:?} was accepted but did not read back as applied"
+        ))),
+    }
+}
+
+async fn set_session_model(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    state: &mut SessionSetup,
+    model_id: &str,
+) -> Result<(), AdapterError> {
+    let response = connection
+        .send_request(SetSessionModelWire {
+            session_id: session_id.to_owned(),
+            model_id: model_id.to_owned(),
+        })
+        .block_task()
+        .await
+        .map_err(|error| protocol_failure("session/set_model", error))?;
+    if let Ok(setup) = SessionSetup::parse(response) {
+        if let Some(models) = setup.models {
+            state.models = Some(models);
+        }
+        if let Some(meta) = setup.meta {
+            state.meta = Some(meta);
+        }
+    }
+    if let Some(models) = &mut state.models {
+        models.current_model_id = model_id.to_owned();
+    }
+    Ok(())
+}
+
+fn find_option<'a>(
+    options: &'a [SessionConfigOption],
+    slot: &str,
+) -> Option<&'a SessionConfigOption> {
+    options
+        .iter()
+        .find(|option| option_category(option) == Some(slot))
+        .or_else(|| options.iter().find(|option| &*option.id.0 == slot))
+}
+
+fn option_category(option: &SessionConfigOption) -> Option<&str> {
+    match &option.category {
+        Some(SessionConfigOptionCategory::Model) => Some("model"),
+        Some(SessionConfigOptionCategory::Mode) => Some("mode"),
+        Some(SessionConfigOptionCategory::ThoughtLevel) => Some("thought_level"),
+        Some(SessionConfigOptionCategory::ModelConfig) => Some("model_config"),
+        Some(SessionConfigOptionCategory::Other(name)) => Some(name.as_ref()),
+        _ => None,
+    }
+}
+
+fn option_select(
+    option: &SessionConfigOption,
+) -> Option<&agent_client_protocol::schema::v1::SessionConfigSelect> {
+    match &option.kind {
+        SessionConfigKind::Select(select) => Some(select),
+        _ => None,
+    }
+}
+
+fn option_current(option: &SessionConfigOption) -> Option<&str> {
+    option_select(option).map(|select| select.current_value.0.as_ref())
+}
+
+/// True when `value` appears among the option's selectable values —
+/// grouped and ungrouped option lists both count.
+fn option_offers(option: &SessionConfigOption, value: &str) -> bool {
+    let Some(select) = option_select(option) else {
+        return false;
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => {
+            options.iter().any(|entry| &*entry.value.0 == value)
+        }
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .any(|entry| &*entry.value.0 == value),
+        _ => false,
+    }
+}
+
+/// Bounded identifier normalization for matching a requested model
+/// against a legacy `models` entry — same allowlist hosts apply when
+/// sanitizing provider ids.
+fn sanitize_model_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|character| character.is_ascii_alphanumeric() || "._-+:[]=,".contains(*character))
+        .take(160)
+        .collect()
+}
+
+fn selector_support(applied: bool) -> SelectorSupport {
+    if applied {
+        SelectorSupport::Applied
+    } else {
+        SelectorSupport::Unsupported
+    }
+}
+
+fn config_selector_available(state: &SessionSetup, category: &str) -> bool {
+    find_option(state.config_options.as_deref().unwrap_or(&[]), category)
+        .is_some_and(|option| option_select(option).is_some())
+}
+
+fn model_selector_available(state: &SessionSetup) -> bool {
+    config_selector_available(state, "model")
+        || state
+            .models
+            .as_ref()
+            .is_some_and(|models| !models.available_models.is_empty())
+}
+
+fn mode_selector_available(state: &SessionSetup) -> bool {
+    config_selector_available(state, "mode")
+        || state
+            .modes
+            .as_ref()
+            .is_some_and(|modes| !modes.available_modes.is_empty())
+}
+
+fn config_value_available(state: &SessionSetup, category: &str, value: &str) -> bool {
+    find_option(state.config_options.as_deref().unwrap_or(&[]), category)
+        .is_some_and(|option| option_select(option).is_some() && option_offers(option, value))
+}
+
+fn model_value_available(state: &SessionSetup, requested: &str) -> bool {
+    let options = state.config_options.as_deref().unwrap_or(&[]);
+    if let Some(option) = find_option(options, "model") {
+        if option_select(option).is_some() {
+            return option_offers(option, requested);
+        }
+    }
+    state.models.as_ref().is_some_and(|models| {
+        models.available_models.iter().any(|entry| {
+            entry.model_id == requested || sanitize_model_id(&entry.model_id) == requested
+        })
+    })
+}
+
+fn config_unavailable(slot: &str, requested: &str) -> AdapterError {
+    AdapterError::permanent("agent_configuration_unavailable", "session/configuration").with_detail(
+        format!("{slot} value {requested:?} is not advertised by the agent"),
+    )
+}
+
 async fn run_prompt(
     connection: &ConnectionTo<Agent>,
     session_id: &str,
-    text: String,
+    state: &mut SessionSetup,
+    request: TurnRequest,
 ) -> Result<TurnOutcome, AdapterError> {
+    if let Some(model) = request.model.as_deref() {
+        apply_model(connection, session_id, state, model).await?;
+    }
+    if let Some(effort) = request.effort.as_deref() {
+        apply_config_value(connection, session_id, state, "thought_level", effort).await?;
+    }
     let response = connection
         .send_request(PromptRequest::new(
             session_id.to_owned(),
-            vec![ContentBlock::Text(TextContent::new(text))],
+            vec![ContentBlock::Text(TextContent::new(request.text))],
         ))
         .block_task()
         .await
@@ -416,6 +1107,8 @@ async fn run_prompt(
         text: String::new(),
         truncated: false,
         exit_code: None,
+        // ACP's turn-usage field is behind the SDK's unstable feature flag.
+        usage: None,
     })
 }
 

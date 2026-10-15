@@ -10,11 +10,19 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+use a4aa::card::{
+    AgentCard, AgentSurface, AttachmentSupport, CliSurface, DetectSurface, FeatureSurface,
+    HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind, TranscriptUsage,
+    UsageSurface,
+};
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
     Target,
 };
-use a4aa::{AdaptationPlan, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{
+    AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet, PromptChannel,
+    StreamMode,
+};
 
 /// The `claude` dialect: Claude Code settings.json hooks, CLAUDE.md, skills, commands, subagents, permissions, .mcp.json.
 pub const DIALECT: Dialect = Dialect {
@@ -70,6 +78,130 @@ pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
 
+/// The `claude` agent card: `claude --print` stream-json over stdio.
+///
+/// Wire shape verified against a production host: one process per turn,
+/// fixed stream-json argv, the prompt as a `stream-json` user message on
+/// stdin, NDJSON events on stdout (`system/init` carries `session_id`,
+/// `result` carries the reply text and token usage). Resume is a fresh
+/// process with `--resume <id>`; guidance rides `--append-system-prompt`;
+/// the vendor launch default is the `bypassPermissions` mode.
+pub const AGENT: AgentCard = AgentCard {
+    id: "claude",
+    label: "Claude Code",
+    dialect: &DIALECT,
+    surface: AgentSurface::Cli(CliSurface {
+        args: &[
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--model",
+            "{model}",
+            "--effort",
+            "{effort}",
+            "--permission-mode",
+            "{permission}",
+            "--append-system-prompt",
+            "{instructions}",
+        ],
+        prompt_channel: PromptChannel::Stdin,
+        stream: StreamMode::Stdio,
+        resume_args: &["--resume", "{sessionId}"],
+        stdin_template: Some(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"{prompt}"}]}}"#,
+        ),
+        json_lines: true,
+        session_id_path: Some("session_id"),
+        usage_path: Some("usage"),
+        open_args: &[],
+        binding_file_env: None,
+        binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
+        // `{"type":"result"}` records carry the reply text in `result`.
+        result_selector: Some("result"),
+        result_selector_field: None,
+        result_path: Some("result"),
+        spawn_args: &[],
+    }),
+    detect: DetectSurface {
+        binaries: &["claude"],
+        processes: &["claude.exe", "claude"],
+        binary_dirs: &[
+            OsPath {
+                path: "{home}/.claude/local",
+                oses: &[],
+            },
+            OsPath {
+                path: "{home}/.claude/local/node_modules/.bin",
+                oses: &[],
+            },
+        ],
+        config: &["{home}/.claude/settings.json", "{home}/.claude.json"],
+        detection: &["{home}/.claude"],
+        apps: &[],
+    },
+    features: FeatureSurface {
+        instructions: InstructionChannel::Flag("--append-system-prompt"),
+        execution_modes: &[],
+        permission_modes: &[
+            "default",
+            "manual",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions",
+        ],
+        permission_default: Some("bypassPermissions"),
+        attachments: AttachmentSupport::None,
+        effort: true,
+        steer: false,
+        models: ModelCatalog::None,
+    },
+    usage: UsageSurface {
+        live: Some(LiveUsage {
+            event: "result",
+            path: "usage",
+        }),
+        transcript: Some(TranscriptUsage {
+            root: "claude-project-transcripts",
+            record: Some(("type", "assistant")),
+            container: "message.usage",
+            input: &["input_tokens"],
+            cached: &["cache_read_input_tokens", "cache_creation_input_tokens"],
+            output: &["output_tokens"],
+            total: &[],
+        }),
+        hosted: None,
+    },
+    history: &[
+        HistoryRoot {
+            path: "{home}/.claude/agents",
+            kind: "claude-agents",
+            store: StoreKind::Directory,
+        },
+        HistoryRoot {
+            path: "{home}/.claude/projects",
+            kind: "claude-project-transcripts",
+            store: StoreKind::JsonlDir,
+        },
+    ],
+};
+
+/// The full card, for hosts that compose over `&'static AgentCard`.
+pub const fn card() -> &'static AgentCard {
+    &AGENT
+}
+
+/// The materialized runtime spec — `Adapter::new(spec())` is the entire
+/// launch path for hosts that keep no spec table of their own.
+pub fn spec() -> AgentSpec {
+    AGENT.spec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +212,37 @@ mod tests {
         let plan = adapt(&set);
         assert_eq!(plan.dialect, "claude");
         assert!(plan.artifacts.is_empty());
+    }
+
+    #[test]
+    fn card_matches_dialect_identity() {
+        assert_eq!(AGENT.id, DIALECT.id);
+        assert!(std::ptr::eq(AGENT.dialect, &DIALECT));
+    }
+
+    #[test]
+    fn spec_materializes_the_stream_json_cli() {
+        let spec = spec();
+        assert_eq!(spec.command.program, "claude");
+        let a4aa::LaneSpec::Cli(cli) = spec.lane else {
+            panic!("claude drives the cli lane")
+        };
+        assert!(cli.args.iter().any(|arg| arg == "--print"));
+        assert_eq!(cli.resume_args, vec!["--resume", "{sessionId}"]);
+        assert!(cli.json_lines);
+        assert_eq!(cli.session_id_path.as_deref(), Some("session_id"));
+        assert_eq!(cli.usage_path.as_deref(), Some("usage"));
+        assert!(cli.stdin_template.is_some());
+        assert!(cli.capabilities().session_resume);
+        assert!(cli.capabilities().cancellation);
+    }
+
+    #[test]
+    fn usage_names_the_stream_json_result_event() {
+        let live = AGENT.usage.live.as_ref().unwrap();
+        assert_eq!(live.event, "result");
+        assert_eq!(live.path, "usage");
+        let transcript = AGENT.usage.transcript.as_ref().unwrap();
+        assert_eq!(transcript.root, "claude-project-transcripts");
     }
 }

@@ -325,9 +325,35 @@ fn cursor_flat_hooks_and_permissions() {
 fn antigravity_named_bundle_and_unsupported_events() {
     let set = MechanismSet {
         hooks: vec![
+            hook(HookEvent::SessionStart, "start.sh"),
+            hook(HookEvent::PreToolUse, "guard.sh"),
+            hook(HookEvent::PostToolUse, "after.sh"),
             hook(HookEvent::Stop, "receipt.sh"),
             hook(HookEvent::Notification, "note.sh"),
         ],
+        rules: vec![RuleDecl {
+            name: "project".into(),
+            content: "Use the project rules.".into(),
+        }],
+        skills: vec![SkillDecl {
+            name: "review".into(),
+            content: "Review carefully.".into(),
+        }],
+        commands: vec![CommandDecl {
+            name: "ship".into(),
+            description: None,
+            content: "Prepare a release.".into(),
+        }],
+        subagents: vec![SubagentDecl {
+            name: "reviewer".into(),
+            instructions: "Review changes.".into(),
+            ..Default::default()
+        }],
+        permissions: Some(PermissionDecl {
+            mode: Some("request-review".into()),
+            allow: vec!["command(git)".into()],
+            deny: vec![],
+        }),
         mcp_servers: [("fs".to_owned(), serde_json::json!({"command": "fs-mcp"}))]
             .into_iter()
             .collect(),
@@ -341,21 +367,51 @@ fn antigravity_named_bundle_and_unsupported_events() {
         .find(|a| a.path.ends_with(".gemini/config/hooks.json"))
         .expect("antigravity bundle artifact");
     let doc: serde_json::Value = serde_json::from_str(&artifact.content).unwrap();
+    assert_eq!(doc["a4aa"]["SessionStart"][0]["command"], "start.sh");
+    assert_eq!(doc["a4aa"]["PreToolUse"][0]["command"], "guard.sh");
+    assert_eq!(doc["a4aa"]["PostToolUse"][0]["command"], "after.sh");
     assert_eq!(doc["a4aa"]["Stop"][0]["command"], "receipt.sh");
     assert_eq!(doc["a4aa"]["enabled"], true);
 
     let settings = plan
         .artifacts
         .iter()
-        .find(|a| a.path.ends_with(".gemini/mcp_config.json"))
+        .find(|a| a.path.ends_with(".gemini/config/mcp_config.json"))
         .expect("antigravity mcp merge");
     assert!(settings.content.contains("fs-mcp"));
 
+    assert!(plan.artifacts.iter().any(|a| a.path.ends_with("GEMINI.md")));
+    assert!(plan.artifacts.iter().any(|a| a
+        .path
+        .ends_with(".gemini/antigravity-cli/skills/review/SKILL.md")));
+    assert!(plan
+        .artifacts
+        .iter()
+        .any(|a| a.path.ends_with(".gemini/config/workflows/ship.md")));
+    assert!(plan
+        .artifacts
+        .iter()
+        .any(|a| a.path.ends_with(".gemini/config/agents/reviewer.md")));
+
+    assert_eq!(
+        support(&plan, "hooks.session-start"),
+        Some(Support::Adapted)
+    );
+    assert_eq!(support(&plan, "hooks.pre-tool-use"), Some(Support::Adapted));
+    assert_eq!(
+        support(&plan, "hooks.post-tool-use"),
+        Some(Support::Adapted)
+    );
     assert_eq!(support(&plan, "hooks.stop"), Some(Support::Adapted));
     assert_eq!(
         support(&plan, "hooks.notification"),
         Some(Support::Unsupported)
     );
+    assert_eq!(support(&plan, "rules.project"), Some(Support::Native));
+    assert_eq!(support(&plan, "skills.review"), Some(Support::Native));
+    assert_eq!(support(&plan, "commands.ship"), Some(Support::Native));
+    assert_eq!(support(&plan, "subagents.reviewer"), Some(Support::Native));
+    assert_eq!(support(&plan, "permissions"), Some(Support::Unsupported));
 }
 
 // -------------------------------- pi ---------------------------------------

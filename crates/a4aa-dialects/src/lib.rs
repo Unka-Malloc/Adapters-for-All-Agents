@@ -11,6 +11,7 @@
 //! that keeps the dependency graph (and compile time) at exactly one
 //! descriptor. Nothing in `a4aa` core requires this registry.
 
+use a4aa::card::AgentCard;
 use a4aa::Dialect;
 
 /// `(name, descriptor)` pairs for every adapter crate in the workspace.
@@ -55,6 +56,30 @@ pub fn all() -> impl Iterator<Item = (&'static str, &'static Dialect)> {
         .chain(std::iter::once(("generic", &GENERIC as &'static Dialect)))
 }
 
+/// `(name, card)` pairs for the adapter crates that publish an
+/// [`AgentCard`]. Cards land per agent — the list grows as crates adopt
+/// them; lookup returns `None` until a card exists.
+static CARDS: &[(&str, &AgentCard)] = &[
+    ("antigravity", a4aa_antigravity::card()),
+    ("claude", a4aa_claude::card()),
+    ("codex", a4aa_codex::card()),
+    ("cursor", a4aa_cursor::card()),
+    ("dsh", a4aa_dsh::card()),
+    ("opencode", a4aa_opencode::card()),
+    ("pi", a4aa_pi::card()),
+];
+
+/// Look an agent's card up by id. `None` until the adapter crate publishes
+/// one — callers fall back to `dialect(name)` for write-surface knowledge.
+pub fn card(name: &str) -> Option<&'static AgentCard> {
+    CARDS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+}
+
+/// Every published `(name, card)` pair.
+pub fn cards() -> impl Iterator<Item = (&'static str, &'static AgentCard)> {
+    CARDS.iter().copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,9 +95,17 @@ mod tests {
     #[test]
     fn all_covers_every_adapter_plus_generic() {
         let names: Vec<_> = all().map(|(n, _)| n).collect();
-        assert_eq!(names.len(), 28);
+        assert_eq!(names.len(), DIALECTS.len() + 1);
         for (name, d) in all() {
             assert_eq!(name, d.id);
+        }
+    }
+
+    #[test]
+    fn cards_match_their_dialects() {
+        for (name, card) in cards() {
+            assert_eq!(name, card.id);
+            assert_eq!(dialect(name).map(|d| d.id), Some(card.dialect.id));
         }
     }
 }
