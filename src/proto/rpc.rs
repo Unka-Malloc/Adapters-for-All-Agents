@@ -26,7 +26,7 @@ use crate::model::{
     SelectorSupportSet, SessionRequest, SessionScope, TurnOutcome,
 };
 use crate::observe::SharedObserver;
-use crate::rpc::{CallFailure, JsonRpcPeer, RpcDelegate, RpcErrorObject};
+use crate::rpc::{CallFailure, JsonRpcPeer, PendingCall, RpcDelegate, RpcErrorObject};
 use crate::supervision::SupervisedChild;
 use crate::template::{contains_placeholder, extract_path, substitute, vars, VarSpec, Vars};
 use crate::transport::stdio;
@@ -52,6 +52,10 @@ pub struct RpcLane {
 
 /// One open RPC session: child process + peer + negotiated session id.
 pub struct RpcSession {
+    state: Arc<RpcState>,
+}
+
+struct RpcState {
     peer: Arc<JsonRpcPeer>,
     child: Mutex<SupervisedChild>,
     spec: RpcLaneSpec,
@@ -66,7 +70,7 @@ pub struct RpcSession {
     /// return path, including setup/transport errors.
     control: std::sync::Mutex<TurnControl>,
     /// Serializes prompt turns.
-    turn_lock: Mutex<()>,
+    turn_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -76,12 +80,24 @@ struct TurnControl {
     turn_id: Option<String>,
     pending_cancel: bool,
     killed: bool,
+    recovery_required: bool,
 }
-struct TurnScope<'a>(&'a std::sync::Mutex<TurnControl>, &'a TurnDelivery);
+struct TurnScope<'a> {
+    control: &'a std::sync::Mutex<TurnControl>,
+    delivery: &'a TurnDelivery,
+    completed: bool,
+}
 impl Drop for TurnScope<'_> {
     fn drop(&mut self) {
-        *self.0.lock().unwrap() = TurnControl::default();
-        self.1.state.lock().unwrap().progress = None;
+        let mut control = self.control.lock().unwrap();
+        if control.dispatched && !self.completed {
+            // A failed observation is not a remote terminal. Keep cancellation
+            // identity and block a new paid turn until the session is closed.
+            control.recovery_required = true;
+            return;
+        }
+        *control = TurnControl::default();
+        self.delivery.state.lock().unwrap().progress = None;
     }
 }
 
@@ -513,23 +529,94 @@ impl RpcLane {
         }
 
         Ok(RpcSession {
-            peer,
-            child: Mutex::new(child),
-            spec: self.spec.clone(),
-            max_output_bytes: self.max_output_bytes,
-            delivery,
-            session_model: request.config.model.clone(),
-            session_effort: request.config.effort.clone(),
-            session_instructions: request.config.instructions.clone(),
-            session_id,
-            cwd,
-            control: std::sync::Mutex::new(TurnControl::default()),
-            turn_lock: Mutex::new(()),
+            state: Arc::new(RpcState {
+                peer,
+                child: Mutex::new(child),
+                spec: self.spec.clone(),
+                max_output_bytes: self.max_output_bytes,
+                delivery,
+                session_model: request.config.model.clone(),
+                session_effort: request.config.effort.clone(),
+                session_instructions: request.config.instructions.clone(),
+                session_id,
+                cwd,
+                control: std::sync::Mutex::new(TurnControl::default()),
+                turn_lock: Arc::new(Mutex::new(())),
+            }),
         })
     }
 }
 
 impl RpcSession {
+    pub fn session_id(&self) -> Option<&str> {
+        self.state.session_id()
+    }
+    pub fn capabilities(&self) -> Capabilities {
+        self.state.capabilities()
+    }
+    pub fn selector_support(&self, phase: SelectorPhase) -> SelectorSupportSet {
+        self.state.selector_support(phase)
+    }
+    /// The driver owns the turn until its actual terminal state. Dropping
+    /// this waiting future neither cancels the agent nor releases the turn.
+    pub async fn prompt(
+        &self,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<TurnOutcome, AdapterError> {
+        let serial = self.state.turn_lock.clone().lock_owned().await;
+        {
+            let mut control = self.state.control.lock().unwrap();
+            if control.recovery_required {
+                return Err(AdapterError::uncertain(
+                    "agent_session_recovery_required",
+                    "rpc/prompt",
+                ));
+            }
+            *control = TurnControl {
+                active: true,
+                ..Default::default()
+            };
+        }
+        let state = self.state.clone();
+        let (text, model, effort) = (
+            text.to_owned(),
+            model.map(str::to_owned),
+            effort.map(str::to_owned),
+        );
+        tokio::spawn(async move {
+            let _serial = serial;
+            let mut scope = TurnScope {
+                control: &state.control,
+                delivery: &state.delivery,
+                completed: false,
+            };
+            let result = state
+                .prompt(&text, model.as_deref(), effort.as_deref())
+                .await;
+            scope.completed = !result.as_ref().is_err_and(|error| error.uncertain_effect);
+            result
+        })
+        .await
+        .map_err(|_| AdapterError::uncertain("agent_session_driver_failed", "rpc/prompt"))?
+    }
+    pub async fn cancel(&self) -> Result<(), AdapterError> {
+        self.state.cancel().await
+    }
+    pub async fn call_passthrough(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, AdapterError> {
+        self.state.call_passthrough(method, params).await
+    }
+    pub async fn close(self) -> Result<(), AdapterError> {
+        self.state.close().await
+    }
+}
+
+impl RpcState {
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -549,12 +636,6 @@ impl RpcSession {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<TurnOutcome, AdapterError> {
-        let _guard = self.turn_lock.lock().await;
-        *self.control.lock().unwrap() = TurnControl {
-            active: true,
-            ..Default::default()
-        };
-        let _turn_scope = TurnScope(&self.control, &self.delivery);
         self.delivery.begin().await?;
         let model = model.or(self.session_model.as_deref());
         let effort = effort.or(self.session_effort.as_deref());
@@ -592,17 +673,26 @@ impl RpcSession {
                 return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
             }
         }
-        {
+        if self.spec.prompt.method.is_empty() {
+            return Err(AdapterError::permanent("agent_method_unset", "rpc/call"));
+        }
+        let params = substitute(&self.spec.prompt.params, &vars);
+        let pending = {
             let mut control = self.control.lock().unwrap();
             if control.pending_cancel || control.killed {
                 return Ok(cancelled_outcome(String::new(), false));
             }
+            let pending = self
+                .peer
+                .start_call(&self.spec.prompt.method, params)
+                .map_err(call_failure)?;
             control.dispatched = true;
-        }
+            pending
+        };
         if let Some(done) = &self.spec.completion {
-            return self.await_completion(done, &vars).await;
+            return self.await_completion(done, pending).await;
         }
-        let result = match call(&self.peer, &self.spec.prompt, &vars).await {
+        let result = match pending.wait().await.map_err(call_failure) {
             Ok(result) => result,
             Err(_) if self.control.lock().unwrap().killed => {
                 return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
@@ -637,9 +727,9 @@ impl RpcSession {
     async fn await_completion(
         &self,
         done: &crate::model::RpcCompletionSpec,
-        vars: &Vars,
+        pending: PendingCall,
     ) -> Result<TurnOutcome, AdapterError> {
-        let reply = call(&self.peer, &self.spec.prompt, vars);
+        let reply = async { pending.wait().await.map_err(call_failure) };
         tokio::pin!(reply);
         let mut acknowledged = false;
         let mut turn_id = None;
@@ -720,6 +810,9 @@ impl RpcSession {
                     if pending_cancel { self.send_cancel(turn_id.as_deref())?; }
                 }
                 _ = &mut changed => {}
+                _ = self.peer.closed() => {
+                    self.delivery.state.lock().unwrap().closed = true;
+                }
             }
         }
     }
@@ -809,8 +902,15 @@ impl RpcSession {
         self.peer.call(method, params).await.map_err(call_failure)
     }
 
-    pub async fn close(self) -> Result<(), AdapterError> {
-        if let Some(close) = &self.spec.session_close {
+    pub async fn close(&self) -> Result<(), AdapterError> {
+        let active = {
+            let mut control = self.control.lock().unwrap();
+            if control.active {
+                control.killed = true;
+            }
+            control.active
+        };
+        if let Some(close) = self.spec.session_close.as_ref().filter(|_| !active) {
             let vars = vars(VarSpec {
                 session_id: self.session_id.as_deref(),
                 cwd: &self.cwd,
@@ -821,8 +921,7 @@ impl RpcSession {
         }
         self.peer.close().await;
         let mut child = self.child.lock().await;
-        let _ = child.terminate().await;
-        Ok(())
+        child.terminate().await.map(|_| ())
     }
 }
 
@@ -839,14 +938,13 @@ async fn call(peer: &JsonRpcPeer, spec: &RpcCallSpec, vars: &Vars) -> Result<Val
 /// seed, never the wire value itself (the agent's store rejects reusing an
 /// id across process lifetimes).
 fn scoped_session_id(resume: Option<&str>) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|span| span.as_nanos())
         .unwrap_or_default();
-    let nonce = format!(
-        "{:08x}",
-        ((nonce ^ std::process::id() as u128) & 0xffff_ffff) as u64
-    );
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = format!("{:x}-{nonce:x}-{serial:x}", std::process::id());
     match resume {
         Some(id) => format!("{id}-{nonce}"),
         None => format!("a4aa-{nonce}"),

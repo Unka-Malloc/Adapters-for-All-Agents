@@ -92,7 +92,7 @@ impl Default for IoPlan {
 pub struct SupervisedChild {
     child: Option<AsyncGroupChild>,
     pid: Option<u32>,
-    reaped: bool,
+    exit_status: Option<ExitStatus>,
 }
 
 impl SupervisedChild {
@@ -112,7 +112,7 @@ impl SupervisedChild {
         Ok(Self {
             child: Some(child),
             pid,
-            reaped: false,
+            exit_status: None,
         })
     }
 
@@ -159,49 +159,154 @@ impl SupervisedChild {
         self.child().inner().stderr.take()
     }
 
-    /// Wait for exit; reaps the leader.
+    /// Wait for natural leader exit, remove remaining group members, then
+    /// reap the leader. On Unix, WNOWAIT reserves its identity until the
+    /// group signal has been sent; a recycled PID is never signalled.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child().wait().await;
-        if status.is_ok() {
-            self.reaped = true;
+        if let Some(status) = self.exit_status {
+            return Ok(status);
         }
-        status
+        #[cfg(unix)]
+        {
+            // Register before probing, so an exit between the probe and
+            // recv cannot be lost. This is event-driven, without polling.
+            let mut changed =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+            while !self.leader_exited()? {
+                if changed.recv().await.is_none() {
+                    return Err(io::Error::other("child-exit notification channel closed"));
+                }
+            }
+            self.kill_group()?;
+        }
+        let status = self.child().inner().wait().await?;
+        // A Windows Job Object retains its identity after leader exit.
+        #[cfg(not(unix))]
+        self.kill_group()?;
+        self.exit_status = Some(status);
+        Ok(status)
     }
 
     /// Poll for a completed exit status without reaping on `None`.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        match self.child().try_wait() {
-            Ok(Some(status)) => {
-                self.reaped = true;
-                Ok(Some(status))
+        if let Some(status) = self.exit_status {
+            return Ok(Some(status));
+        }
+        #[cfg(unix)]
+        {
+            if !self.leader_exited()? {
+                return Ok(None);
             }
-            other => other,
+            self.kill_group()?;
+        }
+        let status = self.child().inner().try_wait()?;
+        if status.is_some() {
+            #[cfg(not(unix))]
+            self.kill_group()?;
+            self.exit_status = status;
+        }
+        Ok(status)
+    }
+
+    #[cfg(unix)]
+    fn leader_exited(&self) -> io::Result<bool> {
+        let pid = self
+            .pid
+            .ok_or_else(|| io::Error::other("missing child identity"))?;
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.si_signo != 0)
+    }
+
+    fn kill_group(&mut self) -> io::Result<()> {
+        match self.child().start_kill() {
+            #[cfg(target_os = "macos")]
+            Err(error)
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && self.leader_exited()?
+                    && self.group_only_has_zombies()? =>
+            {
+                Ok(())
+            }
+            Err(error) if !process_gone(&error) => Err(error),
+            _ => Ok(()),
         }
     }
 
-    /// Wait up to `deadline` for natural exit without killing.
+    // Darwin returns EPERM for a zombie-only process group. Do not treat
+    // arbitrary permission denial as successful termination: the kernel must
+    // confirm every remaining member is a zombie while our leader is unreaped.
+    #[cfg(target_os = "macos")]
+    fn group_only_has_zombies(&self) -> io::Result<bool> {
+        let pgid = self
+            .pid
+            .ok_or_else(|| io::Error::other("missing child identity"))?;
+        let mut members = vec![0 as libc::pid_t; 2];
+        loop {
+            let bytes = members
+                .len()
+                .checked_mul(std::mem::size_of::<libc::pid_t>())
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| io::Error::other("process-group listing exceeds OS buffer size"))?;
+            let count = unsafe {
+                libc::proc_listpgrppids(pgid as libc::pid_t, members.as_mut_ptr().cast(), bytes)
+            };
+            if count <= 0 {
+                return Ok(false);
+            }
+            if count as usize == members.len() {
+                members.resize(members.len() * 2, 0);
+                continue;
+            }
+            for pid in &members[..count as usize] {
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                let length = std::mem::size_of_val(&info) as i32;
+                let read = unsafe {
+                    libc::proc_pidinfo(
+                        *pid,
+                        libc::PROC_PIDTBSDINFO,
+                        1, // PROC_PIDTBSDINFO's arg requests zombie inclusion.
+                        (&mut info as *mut libc::proc_bsdinfo).cast(),
+                        length,
+                    )
+                };
+                if read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    continue; // Reaped after the group listing.
+                }
+                if read != length || info.pbi_status != libc::SZOMB {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+    }
+
+    /// Wait for natural leader exit, then clean up remaining group members.
     ///
-    /// Implemented as `timeout(child.wait())` rather than a `try_wait` poll:
-    /// `command-group`'s `try_wait` sweeps `waitpid(-pgid)` and races with
-    /// tokio's own reaper — if tokio reaps the leader first, the sweep hits
-    /// `ECHILD` and reports `Ok(None)` forever. `wait()` always returns the
-    /// leader's real status, and dropping the future on timeout is safe
-    /// (the child is not killed, `kill_on_drop` is off).
+    /// A deadline limits only an explicit interruption grace period. Dropping
+    /// this wait before natural exit neither reaps nor kills the leader.
     pub async fn wait_natural(
         &mut self,
         deadline: Option<Instant>,
     ) -> io::Result<Option<ExitStatus>> {
-        if self.reaped {
-            return Ok(None);
+        if let Some(status) = self.exit_status {
+            return Ok(Some(status));
         }
         match deadline {
             Some(end) => {
                 let remaining = end.saturating_duration_since(Instant::now());
-                match tokio::time::timeout(remaining, self.child().wait()).await {
-                    Ok(status) => {
-                        self.reaped = true;
-                        status.map(Some)
-                    }
+                match tokio::time::timeout(remaining, self.wait()).await {
+                    Ok(status) => status.map(Some),
                     Err(_) => Ok(None),
                 }
             }
@@ -219,13 +324,13 @@ impl SupervisedChild {
         }
         if let Some(pid) = self.pid {
             // The group leader is deliberately unreaped, so its pgid is still
-            // reserved; ESRCH/EPERM mean nothing signalable remains.
+            // reserved; only ESRCH means nothing signalable remains.
             let result = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGINT) };
             if result != 0 {
                 let error = io::Error::last_os_error();
                 if !matches!(
                     error.raw_os_error(),
-                    Some(code) if code == libc::ESRCH || code == libc::EPERM
+                    Some(code) if code == libc::ESRCH
                 ) {
                     return Err(AdapterError::io(
                         "agent_process_interrupt_failed",
@@ -257,26 +362,16 @@ impl SupervisedChild {
 
     /// Kill the whole process tree and reap the leader.
     pub async fn terminate(&mut self) -> Result<Option<ExitStatus>, AdapterError> {
-        if let Some(status) = self.try_wait().map_err(|error| {
-            AdapterError::io("agent_process_wait_failed", "process/terminate", error)
-        })? {
+        if let Some(status) = self.exit_status {
             return Ok(Some(status));
         }
-        if let Err(error) = self.child().start_kill() {
-            // The group may already be gone — the leader's exit status can
-            // still be retrievable through `wait`.
-            if !process_gone(&error) {
-                return Err(AdapterError::io(
-                    "agent_process_terminate_failed",
-                    "process/terminate",
-                    error,
-                ));
-            }
-        }
-        let status = self.child().wait().await.map_err(|error| {
+        self.kill_group().map_err(|error| {
+            AdapterError::io("agent_process_terminate_failed", "process/terminate", error)
+        })?;
+        let status = self.child().inner().wait().await.map_err(|error| {
             AdapterError::io("agent_process_wait_failed", "process/terminate", error)
         })?;
-        self.reaped = true;
+        self.exit_status = Some(status);
         Ok(Some(status))
     }
 }
@@ -285,9 +380,7 @@ impl SupervisedChild {
 /// real failure.
 #[cfg(unix)]
 fn process_gone(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .is_some_and(|code| code == libc::ESRCH || code == libc::EPERM)
+    error.raw_os_error().is_some_and(|code| code == libc::ESRCH)
 }
 
 /// Non-Unix kill surfaces expose no portable "no such process" errno; a
@@ -296,13 +389,13 @@ fn process_gone(error: &io::Error) -> bool {
 fn process_gone(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
     )
 }
 
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
-        if self.reaped {
+        if self.exit_status.is_some() {
             return;
         }
         // Best-effort teardown: signal the tree now, then let a detached
@@ -311,7 +404,7 @@ impl Drop for SupervisedChild {
             let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = child.wait().await;
+                    let _ = child.inner().wait().await;
                 });
             }
         }

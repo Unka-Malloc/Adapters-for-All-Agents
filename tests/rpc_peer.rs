@@ -35,6 +35,44 @@ fn peers(
     )
 }
 
+#[tokio::test]
+async fn synchronous_start_enqueues_before_a_related_notification() {
+    struct Sink;
+    #[async_trait::async_trait]
+    impl RpcDelegate for Sink {}
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let (client, server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let peer = JsonRpcPeer::spawn(reader, writer, Arc::new(Sink), None, 4096);
+        let pending = peer.start_call("prompt", json!({})).unwrap();
+        peer.notify("cancel", json!({})).unwrap();
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let first = a4aa::framing::read_frame(&mut reader, 4096)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = a4aa::framing::read_frame(&mut reader, 4096)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["method"], "prompt");
+        assert_eq!(second["method"], "cancel");
+        a4aa::framing::write_frame(
+            &mut writer,
+            &json!({"jsonrpc":"2.0","id":first["id"],"result":"done"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.wait().await.unwrap(), json!("done"));
+        peer.close().await;
+    })
+    .await
+    .expect("request was not enqueued synchronously");
+}
+
 struct Noop;
 #[async_trait::async_trait]
 impl RpcDelegate for Noop {}

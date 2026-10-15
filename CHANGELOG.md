@@ -30,6 +30,12 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Pump CLI input and output concurrently with bounded terminal read queues.
 - Expand templates once without interpreting placeholder-like user data.
 - Preserve session instructions in RPC prompt and configuration templates.
+- Keep dispatched RPC turns owned by the session driver when a caller drops
+  its waiting future; serialize request admission with explicit cancellation.
+- Clean up descendants before reaping exited process-group leaders. On macOS,
+  distinguish zombie-only groups from real signal permission failures.
+- Preserve required empty prompt arguments and JSON fields; omit only optional
+  selectors that were not provided.
 - Derive card-generated CLI usage paths from the card's live usage declaration.
 - Protect flat RPC control fields from parameter overrides, and surface
   contradictory model acknowledgements and invalid session receipts.

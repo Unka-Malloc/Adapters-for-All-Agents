@@ -122,8 +122,7 @@ async fn acp_open_prompt_stream_close() {
     assert_eq!(session.session_id(), "fixture-session-1");
     let outcome = session.prompt(turn("hello")).await.expect("prompt");
     assert_eq!(outcome.stop_reason, "end_turn");
-    // Give the forwarder a beat to flush trailing notifications.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Successful turns drain their admitted output before returning.
     assert_eq!(collect_text(&mut rx), "echo: hello");
 
     session.close().await.expect("close");
@@ -167,7 +166,6 @@ async fn acp_permission_grant_flows_through_handler() {
         .await
         .expect("prompt");
     assert_eq!(outcome.stop_reason, "end_turn");
-    tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(collect_text(&mut rx), "granted: needs permission");
     session.close().await.expect("close");
 }
@@ -250,9 +248,8 @@ async fn rpc_open_prompt_close() {
     let outcome = session.prompt(turn("hello")).await.expect("prompt");
     assert_eq!(outcome.stop_reason, "end_turn");
     assert_eq!(outcome.text, "end_turn"); // result_text_path extracted
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    // session/update notifications arrive as Raw events (params shape isn't
-    // the lane's flat text shape) — they must flow, not drop.
+                                          // session/update notifications arrive as Raw events (params shape isn't
+                                          // the lane's flat text shape) — they must flow, not drop.
     let mut raw_seen = false;
     while let Ok(event) = rx.try_recv() {
         raw_seen |= matches!(event, AgentEvent::Raw { .. });
@@ -1055,7 +1052,6 @@ async fn config_of(
         .prompt(turn("config-check"))
         .await
         .expect("config-check prompt");
-    tokio::time::sleep(Duration::from_millis(20)).await;
     collect_text(rx)
 }
 
@@ -1246,7 +1242,6 @@ async fn acp_turn_level_model_applies_before_prompt() {
         .await
         .expect("prompt");
     assert_eq!(outcome.stop_reason, "end_turn");
-    tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
         collect_text(&mut rx),
         "echo: config:model=fixture-large,mode=code,effort=high,perm=safe"

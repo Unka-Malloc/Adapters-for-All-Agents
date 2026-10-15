@@ -1089,7 +1089,7 @@ for line in sys.stdin:
         )
         .await
         .unwrap();
-    for text in ["first", "next"] {
+    for text in ["first", "", "next"] {
         assert_eq!(
             session
                 .prompt(TurnRequest {
@@ -1103,4 +1103,170 @@ for line in sys.stdin:
         );
     }
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpc_dropped_waiter_preserves_the_active_turn_and_cancel_target() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let script = r#"
+import json,sys
+active=None
+prompts=0
+cancels=0
+def send(m): print(json.dumps(m),flush=True)
+for line in sys.stdin:
+    m=json.loads(line)
+    if m['method']=='prompt':
+        assert active is None, 'new turn overlapped an abandoned waiter'
+        prompts+=1; active='t-'+str(prompts)
+        send({'jsonrpc':'2.0','id':m['id'],'result':{'id':active}})
+        send({'jsonrpc':'2.0','method':'text','params':{'text':'started' if prompts==1 else 'next'}})
+        if prompts==2:
+            assert cancels==1
+            send({'jsonrpc':'2.0','method':'done','params':{'turn':active,'status':'completed'}})
+            active=None
+    elif m['method']=='release':
+        send({'jsonrpc':'2.0','id':m['id'],'result':{'active':active,'prompts':prompts,'cancels':cancels}})
+    elif m['method']=='cancel':
+        assert active=='t-1' and m['params']['turnId']==active
+        cancels+=1
+        send({'jsonrpc':'2.0','method':'done','params':{'turn':active,'status':'cancelled'}})
+        active=None
+    else: raise AssertionError(m)
+"#;
+        let mut spec=rpc_fixture(script,Some(1024));
+        let LaneSpec::Rpc(lane)=&mut spec.lane else { unreachable!() };
+        lane.cancel=Some(a4aa::RpcCallSpec { method:"cancel".into(),params:serde_json::json!({"turnId":"{turnId}"}) });
+        let (tx,mut rx)=mpsc::unbounded_channel();
+        let session=Adapter::new(spec).open_session(SessionRequest::default(),tx).await.unwrap();
+        {
+            let first=session.prompt(TurnRequest {text:"first".into(),..Default::default()});
+            tokio::pin!(first);
+            tokio::select! {
+                result=&mut first=>panic!("first turn ended before explicit cancellation: {result:?}"),
+                event=rx.recv()=>assert_eq!(event.unwrap(),a4aa::AgentEvent::MessageChunk {text:"started".into()})
+            }
+        } // Abandon only the waiter, without cancelling the agent.
+        let a4aa::LaneSession::Rpc(rpc)=session.lane() else {unreachable!()};
+        assert_eq!(rpc.call_passthrough("release",serde_json::json!({})).await.unwrap(),
+            serde_json::json!({"active":"t-1","prompts":1,"cancels":0}));
+        let second=session.prompt(TurnRequest {text:"second".into(),..Default::default()});
+        tokio::pin!(second);
+        tokio::select! {biased;
+            result=&mut second=>panic!("second turn overtook the active first turn: {result:?}"),
+            _=std::future::ready(())=>{}
+        }
+        session.cancel().await.unwrap();
+        let outcome=second.await.unwrap();
+        assert_eq!(outcome.stop_reason,"completed");
+        assert_eq!(outcome.text,"next");
+    }).await.expect("detached RPC turn did not preserve lifecycle progress");
+}
+
+#[tokio::test]
+async fn cli_empty_prompt_keeps_headless_argv_and_rejects_empty_model() {
+    for model in [None, Some("")] {
+        let mut spec = cli("", StreamMode::Stdio, false);
+        spec.command = CommandSpec {
+            program: "python3".into(),
+            args: vec![
+                "-c".into(),
+                "import json,sys;print(json.dumps(sys.argv[1:]))".into(),
+            ],
+            cwd: None,
+            env: EnvPolicy::default(),
+        };
+        let LaneSpec::Cli(lane) = &mut spec.lane else {
+            unreachable!()
+        };
+        lane.args = vec![
+            "--print".into(),
+            "{prompt}".into(),
+            "--model".into(),
+            "{model}".into(),
+        ];
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(spec)
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        let result = session
+            .prompt(TurnRequest {
+                text: String::new(),
+                model: model.map(str::to_owned),
+                effort: None,
+            })
+            .await;
+        if model.is_some() {
+            // The existing public selector contract rejects a blank model
+            // before launching work; it is not treated as an omitted model.
+            assert_eq!(result.unwrap_err().code, "agent_model_unsupported");
+        } else {
+            let args: Vec<String> = serde_json::from_str(&result.unwrap().text).unwrap();
+            assert_eq!(args, vec!["--print", ""]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellation_cleans_descendants_after_the_agent_leader_exits() {
+    for mode in ["stdio", "pty", "rpc"] {
+        tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+            let mut changes=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
+            let script=format!("rpc={}\n{}",if mode=="rpc" {"True"}else{"False"},r#"
+import os,sys,json,signal
+request=json.loads(sys.stdin.readline()) if rpc else None
+leader=os.getpid()
+if os.fork(): os._exit(23)
+signal.signal(signal.SIGINT,signal.SIG_IGN)
+payload=json.dumps({'leader':leader,'descendant':os.getpid()})
+if rpc:
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'id':'t'}}),flush=True)
+    print(json.dumps({'jsonrpc':'2.0','method':'text','params':{'text':payload}}),flush=True)
+else: print(payload,flush=True)
+signal.pause()
+"#);
+            let spec=if mode=="rpc" {
+                let mut spec=rpc_fixture(&script,Some(1024));
+                let LaneSpec::Rpc(lane)=&mut spec.lane else {unreachable!()};
+                lane.kill_on_cancel=true;
+                spec
+            } else {
+                let mut spec=cli("",if mode=="pty" {StreamMode::Pty}else{StreamMode::Stdio},false);
+                spec.command=CommandSpec {program:"python3".into(),args:vec!["-u".into(),"-c".into(),script],cwd:None,env:EnvPolicy::default()};
+                spec
+            };
+            let (tx,mut rx)=mpsc::unbounded_channel();
+            let session=Adapter::new(spec).open_session(SessionRequest::default(),tx).await.unwrap();
+            let mut prompt=std::pin::pin!(session.prompt(TurnRequest {text:"run".into(),..Default::default()}));
+            let mut text=String::new();
+            let identity:serde_json::Value=loop {
+                tokio::select! {
+                    result=&mut prompt=>panic!("fixture ended before explicit cancel: {result:?}"),
+                    event=rx.recv()=>if let Some(a4aa::AgentEvent::MessageChunk {text:chunk})=event {
+                        text.push_str(&chunk);
+                        if let Ok(value)=serde_json::from_str(&text) {break value;}
+                    }
+                }
+            };
+            let leader=identity["leader"].as_u64().unwrap() as libc::id_t;
+            let descendant=identity["descendant"].as_i64().unwrap() as libc::pid_t;
+            loop {
+                let mut info:libc::siginfo_t=unsafe {std::mem::zeroed()};
+                assert_eq!(unsafe {libc::waitid(libc::P_PID,leader,&mut info,libc::WEXITED|libc::WNOHANG|libc::WNOWAIT)},0);
+                if info.si_signo!=0 {break;}
+                changes.recv().await.unwrap();
+            }
+            session.cancel().await.unwrap();
+            assert_eq!(prompt.await.unwrap().stop_reason,"cancelled","{mode}");
+            let reaped=tokio::time::timeout(test_settings::WAIT_BUDGET,async {
+                while unsafe {libc::kill(descendant,0)}==0 {
+                    tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+                }
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ESRCH));
+            }).await;
+            if reaped.is_err() {unsafe {libc::kill(descendant,libc::SIGKILL);}}
+            reaped.expect("descendant remained alive after successful cancellation");
+        }).await.expect("exited-leader cancellation stalled");
+    }
 }

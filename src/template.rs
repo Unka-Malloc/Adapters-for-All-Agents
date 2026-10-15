@@ -10,7 +10,21 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub(crate) type Vars = BTreeMap<String, String>;
+pub(crate) struct Vars {
+    values: BTreeMap<String, String>,
+    absent: Vec<&'static str>,
+}
+impl Vars {
+    pub(crate) fn absent_names(&self) -> impl Iterator<Item = &&'static str> {
+        self.absent.iter()
+    }
+    pub(crate) fn is_absent_option(&self, template: &str) -> bool {
+        template
+            .strip_prefix('{')
+            .and_then(|t| t.strip_suffix('}'))
+            .is_some_and(|name| self.absent.contains(&name))
+    }
+}
 
 /// Whether a template consumes one of the adapter's declared selector
 /// placeholders. This keeps lane support discovery beside the substitution
@@ -48,6 +62,26 @@ pub(crate) struct VarSpec<'a> {
 }
 
 pub(crate) fn vars(input: VarSpec<'_>) -> Vars {
+    let absent = [
+        ("model", input.model),
+        ("modelId", input.model),
+        (
+            "modelProvider",
+            input
+                .model
+                .and_then(|model| model.split_once('/').map(|(provider, _)| provider)),
+        ),
+        ("effort", input.effort),
+        ("mode", input.mode),
+        ("instructions", input.instructions),
+        ("permission", input.permission),
+        ("provider", input.provider),
+        ("sessionId", input.session_id),
+        ("turnId", input.turn_id),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.is_none().then_some(name))
+    .collect();
     let mut vars = BTreeMap::new();
     vars.insert("cwd".to_owned(), input.cwd.to_owned());
     vars.insert("prompt".to_owned(), input.prompt.to_owned());
@@ -82,7 +116,10 @@ pub(crate) fn vars(input: VarSpec<'_>) -> Vars {
     if let Some(turn) = input.turn_id {
         vars.insert("turnId".to_owned(), turn.to_owned());
     }
-    vars
+    Vars {
+        values: vars,
+        absent,
+    }
 }
 
 /// Expand only tokens in the original template. Inserted values are opaque
@@ -95,7 +132,7 @@ pub(crate) fn substitute_text(template: &str, vars: &Vars) -> String {
         let tail = &rest[open + 1..];
         if let Some(end) = tail.find(['{', '}']) {
             if tail.as_bytes()[end] == b'}' {
-                if let Some(value) = vars.get(&tail[..end]) {
+                if let Some(value) = vars.values.get(&tail[..end]) {
                     output.push_str(value);
                 } else {
                     output.push('{');
@@ -116,8 +153,8 @@ pub(crate) fn substitute_text(template: &str, vars: &Vars) -> String {
 ///
 /// A leaf that is exactly `{var}` receives the value as a JSON string — a
 /// prompt containing quotes or newlines cannot corrupt the template. In an
-/// object, a leaf containing a placeholder that substitutes to nothing is
-/// dropped: an absent option must not send `""` onto the wire.
+/// object, an absent optional selector leaf is dropped. Required prompt text
+/// and explicitly provided empty values remain present.
 pub(crate) fn substitute(template: &Value, vars: &Vars) -> Value {
     match template {
         Value::String(text) => Value::String(substitute_text(text, vars)),
@@ -128,8 +165,7 @@ pub(crate) fn substitute(template: &Value, vars: &Vars) -> Value {
             map.iter()
                 .filter_map(|(key, value)| {
                     let resolved = substitute(value, vars);
-                    let absent = matches!(value, Value::String(t) if t.contains('{'))
-                        && resolved.as_str().is_some_and(str::is_empty);
+                    let absent = matches!(value, Value::String(t) if vars.is_absent_option(t));
                     (!absent).then(|| (key.clone(), resolved))
                 })
                 .collect(),
@@ -151,6 +187,22 @@ pub(crate) fn extract_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn required_empty_text_and_provided_empty_instructions_are_preserved() {
+        let variables = vars(VarSpec {
+            prompt: "",
+            instructions: Some(""),
+            ..Default::default()
+        });
+        assert_eq!(
+            substitute(
+                &json!({"text":"{prompt}","instructions":"{instructions}","model":"{model}"}),
+                &variables
+            ),
+            json!({"text":"","instructions":""})
+        );
+    }
 
     #[test]
     fn substitution_never_reinterprets_inserted_values() {

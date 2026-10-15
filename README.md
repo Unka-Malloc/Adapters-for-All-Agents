@@ -137,6 +137,12 @@ new turns drain earlier admitted events before resetting the output budget.
 `JsonRpcPeer` delegates can use `prepare_notification` for synchronous ingress
 admission; its default retains all notifications without a queue budget.
 
+RPC turns belong to the session driver until a terminal result arrives. Dropping
+the future waiting for a turn does not cancel it, discard its cancellation target,
+or admit a second overlapping turn. If a dispatched turn loses its outcome,
+`agent_session_recovery_required` prevents another turn on that session; close
+the session and reconcile the uncertain outcome before submitting more work.
+
 Generated Pi/OpenCode-style extension hooks are observers: only `Notify` intent
 is adapted. `Enforce`, `Inject` and `Rewrite` are reported as `Unsupported` and
 produce no observer artifact pretending to implement those semantics.

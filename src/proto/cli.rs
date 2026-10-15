@@ -770,8 +770,8 @@ fn effective_stream(requested: StreamMode) -> StreamMode {
 
 /// Substitute `{prompt}`/`{model}`/`{effort}`/`{instructions}`/
 /// `{permission}`/`{sessionId}`/`{cwd}`/`{provider}` placeholders from the
-/// shared variable map. An argument that is exactly a placeholder
-/// resolving empty is dropped, together with the flag immediately
+/// shared variable map. An argument that is exactly an absent optional
+/// selector is dropped, together with the value flag immediately
 /// preceding it when that flag exists only to carry the value (`--model
 /// "{model}"` with no model must not send an empty string). An argument
 /// whose trailing `={placeholder}` or leading `--{placeholder}` resolves
@@ -787,13 +787,11 @@ fn substitute_args(args: &[String], vars: &Vars) -> (Vec<String>, bool) {
         }
         // Empty-valued placeholders that form a flag tail (`--k={x}`) or
         // a flag body (`--{x}`) leave a malformed token: drop the arg.
-        let dangling = vars.iter().any(|(key, value)| {
-            value.is_empty()
-                && (arg.ends_with(&format!("={{{key}}}")) || *arg == format!("--{{{key}}}"))
-        });
+        let dangling = vars
+            .absent_names()
+            .any(|key| arg.ends_with(&format!("={{{key}}}")) || *arg == format!("--{{{key}}}"));
         let text = substitute_text(arg, vars);
-        let bare = arg.len() > 2 && arg.starts_with('{') && arg.ends_with('}');
-        if bare && text.is_empty() {
+        if vars.is_absent_option(arg) {
             if resolved
                 .last()
                 .is_some_and(|flag: &String| flag.starts_with('-'))

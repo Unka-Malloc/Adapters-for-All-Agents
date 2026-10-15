@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::framing::{self, FrameError};
@@ -89,6 +89,16 @@ pub enum CallFailure {
     Transport(String),
 }
 
+/// An already-enqueued request. Dropping the waiter does not cancel remote work.
+pub struct PendingCall(oneshot::Receiver<Result<Value, CallFailure>>);
+impl PendingCall {
+    pub async fn wait(self) -> Result<Value, CallFailure> {
+        self.0
+            .await
+            .unwrap_or_else(|_| Err(CallFailure::Transport("peer_closed".into())))
+    }
+}
+
 struct Pending {
     /// Pending calls keyed by the normalized wire id — numeric and string
     /// ids share one map because both render to the same key string.
@@ -113,6 +123,7 @@ pub struct JsonRpcPeer {
     reader: Mutex<Option<JoinHandle<()>>>,
     writer_task: Mutex<Option<JoinHandle<io::Result<()>>>>,
     closed: std::sync::atomic::AtomicBool,
+    closed_notice: Notify,
     notifications: mpsc::UnboundedSender<Option<(String, Value)>>,
     /// Non-stock envelope conventions (`None` = plain JSON-RPC 2.0).
     envelope: Option<RpcEnvelopeSpec>,
@@ -184,6 +195,7 @@ impl JsonRpcPeer {
             reader: Mutex::new(None),
             writer_task: Mutex::new(Some(writer_task)),
             closed: std::sync::atomic::AtomicBool::new(false),
+            closed_notice: Notify::new(),
             notifications,
             envelope,
         });
@@ -468,6 +480,13 @@ impl JsonRpcPeer {
 
     /// Send a request and await its response.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, CallFailure> {
+        self.start_call(method, params)?.wait().await
+    }
+
+    /// Enqueue synchronously, then let the owner decide where to await the
+    /// response. This allows dispatch and cancellation to share a critical
+    /// section without holding a lock across an await.
+    pub fn start_call(&self, method: &str, params: Value) -> Result<PendingCall, CallFailure> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(CallFailure::Transport("peer_closed".into()));
         }
@@ -502,10 +521,7 @@ impl JsonRpcPeer {
             self.pending.lock().unwrap().map.remove(&key);
             return Err(CallFailure::Transport("writer_closed".into()));
         }
-        match rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(CallFailure::Transport("peer_closed".into())),
-        }
+        Ok(PendingCall(rx))
     }
 
     /// Send a notification (no response expected).
@@ -523,9 +539,23 @@ impl JsonRpcPeer {
         // Mark closed first so a caller that inserts under the pending
         // lock after the flag is visible rejects instead of orphaning.
         self.closed.store(true, Ordering::Relaxed);
+        self.closed_notice.notify_waiters();
         let mut pending = self.pending.lock().unwrap();
         for (_, reply) in pending.map.drain() {
             let _ = reply.send(Err(CallFailure::Transport(reason.into())));
+        }
+    }
+
+    /// Wait for transport closure, including explicit close after an ack.
+    pub async fn closed(&self) {
+        loop {
+            let notice = self.closed_notice.notified();
+            tokio::pin!(notice);
+            notice.as_mut().enable();
+            if self.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            notice.await;
         }
     }
 
