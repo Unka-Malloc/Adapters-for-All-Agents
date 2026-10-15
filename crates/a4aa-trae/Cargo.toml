@@ -1,0 +1,17 @@
+[package]
+name = "a4aa-trae"
+description = "a4aa dialect adapter: the `trae` mechanism descriptor (hooks, rules, skills, commands, subagents, plugins, permissions, MCP) for a4aa's adaptation engine."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Adapter-For-All-Agents"
+keywords = ["a4aa", "agent", "trae", "dialect", "profile"]
+categories = ["development-tools"]
+
+[lib]
+name = "a4aa_trae"
+path = "src/lib.rs"
+
+[dependencies]
+a4aa = { path = "../..", version = "0.1.0" }
