@@ -42,7 +42,6 @@ static DIALECTS: &[(&str, &Dialect)] = &[
     ("qwen", a4aa_qwen::dialect()),
     ("roocode", a4aa_roo_code::dialect()),
     ("trae", a4aa_trae::dialect()),
-    ("windsurf", a4aa_windsurf::dialect()),
 ];
 
 /// Look a dialect up by id (`"codex"`, `"pi"`, `"generic"`, ...). Returns

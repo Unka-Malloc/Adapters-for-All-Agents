@@ -44,7 +44,7 @@ pub struct Dialect {
     /// How config-file MCP servers merge.
     pub mcp: McpSurface,
     /// Whether the agent has its own profile selection mechanism
-    /// (`codex --profile`, a DSH profile, Windsurf profiles).
+    /// (`codex --profile`, a DSH profile, Devin Desktop profiles).
     pub native_profiles: bool,
 }
 

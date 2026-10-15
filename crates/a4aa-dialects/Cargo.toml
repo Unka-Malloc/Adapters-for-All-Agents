@@ -41,4 +41,3 @@ a4aa-qoder = { path = "../a4aa-qoder", version = "0.1.0" }
 a4aa-qwen = { path = "../a4aa-qwen", version = "0.1.0" }
 a4aa-roo-code = { path = "../a4aa-roo-code", version = "0.1.0" }
 a4aa-trae = { path = "../a4aa-trae", version = "0.1.0" }
-a4aa-windsurf = { path = "../a4aa-windsurf", version = "0.1.0" }

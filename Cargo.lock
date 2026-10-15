@@ -116,7 +116,6 @@ dependencies = [
  "a4aa-qwen",
  "a4aa-roo-code",
  "a4aa-trae",
- "a4aa-windsurf",
 ]
 
 [[package]]
@@ -233,13 +232,6 @@ dependencies = [
 
 [[package]]
 name = "a4aa-trae"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-windsurf"
 version = "0.1.0"
 dependencies = [
  "a4aa",
