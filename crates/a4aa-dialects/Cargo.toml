@@ -26,7 +26,6 @@ a4aa-cursor = { path = "../a4aa-cursor", version = "0.1.0" }
 a4aa-devin = { path = "../a4aa-devin", version = "0.1.0" }
 a4aa-dsh = { path = "../a4aa-dsh", version = "0.1.0" }
 a4aa-factory = { path = "../a4aa-factory", version = "0.1.0" }
-a4aa-gemini = { path = "../a4aa-gemini", version = "0.1.0" }
 a4aa-grok = { path = "../a4aa-grok", version = "0.1.0" }
 a4aa-hermes = { path = "../a4aa-hermes", version = "0.1.0" }
 a4aa-iflow = { path = "../a4aa-iflow", version = "0.1.0" }

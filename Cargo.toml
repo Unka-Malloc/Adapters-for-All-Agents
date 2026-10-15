@@ -52,7 +52,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 a4aa-codex = { path = "crates/a4aa-codex" }
 a4aa-claude = { path = "crates/a4aa-claude" }
 a4aa-cursor = { path = "crates/a4aa-cursor" }
-a4aa-gemini = { path = "crates/a4aa-gemini" }
+a4aa-antigravity = { path = "crates/a4aa-antigravity" }
 a4aa-pi = { path = "crates/a4aa-pi" }
 
 [target.'cfg(unix)'.dev-dependencies]

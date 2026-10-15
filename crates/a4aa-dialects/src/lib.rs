@@ -27,7 +27,6 @@ static DIALECTS: &[(&str, &Dialect)] = &[
     ("devin", a4aa_devin::dialect()),
     ("dsh", a4aa_dsh::dialect()),
     ("factory", a4aa_factory::dialect()),
-    ("gemini", a4aa_gemini::dialect()),
     ("grok", a4aa_grok::dialect()),
     ("hermes", a4aa_hermes::dialect()),
     ("iflow", a4aa_iflow::dialect()),

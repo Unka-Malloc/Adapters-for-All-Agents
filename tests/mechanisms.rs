@@ -319,10 +319,10 @@ fn cursor_flat_hooks_and_permissions() {
     );
 }
 
-// ------------------------------ gemini --------------------------------------
+// ---------------------------- antigravity ------------------------------------
 
 #[test]
-fn gemini_named_bundle_and_unsupported_events() {
+fn antigravity_named_bundle_and_unsupported_events() {
     let set = MechanismSet {
         hooks: vec![
             hook(HookEvent::Stop, "receipt.sh"),
@@ -333,13 +333,13 @@ fn gemini_named_bundle_and_unsupported_events() {
             .collect(),
         ..Default::default()
     };
-    let plan = a4aa_gemini::adapt(&set);
+    let plan = a4aa_antigravity::adapt(&set);
 
     let artifact = plan
         .artifacts
         .iter()
         .find(|a| a.path.ends_with(".gemini/config/hooks.json"))
-        .expect("gemini bundle artifact");
+        .expect("antigravity bundle artifact");
     let doc: serde_json::Value = serde_json::from_str(&artifact.content).unwrap();
     assert_eq!(doc["a4aa"]["Stop"][0]["command"], "receipt.sh");
     assert_eq!(doc["a4aa"]["enabled"], true);
@@ -347,8 +347,8 @@ fn gemini_named_bundle_and_unsupported_events() {
     let settings = plan
         .artifacts
         .iter()
-        .find(|a| a.path.ends_with(".gemini/settings.json"))
-        .expect("gemini mcp merge");
+        .find(|a| a.path.ends_with(".gemini/mcp_config.json"))
+        .expect("antigravity mcp merge");
     assert!(settings.content.contains("fs-mcp"));
 
     assert_eq!(support(&plan, "hooks.stop"), Some(Support::Adapted));

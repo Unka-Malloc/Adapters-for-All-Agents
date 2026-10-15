@@ -6,10 +6,10 @@ version = 4
 name = "a4aa"
 version = "0.1.0"
 dependencies = [
+ "a4aa-antigravity",
  "a4aa-claude",
  "a4aa-codex",
  "a4aa-cursor",
- "a4aa-gemini",
  "a4aa-pi",
  "agent-client-protocol",
  "async-trait",
@@ -101,7 +101,6 @@ dependencies = [
  "a4aa-devin",
  "a4aa-dsh",
  "a4aa-factory",
- "a4aa-gemini",
  "a4aa-grok",
  "a4aa-hermes",
  "a4aa-iflow",
@@ -127,13 +126,6 @@ dependencies = [
 
 [[package]]
 name = "a4aa-factory"
-version = "0.1.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-gemini"
 version = "0.1.0"
 dependencies = [
  "a4aa",
