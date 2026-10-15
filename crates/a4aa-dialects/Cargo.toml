@@ -25,6 +25,7 @@ a4aa-dsh = { path = "../a4aa-dsh", version = "0.1.0" }
 a4aa-factory = { path = "../a4aa-factory", version = "0.1.0" }
 a4aa-grok = { path = "../a4aa-grok", version = "0.1.0" }
 a4aa-hermes = { path = "../a4aa-hermes", version = "0.1.0" }
+a4aa-kilo-code = { path = "../a4aa-kilo-code", version = "0.1.0" }
 a4aa-kimi-code = { path = "../a4aa-kimi-code", version = "0.1.0" }
 a4aa-kiro = { path = "../a4aa-kiro", version = "0.1.0" }
 a4aa-open-claw = { path = "../a4aa-open-claw", version = "0.1.0" }

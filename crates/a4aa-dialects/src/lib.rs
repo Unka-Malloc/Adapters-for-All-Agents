@@ -26,6 +26,7 @@ static DIALECTS: &[(&str, &Dialect)] = &[
     ("factory", a4aa_factory::dialect()),
     ("grok", a4aa_grok::dialect()),
     ("hermes", a4aa_hermes::dialect()),
+    ("kilocode", a4aa_kilo_code::dialect()),
     ("kimicode", a4aa_kimi_code::dialect()),
     ("kiro", a4aa_kiro::dialect()),
     ("openclaw", a4aa_open_claw::dialect()),

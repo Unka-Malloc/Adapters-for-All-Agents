@@ -79,6 +79,7 @@ dependencies = [
  "a4aa-factory",
  "a4aa-grok",
  "a4aa-hermes",
+ "a4aa-kilo-code",
  "a4aa-kimi-code",
  "a4aa-kiro",
  "a4aa-open-claw",
@@ -109,6 +110,13 @@ dependencies = [
 
 [[package]]
 name = "a4aa-hermes"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-kilo-code"
 version = "0.1.0"
 dependencies = [
  "a4aa",
