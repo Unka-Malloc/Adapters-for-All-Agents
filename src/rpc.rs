@@ -262,7 +262,17 @@ impl JsonRpcPeer {
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().map.insert(id, tx);
+        {
+            // `closed` is set before fail_pending drains the map, so once
+            // we hold this lock either closed is already visible or the
+            // drain that follows our insert will complete this entry —
+            // a call racing peer shutdown cannot be orphaned.
+            let mut pending = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(CallFailure::Transport("peer_closed".into()));
+            }
+            pending.map.insert(id, tx);
+        }
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if writer.send(frame).is_err() {
             self.pending.lock().unwrap().map.remove(&id);
@@ -286,11 +296,13 @@ impl JsonRpcPeer {
     }
 
     fn fail_pending(&self, reason: &'static str) {
+        // Mark closed first so a caller that inserts under the pending
+        // lock after the flag is visible rejects instead of orphaning.
+        self.closed.store(true, Ordering::Relaxed);
         let mut pending = self.pending.lock().unwrap();
         for (_, reply) in pending.map.drain() {
             let _ = reply.send(Err(CallFailure::Transport(reason.into())));
         }
-        self.closed.store(true, Ordering::Relaxed);
     }
 
     /// Close the peer: stop writing, stop reading, fail pending calls.
