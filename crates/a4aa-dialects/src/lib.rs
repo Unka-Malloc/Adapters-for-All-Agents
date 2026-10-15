@@ -94,8 +94,30 @@ mod tests {
 
     #[test]
     fn all_covers_every_adapter_plus_generic() {
-        let names: Vec<_> = all().map(|(n, _)| n).collect();
-        assert_eq!(names.len(), DIALECTS.len() + 1);
+        let mut names: Vec<_> = all().map(|(n, _)| n).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "antigravity",
+                "claude",
+                "codex",
+                "commandcode",
+                "cursor",
+                "devin",
+                "dsh",
+                "factory",
+                "generic",
+                "grok",
+                "hermes",
+                "kilocode",
+                "kimicode",
+                "kiro",
+                "openclaw",
+                "opencode",
+                "pi",
+            ]
+        );
         for (name, d) in all() {
             assert_eq!(name, d.id);
         }

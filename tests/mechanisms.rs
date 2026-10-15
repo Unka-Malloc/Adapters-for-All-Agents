@@ -27,6 +27,81 @@ fn support(plan: &AdaptationPlan, item: &str) -> Option<Support> {
         .map(|entry| entry.support)
 }
 
+#[test]
+fn kilo_nonempty_mechanisms_use_kilo_paths_and_merge_contracts() {
+    let set: MechanismSet = serde_json::from_value(serde_json::json!({
+        "hooks": [
+            {"event":"session-start","command":"start.sh"},
+            {"event":"pre-tool-use","command":"guard.sh"}
+        ],
+        "skills":[{"name":"audit","content":"Review."}],
+        "commands":[{"name":"ship","content":"Ship."}],
+        "subagents":[{"name":"reviewer","instructions":"Review."}],
+        "plugins":[{"id":"extra","source":"extra.ts"}],
+        "permissions":{"allow":["Shell(ls)"],"deny":["Shell(rm)"]},
+        "mcpServers":{"local":{"command":"fixture-mcp"}}
+    }))
+    .unwrap();
+    let plan = a4aa_dialects::dialect("kilocode").unwrap().adapt(&set);
+    let hooks = plan
+        .artifacts
+        .iter()
+        .find(|a| a.path == std::path::Path::new(".config/kilo/plugin/a4aa.js"))
+        .unwrap();
+    assert_eq!(hooks.scope, ArtifactScope::UserHome);
+    for entry in [
+        "session.created",
+        "tool.execute.before",
+        "start.sh",
+        "guard.sh",
+    ] {
+        assert!(hooks.content.contains(entry), "missing {entry}");
+    }
+    for path in [
+        ".kilo/skills/audit/SKILL.md",
+        ".config/kilo/command/ship.md",
+        ".config/kilo/agents/reviewer.md",
+    ] {
+        assert!(plan
+            .artifacts
+            .iter()
+            .any(|a| a.path == std::path::Path::new(path) && a.scope == ArtifactScope::UserHome));
+    }
+    let config = |key: &str| {
+        let artifact = plan
+            .artifacts
+            .iter()
+            .find(|a| {
+                a.path == std::path::Path::new(".config/kilo/kilo.json")
+                    && matches!(&a.mode, WriteMode::JsonMerge { at } if at == key)
+            })
+            .unwrap();
+        assert_eq!(artifact.scope, ArtifactScope::UserHome);
+        serde_json::from_str::<serde_json::Value>(&artifact.content).unwrap()
+    };
+    assert_eq!(
+        config("permission")["allow"],
+        serde_json::json!(["Shell(ls)"])
+    );
+    assert_eq!(
+        config("permission")["deny"],
+        serde_json::json!(["Shell(rm)"])
+    );
+    assert_eq!(config("")["mcp"]["local"]["command"], "fixture-mcp");
+    for item in ["hooks.session-start", "hooks.pre-tool-use", "plugins.extra"] {
+        assert_eq!(support(&plan, item), Some(Support::Adapted));
+    }
+    for item in [
+        "skills.audit",
+        "commands.ship",
+        "subagents.reviewer",
+        "permissions",
+        "mcp-servers",
+    ] {
+        assert_eq!(support(&plan, item), Some(Support::Native));
+    }
+}
+
 // --------------------------- declaration serde ----------------------------
 
 #[test]

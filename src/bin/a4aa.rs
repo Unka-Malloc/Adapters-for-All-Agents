@@ -435,6 +435,7 @@ fn fixture_agent() -> i32 {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let legacy = std::env::var_os("A4AA_FIXTURE_LEGACY").is_some();
+    let restore_unknown = std::env::var_os("A4AA_FIXTURE_RESTORE_UNKNOWN").is_some();
     let require_auth = std::env::var_os("A4AA_FIXTURE_AUTH").is_some();
     let mut authenticated = !require_auth;
     // Current session configuration selections, keyed by slot.
@@ -666,9 +667,9 @@ fn fixture_agent() -> i32 {
                     &stdout,
                     json!({
                         "jsonrpc": "2.0", "id": id,
-                        "result": session_state(
+                        "result": if restore_unknown { json!({}) } else { session_state(
                             params.get("sessionId").cloned().unwrap_or(json!("fixture-resumed")),
-                            &selections, legacy)
+                            &selections, legacy) }
                     }),
                 );
             }

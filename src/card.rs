@@ -120,7 +120,6 @@ impl AgentCard {
                 kill_on_cancel: rpc.kill_on_cancel,
                 envelope: rpc.envelope.map(|envelope| RpcEnvelopeSpec {
                     method_field: envelope.method_field.to_owned(),
-                    jsonrpc_tag: envelope.jsonrpc_tag,
                     string_ids: envelope.string_ids,
                     params_inline: envelope.params_inline,
                     response_method: envelope.response_method.map(str::to_owned),
@@ -279,7 +278,6 @@ pub struct RpcSurface {
 #[derive(Clone, Copy)]
 pub struct EnvelopeDecl {
     pub method_field: &'static str,
-    pub jsonrpc_tag: bool,
     pub string_ids: bool,
     pub params_inline: bool,
     pub response_method: Option<&'static str>,

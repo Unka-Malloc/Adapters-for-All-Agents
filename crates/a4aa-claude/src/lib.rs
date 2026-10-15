@@ -80,7 +80,7 @@ pub const fn dialect() -> &'static Dialect {
 
 /// The `claude` agent card: `claude --print` stream-json over stdio.
 ///
-/// Wire shape verified against a production host: one process per turn,
+/// Protocol: one process per turn,
 /// fixed stream-json argv, the prompt as a `stream-json` user message on
 /// stdin, NDJSON events on stdout (`system/init` carries `session_id`,
 /// `result` carries the reply text and token usage). Resume is a fresh

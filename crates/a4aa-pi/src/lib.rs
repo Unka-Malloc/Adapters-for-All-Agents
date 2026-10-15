@@ -57,7 +57,7 @@ pub const fn dialect() -> &'static Dialect {
 
 /// The `pi` agent card: a flat command envelope over stdio.
 ///
-/// Wire shape verified against a production host: frames are
+/// Protocol: frames are
 /// `{type,id,...inline fields}` — **not** JSON-RPC 2.0 — with responses
 /// `{type:"response",command,success,id,data|error}` and events carrying
 /// their payload under `data`. A fresh open is `get_state` (its
@@ -116,7 +116,6 @@ pub const AGENT: AgentCard = AgentCard {
         kill_on_cancel: true,
         envelope: Some(&EnvelopeDecl {
             method_field: "type",
-            jsonrpc_tag: false,
             string_ids: true,
             params_inline: true,
             response_method: Some("response"),
@@ -219,7 +218,6 @@ mod card_tests {
         assert!(rpc.kill_on_cancel);
         let envelope = rpc.envelope.as_ref().expect("flat envelope");
         assert_eq!(envelope.method_field, "type");
-        assert!(!envelope.jsonrpc_tag);
         assert!(envelope.string_ids);
         assert!(envelope.params_inline);
         assert_eq!(envelope.response_method.as_deref(), Some("response"));

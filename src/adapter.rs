@@ -20,13 +20,7 @@ use crate::proto::acp::{AcpLane, AcpSession, PermissionDecision, SessionDelegate
 use crate::proto::cli::CliLane;
 use crate::proto::rpc::{RpcLane, RpcSession, RpcSessionDelegate};
 
-/// One prompt submission.
-#[derive(Clone, Debug, Default)]
-pub struct TurnRequest {
-    pub text: String,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-}
+pub use crate::model::TurnRequest;
 
 /// Permission decisions host-side (ACP lane). Other lanes never call this.
 #[async_trait::async_trait]
@@ -100,7 +94,7 @@ impl AgentSession {
         }
     }
 
-    /// Validate the effective AwP turn selectors without prompting the
+    /// Validate the effective turn selectors without prompting the
     /// agent. This runs before BeforeTurn, so unsupported selectors cannot
     /// reserve paid work.
     pub fn validate_turn_request(&self, request: &TurnRequest) -> Result<(), AdapterError> {
@@ -154,7 +148,7 @@ impl AgentSession {
             LaneSession::Acp(session) => session.cancel(),
             LaneSession::Rpc(session) => session.cancel().await,
             LaneSession::Cli(session) => {
-                session.lane.cancelled.notify_waiters();
+                session.lane.cancelled.send_replace(());
                 Ok(())
             }
         }
@@ -422,7 +416,7 @@ impl Adapter {
                     secrets: self.secrets.clone(),
                     observer: self.observer.clone(),
                     max_output_bytes: self.spec.max_output_bytes,
-                    cancelled: Arc::new(tokio::sync::Notify::new()),
+                    cancelled: Arc::new(tokio::sync::watch::channel(()).0),
                     observed: Arc::new(std::sync::OnceLock::new()),
                 };
                 // An explicitly requested resume is already the session's

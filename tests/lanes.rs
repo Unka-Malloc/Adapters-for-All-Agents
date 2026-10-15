@@ -1094,6 +1094,61 @@ async fn acp_session_options_unadvertised_fail_closed() {
 }
 
 #[tokio::test]
+async fn acp_restored_unknown_options_reject_explicit_overrides() {
+    for config in [
+        options(Some("fixture-large"), None, None, None),
+        options(None, Some("ask"), None, None),
+        options(None, None, Some("high"), None),
+        options(None, None, None, Some("safe")),
+    ] {
+        let adapter = Adapter::new(acp_spec_with_env(&[("A4AA_FIXTURE_RESTORE_UNKNOWN", "1")]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let request = SessionRequest {
+            resume: Some("saved-session".into()),
+            config,
+            ..Default::default()
+        };
+        let error = match adapter.open_session(request, tx).await {
+            Ok(_) => panic!("an unconfirmed override must not open a restored session"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "agent_configuration_unavailable");
+    }
+    // Without an override the persisted configuration remains the agent's.
+    let adapter = Adapter::new(acp_spec_with_env(&[("A4AA_FIXTURE_RESTORE_UNKNOWN", "1")]));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(
+            SessionRequest {
+                resume: Some("saved-session".into()),
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn acp_restored_permission_override_is_applied_and_confirmed() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(acp_spec())
+        .open_session(
+            SessionRequest {
+                resume: Some("saved-session".into()),
+                config: options(None, None, None, Some("open")),
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+    assert!(config_of(&session, &mut rx).await.ends_with("perm=open"));
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn acp_session_options_fall_back_to_legacy_surfaces() {
     // A4AA_FIXTURE_LEGACY drops the model/mode configOptions — the legacy
     // `models`/`modes` surfaces + `session/set_model`/`session/set_mode`

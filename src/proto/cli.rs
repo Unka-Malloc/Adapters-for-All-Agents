@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::bounds;
 use crate::env::SecretResolver;
@@ -34,7 +34,7 @@ pub struct CliLane {
     /// Fired by `AgentSession::cancel`; the in-flight turn's process tree is
     /// terminated. Explicit user cancellation only — transport failures and
     /// observer disconnects never reach this.
-    pub cancelled: std::sync::Arc<tokio::sync::Notify>,
+    pub cancelled: std::sync::Arc<watch::Sender<()>>,
     /// Session binding captured from a `sessionIdPath` match on stdout —
     /// the first observed value wins and later turns resume through it.
     pub observed: std::sync::Arc<std::sync::OnceLock<String>>,
@@ -91,17 +91,72 @@ impl CliLane {
                 "cli/stdio",
             ));
         };
-        let mut output = Vec::new();
-        let read = stdout
-            .read_to_end(&mut output)
+        // Only the first non-empty line is a binding. Bound that line and
+        // drain everything else without retaining it, including on overflow.
+        let limit = self
+            .max_output_bytes
+            .unwrap_or(crate::framing::DEFAULT_MAX_MESSAGE_BYTES);
+        let mut line = Vec::new();
+        let mut id = None;
+        let mut oversized = false;
+        let mut buffer = [0u8; bounds::READ_CHUNK];
+        loop {
+            let count = match AsyncReadExt::read(&mut stdout, &mut buffer).await {
+                Ok(count) => count,
+                Err(error) => {
+                    let _ = child.terminate().await;
+                    return Err(AdapterError::io(
+                        "agent_output_read_failed",
+                        "cli/stdout",
+                        error,
+                    ));
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            if id.is_some() || oversized {
+                continue;
+            }
+            for byte in &buffer[..count] {
+                if *byte == b'\n' {
+                    let candidate = String::from_utf8_lossy(&line).trim().to_owned();
+                    line.clear();
+                    if !candidate.is_empty() {
+                        id = Some(candidate);
+                        break;
+                    }
+                } else if line.len() < limit {
+                    line.push(*byte);
+                } else {
+                    oversized = true;
+                    line.clear();
+                    break;
+                }
+            }
+        }
+        let exit = child
+            .wait_natural(None)
             .await
-            .map_err(|e| AdapterError::io("agent_output_read_failed", "cli/stdout", e));
-        let _ = child.terminate().await;
-        read?;
-        let id = output
-            .split(|byte| *byte == b'\n')
-            .map(|line| String::from_utf8_lossy(line).trim().to_owned())
-            .find(|line| !line.is_empty());
+            .map_err(|error| AdapterError::io("agent_process_wait_failed", "cli/open", error))?;
+        if oversized {
+            return Err(AdapterError::permanent(
+                "agent_session_id_too_large",
+                "cli/open",
+            ));
+        }
+        if exit.is_some_and(|status| !status.success()) {
+            return Err(AdapterError::permanent(
+                "agent_session_open_failed",
+                "cli/open",
+            ));
+        }
+        if id.is_none() {
+            let candidate = String::from_utf8_lossy(&line).trim().to_owned();
+            if !candidate.is_empty() {
+                id = Some(candidate);
+            }
+        }
         match id {
             Some(id) => {
                 let _ = self.observed.set(id);
@@ -124,6 +179,10 @@ impl CliLane {
         effort: Option<&str>,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<TurnOutcome, AdapterError> {
+        // Each active turn observes cancellation even between I/O awaits.
+        // A subscription starts at the current version, so idle cancellation
+        // never carries over to a later turn.
+        let cancelled = self.cancelled.subscribe();
         // The effective session binding: an explicitly requested resume
         // first, then whatever the agent already reported on stdout or a
         // session-creation command.
@@ -226,9 +285,15 @@ impl CliLane {
         let command = SupervisedChild::command(&spec, &env, request.cwd.as_deref());
 
         let mut outcome = match effective_stream(self.lane.stream) {
-            StreamMode::Stdio => self.run_stdio(command, stdin_payload, events).await,
+            StreamMode::Stdio => {
+                self.run_stdio(command, stdin_payload, events, cancelled)
+                    .await
+            }
             #[cfg(unix)]
-            StreamMode::Pty => self.run_pty(command, stdin_payload, events).await,
+            StreamMode::Pty => {
+                self.run_pty(command, stdin_payload, events, cancelled)
+                    .await
+            }
             #[cfg(not(unix))]
             StreamMode::Pty => unreachable!("effective_stream degrades pty off-unix"),
         };
@@ -260,6 +325,7 @@ impl CliLane {
         mut command: tokio::process::Command,
         stdin_payload: Option<String>,
         events: mpsc::UnboundedSender<AgentEvent>,
+        mut cancelled: watch::Receiver<()>,
     ) -> Result<TurnOutcome, AdapterError> {
         command
             .stdin(if stdin_payload.is_some() {
@@ -285,16 +351,23 @@ impl CliLane {
                 }
                 // An undelivered prompt must fail the turn — a quiet drop
                 // would let the turn report success for work never asked.
-                stdin
-                    .write_all(bytes)
-                    .await
-                    .map_err(|e| AdapterError::io("agent_prompt_write_failed", "cli/stdin", e))?;
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => {
+                        child.terminate().await?;
+                        return Ok(cancelled_outcome(TurnCollect::default()));
+                    }
+                    result = stdin.write_all(bytes) => {
+                        result.map_err(|e| AdapterError::io("agent_prompt_write_failed", "cli/stdin", e))?;
+                    }
+                }
             }
         }
         let stdout = child
             .stdout()
             .ok_or_else(|| AdapterError::permanent("agent_pipe_unavailable", "cli/stdio"))?;
-        self.collect(child, Box::new(stdout), events).await
+        self.collect(child, Box::new(stdout), events, cancelled)
+            .await
     }
 
     #[cfg(unix)]
@@ -303,16 +376,24 @@ impl CliLane {
         command: tokio::process::Command,
         stdin_payload: Option<String>,
         events: mpsc::UnboundedSender<AgentEvent>,
+        mut cancelled: watch::Receiver<()>,
     ) -> Result<TurnOutcome, AdapterError> {
-        let (child, master) = crate::transport::pty::spawn(command)?;
+        let (mut child, master) = crate::transport::pty::spawn(command)?;
         let master = master.with_observer(self.observer.clone());
         if let Some(payload) = stdin_payload {
-            master
-                .write(payload.as_bytes())
-                .await
-                .map_err(|e| AdapterError::io("agent_prompt_write_failed", "cli/pty", e))?;
+            tokio::select! {
+                biased;
+                _ = cancelled.changed() => {
+                    child.terminate().await?;
+                    return Ok(cancelled_outcome(TurnCollect::default()));
+                }
+                result = master.write(payload.as_bytes()) => {
+                    result.map_err(|e| AdapterError::io("agent_prompt_write_failed", "cli/pty", e))?;
+                }
+            }
         }
-        self.collect(child, Box::new(master), events).await
+        self.collect(child, Box::new(master), events, cancelled)
+            .await
     }
 
     /// Drain the output stream, emitting chunks, until EOF. There is no
@@ -323,6 +404,7 @@ impl CliLane {
         mut child: SupervisedChild,
         mut reader: Box<dyn ChunkRead>,
         events: mpsc::UnboundedSender<AgentEvent>,
+        mut cancelled: watch::Receiver<()>,
     ) -> Result<TurnOutcome, AdapterError> {
         if let Some(stderr) = child.stderr() {
             tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
@@ -337,6 +419,11 @@ impl CliLane {
         let mut buffer = [0u8; bounds::READ_CHUNK];
         loop {
             tokio::select! {
+                biased;
+                _ = cancelled.changed() => {
+                    child.terminate().await?;
+                    return Ok(cancelled_outcome(state));
+                }
                 count = reader.read(&mut buffer) => {
                     match count {
                         Ok(0) => break,
@@ -387,16 +474,6 @@ impl CliLane {
                         }
                     }
                 }
-                _ = self.cancelled.notified() => {
-                    let _ = child.terminate().await;
-                    return Ok(TurnOutcome {
-                        stop_reason: "cancelled".to_owned(),
-                        text: state.output,
-                        truncated: state.truncated,
-                        exit_code: None,
-                        usage: state.usage,
-                    });
-                }
             }
         }
         if !pending.is_empty() {
@@ -407,10 +484,16 @@ impl CliLane {
             let tail = std::mem::take(&mut state.lines);
             self.absorb_line(tail.trim_end_matches('\r'), &events, &mut state);
         }
-        let exit = child
-            .wait_natural(None)
-            .await
-            .map_err(|e| AdapterError::io("agent_process_wait_failed", "process/wait", e))?;
+        let exit = tokio::select! {
+            biased;
+            _ = cancelled.changed() => {
+                child.terminate().await?;
+                return Ok(cancelled_outcome(state));
+            }
+            result = child.wait_natural(None) => {
+                result.map_err(|e| AdapterError::io("agent_process_wait_failed", "process/wait", e))?
+            }
+        };
         Ok(TurnOutcome {
             stop_reason: if exit.and_then(|s| s.code()).unwrap_or(0) == 0 {
                 "end_turn"
@@ -434,11 +517,9 @@ impl CliLane {
         state: &mut TurnCollect,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
+        self.retain_text(text, state, events);
         if self.lane.json_lines {
-            self.retain_text(text, state, events);
             self.absorb_lines(text, state, events);
-        } else {
-            self.emit_text(text, state, events);
         }
     }
 
@@ -449,11 +530,34 @@ impl CliLane {
         state: &mut TurnCollect,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        state.lines.push_str(text);
-        while let Some(end) = state.lines.find('\n') {
-            let line = state.lines[..end].trim_end_matches('\r').to_owned();
-            state.lines.drain(..=end);
-            self.absorb_line(&line, events, state);
+        // Like framing::read_frame and Tokio's LinesCodec, inspect only the
+        // new chunk and drain an oversized record through its terminator.
+        // Keep enough scratch space for small control records even when the
+        // caller's retained-output budget is very small.
+        let frame_limit = self
+            .max_output_bytes
+            .map(|limit| limit.max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES));
+        for part in text.split_inclusive('\n') {
+            let complete = part.ends_with('\n');
+            let content = part.strip_suffix('\n').unwrap_or(part);
+            if !state.discarding_line {
+                if frame_limit
+                    .is_some_and(|limit| state.lines.len().saturating_add(content.len()) > limit)
+                {
+                    state.lines.clear();
+                    state.discarding_line = true;
+                    signal_truncated(state, events);
+                } else {
+                    state.lines.push_str(content);
+                }
+            }
+            if complete {
+                if !state.discarding_line {
+                    let line = std::mem::take(&mut state.lines);
+                    self.absorb_line(line.trim_end_matches('\r'), events, state);
+                }
+                state.discarding_line = false;
+            }
         }
     }
 
@@ -471,6 +575,9 @@ impl CliLane {
         let Ok(raw) = serde_json::from_str::<Value>(line) else {
             return;
         };
+        let emit_raw = self
+            .max_output_bytes
+            .is_none_or(|limit| line.len() <= limit.saturating_sub(state.raw_bytes));
         if self.observed.get().is_none() {
             if let Some(path) = self.lane.session_id_path.as_deref() {
                 if let Some(id) = extract_path(&raw, path)
@@ -484,10 +591,12 @@ impl CliLane {
         if let Some(path) = self.lane.usage_path.as_deref() {
             if let Some(found) = extract_path(&raw, path).and_then(token_usage) {
                 state.usage = Some(found.clone());
-                let _ = events.send(AgentEvent::Usage {
-                    usage: found,
-                    raw: Some(raw.clone()),
-                });
+                if emit_raw {
+                    let _ = events.send(AgentEvent::Usage {
+                        usage: found,
+                        raw: None,
+                    });
+                }
             }
         }
         if let (Some(selector), Some(path)) = (
@@ -497,11 +606,20 @@ impl CliLane {
             let selector_field = self.lane.result_selector_field.as_deref().unwrap_or("type");
             if raw.get(selector_field).and_then(Value::as_str) == Some(selector) {
                 if let Some(text) = extract_path(&raw, path).and_then(Value::as_str) {
-                    state.result_text = Some(text.to_owned());
+                    let retained = bounded_prefix(text, self.max_output_bytes);
+                    state.result_text = Some(retained.to_owned());
+                    if retained.len() < text.len() {
+                        signal_truncated(state, events);
+                    }
                 }
             }
         }
-        let _ = events.send(AgentEvent::Raw { raw });
+        if emit_raw {
+            state.raw_bytes = state.raw_bytes.saturating_add(line.len());
+            let _ = events.send(AgentEvent::Raw { raw });
+        } else {
+            signal_truncated(state, events);
+        }
     }
 
     /// Retain a decoded span under the byte cap and signal `Truncated`
@@ -513,52 +631,28 @@ impl CliLane {
         state: &mut TurnCollect,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        let mut accepted = text.len();
-        if let Some(limit) = self.max_output_bytes {
-            accepted = limit.saturating_sub(state.output.len()).min(text.len());
-            while !text.is_char_boundary(accepted) {
-                accepted -= 1;
-            }
-        }
-        if accepted > 0 {
-            state.output.push_str(&text[..accepted]);
-        }
-        if accepted < text.len() && !state.truncated {
-            state.truncated = true;
-            let _ = events.send(AgentEvent::Truncated);
-        }
-    }
-
-    /// Emit one decoded text span: retain up to the cap, signal `Truncated`
-    /// once, and mirror the retained prefix as a chunk event. The byte cap
-    /// applies to retained output; `accepted` never splits a scalar.
-    fn emit_text(
-        &self,
-        text: &str,
-        state: &mut TurnCollect,
-        events: &mpsc::UnboundedSender<AgentEvent>,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        let mut accepted = text.len();
-        if let Some(limit) = self.max_output_bytes {
-            accepted = limit.saturating_sub(state.output.len()).min(text.len());
-            while !text.is_char_boundary(accepted) {
-                accepted -= 1;
-            }
-        }
-        if accepted > 0 {
-            state.output.push_str(&text[..accepted]);
+        let remaining = self
+            .max_output_bytes
+            .map(|limit| limit.saturating_sub(state.output.len()));
+        let retained = bounded_prefix(text, remaining);
+        state.output.push_str(retained);
+        if !self.lane.json_lines && !retained.is_empty() {
             let _ = events.send(AgentEvent::MessageChunk {
-                text: text[..accepted].to_string(),
+                text: retained.to_owned(),
             });
         }
-        if accepted < text.len() && !state.truncated {
-            state.truncated = true;
-            let _ = events.send(AgentEvent::Truncated);
+        if retained.len() < text.len() {
+            signal_truncated(state, events);
         }
     }
+}
+
+fn bounded_prefix(text: &str, limit: Option<usize>) -> &str {
+    let mut end = limit.unwrap_or(text.len()).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Everything one CLI turn accumulates while it collects output.
@@ -571,9 +665,28 @@ struct TurnCollect {
     /// NDJSON carry for `jsonLines`: a line split across reads waits for
     /// its newline; an unterminated tail at EOF is still one record.
     lines: String,
+    discarding_line: bool,
+    raw_bytes: usize,
     usage: Option<TokenUsage>,
     /// A `result_selector`/`result_path` record's authoritative text.
     result_text: Option<String>,
+}
+
+fn signal_truncated(state: &mut TurnCollect, events: &mpsc::UnboundedSender<AgentEvent>) {
+    if !state.truncated {
+        state.truncated = true;
+        let _ = events.send(AgentEvent::Truncated);
+    }
+}
+
+fn cancelled_outcome(state: TurnCollect) -> TurnOutcome {
+    TurnOutcome {
+        stop_reason: "cancelled".to_owned(),
+        text: state.result_text.unwrap_or(state.output),
+        truncated: state.truncated,
+        exit_code: None,
+        usage: state.usage,
+    }
 }
 
 /// Uniform chunk source over a child stdout pipe or a pty master.
@@ -645,13 +758,16 @@ fn substitute_args(args: &[String], vars: &Vars) -> (Vec<String>, bool) {
             text = text.replace(&format!("{{{key}}}"), value);
         }
         let bare = arg.len() > 2 && arg.starts_with('{') && arg.ends_with('}');
-        if (bare && text.is_empty()) || dangling {
+        if bare && text.is_empty() {
             if resolved
                 .last()
                 .is_some_and(|flag: &String| flag.starts_with('-'))
             {
                 resolved.pop();
             }
+            continue;
+        }
+        if dangling {
             continue;
         }
         resolved.push(text);

@@ -66,7 +66,7 @@ pub const fn dialect() -> &'static Dialect {
 /// The `opencode` agent card: the official `opencode acp` NDJSON-stdio
 /// surface.
 ///
-/// Wire shape verified against a production host: `opencode acp` speaks
+/// Protocol: `opencode acp` speaks
 /// Agent Client Protocol over stdio — `session/new`, `session/load`,
 /// `session/prompt`, `session/update` streaming, permission requests and
 /// `session/cancel` all ride the protocol, so the card declares the lane

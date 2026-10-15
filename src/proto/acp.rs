@@ -32,10 +32,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::adapter::TurnRequest;
 use crate::bounds;
 use crate::env::SecretResolver;
 use crate::error::AdapterError;
+use crate::model::TurnRequest;
 use crate::model::{
     AgentEvent, AgentInfo, Capabilities, CommandSpec, SelectorPhase, SelectorSupport,
     SelectorSupportSet, SessionConfig, SessionRequest, TurnOutcome,
@@ -603,7 +603,6 @@ async fn open_session(
             mcp_servers: mcp,
         }
     };
-    let restored = !matches!(call, SessionCall::New { .. });
     let response = call_with_auth_retry(connection, &call, &auth_methods).await?;
     let mut setup = SessionSetup::parse(response)?;
     let session_id = match context.resume.as_deref() {
@@ -614,14 +613,7 @@ async fn open_session(
         })?,
     };
 
-    apply_session_config(
-        connection,
-        &session_id,
-        &mut setup,
-        &context.config,
-        restored,
-    )
-    .await?;
+    apply_session_config(connection, &session_id, &mut setup, &context.config).await?;
 
     Ok(Opened {
         connection: connection.clone(),
@@ -748,35 +740,27 @@ async fn call_with_auth_retry(
 ///   closed rather than falling back.
 /// - On a fresh session every surface is treated as reported, so an
 ///   unadvertised request fails.
-/// - On a restored session an unreported surface is *unknown*: the
-///   persisted session state stays in charge and the request is left
-///   unapplied rather than fabricating a selection.
+/// - On a restored session an unreported surface stays unknown only when
+///   the host did not request an override. Explicit selections must be
+///   applied and confirmed, or session establishment fails closed.
 async fn apply_session_config(
     connection: &ConnectionTo<Agent>,
     session_id: &str,
     state: &mut SessionSetup,
     requested: &SessionConfig,
-    restored: bool,
 ) -> Result<(), AdapterError> {
-    let config_known = state.config_options.is_some();
     if let Some(model) = requested.model.as_deref() {
-        if !(restored && !config_known && state.models.is_none()) {
-            apply_model(connection, session_id, state, model).await?;
-        }
+        apply_model(connection, session_id, state, model).await?;
     }
     if let Some(mode) = requested.mode.as_deref() {
-        if !(restored && !config_known && state.modes.is_none()) {
-            apply_mode(connection, session_id, state, mode).await?;
-        }
+        apply_mode(connection, session_id, state, mode).await?;
     }
     for (slot, requested_value) in [
         ("thought_level", requested.effort.as_deref()),
         ("permissions", requested.permission.as_deref()),
     ] {
         if let Some(value) = requested_value {
-            if !restored || config_known {
-                apply_config_value(connection, session_id, state, slot, value).await?;
-            }
+            apply_config_value(connection, session_id, state, slot, value).await?;
         }
     }
     Ok(())
@@ -1020,9 +1004,10 @@ fn option_offers(option: &SessionConfigOption, value: &str) -> bool {
 /// against a legacy `models` entry — same allowlist hosts apply when
 /// sanitizing provider ids.
 fn sanitize_model_id(raw: &str) -> String {
+    const MAX_NORMALIZED_MODEL_ID_CHARS: usize = 160;
     raw.chars()
         .filter(|character| character.is_ascii_alphanumeric() || "._-+:[]=,".contains(*character))
-        .take(160)
+        .take(MAX_NORMALIZED_MODEL_ID_CHARS)
         .collect()
 }
 

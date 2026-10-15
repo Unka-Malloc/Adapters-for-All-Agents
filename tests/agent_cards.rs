@@ -355,7 +355,6 @@ done
             kill_on_cancel: true,
             envelope: Some(a4aa::RpcEnvelopeSpec {
                 method_field: "type".into(),
-                jsonrpc_tag: false,
                 string_ids: true,
                 params_inline: true,
                 response_method: Some("response".into()),

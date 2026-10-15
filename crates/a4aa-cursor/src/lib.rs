@@ -67,11 +67,11 @@ pub const fn dialect() -> &'static Dialect {
 
 /// The `cursor` agent card: `cursor-agent` stream-json CLI over a PTY.
 ///
-/// Wire shape verified against a production host: a session opens with
+/// Protocol: a session opens with
 /// `cursor-agent create-chat` — the first non-empty stdout line is the
 /// binding — and every turn is one process
-/// `cursor-agent --print --output-format stream-json --trust --force
-/// --approve-mcps --stream-partial-output --workspace <dir> --resume <id>
+/// `cursor-agent --print --output-format stream-json
+/// --stream-partial-output --workspace <dir> --resume <id>
 /// <prompt> [--model <m>] [--reasoning-effort <e>]`.
 /// The stream echoes the bound `session_id` on every record and carries
 /// the reply text on the terminal `{type:"result"}` record. Token
@@ -86,9 +86,6 @@ pub const AGENT: AgentCard = AgentCard {
             "--print",
             "--output-format",
             "stream-json",
-            "--trust",
-            "--force",
-            "--approve-mcps",
             "--stream-partial-output",
             "--workspace",
             "{cwd}",

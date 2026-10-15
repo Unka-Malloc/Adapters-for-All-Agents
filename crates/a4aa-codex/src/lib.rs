@@ -66,7 +66,7 @@ pub const fn dialect() -> &'static Dialect {
 
 /// The `codex` agent card: `codex app-server` stdio JSON-RPC.
 ///
-/// Wire shape verified against a production host: `initialize`/`initialized`
+/// Protocol: `initialize`/`initialized`
 /// handshake, then `thread/start` (fresh) or `thread/resume` (bound). Turns
 /// run `turn/start` → async `turn/completed`; `turn/interrupt` cancels the
 /// in-flight turn. `account/rateLimits/read`, `model/list`, `thread/unarchive`,
@@ -78,7 +78,11 @@ pub const AGENT: AgentCard = AgentCard {
     surface: AgentSurface::Rpc(&RpcSurface {
         initialize: Some(RpcCallDecl {
             method: "initialize",
-            params: r#"{"clientInfo":{"name":"a4aa","version":"0.1.0"}}"#,
+            params: concat!(
+                r#"{"clientInfo":{"name":"a4aa","version":""#,
+                env!("CARGO_PKG_VERSION"),
+                r#""}}"#
+            ),
         }),
         initialized: Some("initialized"),
         session_open: Some(RpcCallDecl {
@@ -259,6 +263,10 @@ mod tests {
             panic!("codex drives the rpc lane")
         };
         assert_eq!(rpc.initialize.as_ref().unwrap().method, "initialize");
+        assert_eq!(
+            rpc.initialize.as_ref().unwrap().params["clientInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
         assert_eq!(rpc.initialized.as_deref(), Some("initialized"));
         assert_eq!(rpc.session_open.as_ref().unwrap().method, "thread/start");
         assert_eq!(rpc.session_resume.as_ref().unwrap().method, "thread/resume");

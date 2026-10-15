@@ -15,7 +15,7 @@
 use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::bounds;
 use crate::env::SecretResolver;
@@ -58,7 +58,7 @@ pub struct RpcSession {
     session_id: Option<String>,
     cwd: String,
     /// Inbound notifications, for awaiting declared completion methods.
-    notifications: broadcast::Sender<(String, Value)>,
+    notifications: TurnNotifications,
     /// Turn id captured from the in-flight prompt response; `{turnId}`
     /// substitutes it in `cancel` params.
     active_turn: std::sync::Mutex<Option<String>>,
@@ -67,6 +67,28 @@ pub struct RpcSession {
     cancelled: std::sync::atomic::AtomicBool,
     /// Serializes prompt turns.
     turn_lock: Mutex<()>,
+}
+
+// Bounded backpressure for relevant turn notifications; terminal messages
+// share reliable delivery and are never dropped to make room for telemetry.
+const TURN_NOTIFICATION_CAPACITY: usize = 64;
+type TurnNotifications = Arc<std::sync::Mutex<Option<mpsc::Sender<(String, Value)>>>>;
+
+struct TurnSubscription(TurnNotifications);
+impl Drop for TurnSubscription {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+fn cancelled_outcome(text: String) -> TurnOutcome {
+    TurnOutcome {
+        stop_reason: "cancelled".into(),
+        text,
+        truncated: false,
+        exit_code: None,
+        usage: None,
+    }
 }
 
 impl RpcLane {
@@ -84,12 +106,13 @@ impl RpcLane {
         }
         let text_method = self.spec.text_event_method.clone();
         let observer = self.observer.clone();
-        let (notifications, _) = broadcast::channel(64);
+        let notifications: TurnNotifications = Arc::new(std::sync::Mutex::new(None));
         struct Inner {
             delegate: Arc<dyn RpcSessionDelegate>,
             text_method: Option<String>,
             text_path: Option<String>,
-            notifications: broadcast::Sender<(String, Value)>,
+            completion_method: Option<String>,
+            notifications: TurnNotifications,
         }
         #[async_trait::async_trait]
         impl RpcDelegate for Inner {
@@ -101,10 +124,20 @@ impl RpcLane {
                 self.delegate.on_request(method, params).await
             }
             async fn on_closed(&self) {
-                let _ = self.notifications.send((String::new(), Value::Null));
+                let sink = self.notifications.lock().unwrap().clone();
+                if let Some(sink) = sink {
+                    let _ = sink.send((String::new(), Value::Null)).await;
+                }
             }
             async fn on_notification(&self, method: &str, params: Value) {
-                let _ = self.notifications.send((method.to_owned(), params.clone()));
+                if Some(method) == self.text_method.as_deref()
+                    || Some(method) == self.completion_method.as_deref()
+                {
+                    let sink = self.notifications.lock().unwrap().clone();
+                    if let Some(sink) = sink {
+                        let _ = sink.send((method.to_owned(), params.clone())).await;
+                    }
+                }
                 let event = if Some(method) == self.text_method.as_deref() {
                     notification_text(&params, self.text_path.as_deref())
                         .map(|text| AgentEvent::MessageChunk { text })
@@ -125,6 +158,11 @@ impl RpcLane {
                 delegate,
                 text_method,
                 text_path: self.spec.text_path.clone(),
+                completion_method: self
+                    .spec
+                    .completion
+                    .as_ref()
+                    .map(|done| done.method.clone()),
                 notifications: notifications.clone(),
             }),
             observer,
@@ -268,31 +306,21 @@ impl RpcSession {
                 .await
                 .map_err(call_failure)?;
         }
-        // Subscribe before the call: a completion emitted between the
-        // response and subscription must not be missed.
-        let feed = self
-            .spec
-            .completion
-            .is_some()
-            .then(|| self.notifications.subscribe());
+        // Install the reliable per-turn feed before the prompt request. The
+        // receiver is drained while awaiting its acknowledgement as well.
+        if let Some(done) = &self.spec.completion {
+            let (sink, feed) = mpsc::channel(TURN_NOTIFICATION_CAPACITY);
+            *self.notifications.lock().unwrap() = Some(sink);
+            let _subscription = TurnSubscription(self.notifications.clone());
+            return self.await_completion(done, feed, &vars).await;
+        }
         let result = match call(&self.peer, &self.spec.prompt, &vars).await {
             Ok(result) => result,
             Err(_) if self.cancelled.swap(false, Ordering::Relaxed) => {
-                return Ok(TurnOutcome {
-                    stop_reason: "cancelled".to_owned(),
-                    text: String::new(),
-                    truncated: false,
-                    exit_code: None,
-                    usage: None,
-                });
+                return Ok(cancelled_outcome(String::new()));
             }
             Err(error) => return Err(error),
         };
-        let turn_id = binding(&result);
-        if let (Some(done), Some(feed)) = (&self.spec.completion, feed) {
-            *self.active_turn.lock().unwrap_or_else(|e| e.into_inner()) = turn_id.clone();
-            return self.await_completion(done, feed, turn_id.as_deref()).await;
-        }
         let stop_reason = ["stopReason", "stop_reason", "status"]
             .iter()
             .find_map(|key| result.get(*key).and_then(Value::as_str))
@@ -308,80 +336,72 @@ impl RpcSession {
         })
     }
 
-    /// Await the declared completion notification, accumulating text-method
-    /// payloads meanwhile so the outcome carries the same text the events
-    /// already streamed.
+    /// Collect text and reliable terminal messages concurrently with the
+    /// acknowledgement. Notification bursts cannot overwrite a completed turn.
     async fn await_completion(
         &self,
         done: &crate::model::RpcCompletionSpec,
-        mut feed: broadcast::Receiver<(String, Value)>,
-        turn_id: Option<&str>,
+        mut feed: mpsc::Receiver<(String, Value)>,
+        vars: &Vars,
     ) -> Result<TurnOutcome, AdapterError> {
+        let reply = call(&self.peer, &self.spec.prompt, vars);
+        tokio::pin!(reply);
+        let mut acknowledged = false;
+        let mut turn_id = None;
         let mut text = String::new();
+        // A terminal may precede its acknowledgement. Preserve its turn id and
+        // text boundary until the response identifies the requested turn.
+        let mut terminals: Vec<(Option<String>, String, usize)> = Vec::new();
         loop {
-            match feed.recv().await {
-                Ok((method, params)) if method == done.method => {
-                    if let (Some(path), Some(want)) = (&done.turn_id_path, turn_id) {
-                        if extract_text(&params, Some(path)).as_deref() != Some(want) {
-                            continue;
-                        }
-                    }
-                    let status = extract_text(&params, done.status_path.as_deref());
-                    if let Some(want) = done.status_value.as_deref() {
-                        if status.as_deref() != Some(want) {
-                            continue;
-                        }
-                    }
+            if acknowledged {
+                if let Some((_, status, end)) = terminals.iter().find(|(id, _, _)| {
+                    done.turn_id_path.is_none() || turn_id.is_none() || *id == turn_id
+                }) {
+                    text.truncate(*end);
                     *self.active_turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     return Ok(TurnOutcome {
-                        stop_reason: status.unwrap_or_else(|| "end_turn".to_owned()),
+                        stop_reason: status.clone(),
                         text,
                         truncated: false,
                         exit_code: None,
                         usage: None,
                     });
                 }
-                Ok((method, _)) if method.is_empty() => {
-                    if self.cancelled.swap(false, Ordering::Relaxed) {
-                        return Ok(TurnOutcome {
-                            stop_reason: "cancelled".to_owned(),
-                            text,
-                            truncated: false,
-                            exit_code: None,
-                            usage: None,
-                        });
-                    }
-                    return Err(AdapterError::uncertain(
-                        "agent_transport_failed",
-                        "rpc/read",
-                    ));
+                terminals.clear();
+            }
+            tokio::select! {
+                biased;
+                result = &mut reply, if !acknowledged => {
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(_) if self.cancelled.swap(false, Ordering::Relaxed) => {
+                            return Ok(cancelled_outcome(text));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    turn_id = binding(&result);
+                    *self.active_turn.lock().unwrap_or_else(|e| e.into_inner()) = turn_id.clone();
+                    acknowledged = true;
                 }
-                Ok((method, params)) => {
-                    if Some(method.as_str()) == self.spec.text_event_method.as_deref() {
-                        if let Some(chunk) =
-                            notification_text(&params, self.spec.text_path.as_deref())
-                        {
+                notification = feed.recv() => {
+                    let Some((method, params)) = notification.filter(|(method, _)| !method.is_empty()) else {
+                        if self.cancelled.swap(false, Ordering::Relaxed) {
+                            return Ok(cancelled_outcome(text));
+                        }
+                        return Err(AdapterError::uncertain("agent_transport_failed", "rpc/read"));
+                    };
+                    if method == done.method {
+                        let status = extract_text(&params, done.status_path.as_deref());
+                        if done.status_value.as_deref().is_some_and(|want| status.as_deref() != Some(want)) {
+                            continue;
+                        }
+                        let id = extract_text(&params, done.turn_id_path.as_deref());
+                        terminals.push((id, status.unwrap_or_else(|| "end_turn".to_owned()), text.len()));
+                    } else if Some(method.as_str()) == self.spec.text_event_method.as_deref() {
+                        if let Some(chunk) = notification_text(&params, self.spec.text_path.as_deref()) {
                             text.push_str(&chunk);
                         }
                     }
-                }
-                // A lagged receiver re-syncs on the next notification; the
-                // process stays supervised until it goes quiet for good.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    if self.cancelled.swap(false, Ordering::Relaxed) {
-                        return Ok(TurnOutcome {
-                            stop_reason: "cancelled".to_owned(),
-                            text,
-                            truncated: false,
-                            exit_code: None,
-                            usage: None,
-                        });
-                    }
-                    return Err(AdapterError::uncertain(
-                        "agent_transport_failed",
-                        "rpc/read",
-                    ));
                 }
             }
         }

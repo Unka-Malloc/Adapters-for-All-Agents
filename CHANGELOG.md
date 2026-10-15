@@ -12,6 +12,11 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Extend ACP configuration negotiation, RPC session and completion handling,
   and CLI session binding, resume, cancellation, structured output, and usage.
 - Preserve RPC notification order and report transport closure to pending turns.
+- Keep completion notifications and streamed text reliable across bursts that
+  arrive before a prompt acknowledgement.
+- Honor explicit CLI cancellation during prompt writes and after output EOF.
+- Bound retained structured CLI output, drain oversized records, and continue
+  reading session bindings and usage after the output budget is exhausted.
 - Expose the same runtime capabilities through the `a4aa` sidecar.
 - Publish the matching adapter crates and `a4aa-dialects` registry at 0.2.0.
 
@@ -24,3 +29,11 @@ fields; use defaults for optional behavior. Match the new `AgentEvent::Usage`
 variant when handling events exhaustively. RPC cancellation is asynchronous.
 Existing 0.1.x registry packages remain available for consumers that have not
 updated their source yet.
+
+The 0.2.0 workspace and registry no longer include the following adapters:
+`augment`, `codebuddy`, `craftagent`, `gemini`, `iflow`, `lingma`, `qoder`,
+`qwen`, `roocode`, `trae`, and `windsurf`. Crate names use the `a4aa-`
+prefix; the compound names are `a4aa-code-buddy`, `a4aa-craft-agent`, and
+`a4aa-roo-code`. Hosts that still require these descriptors should retain the
+applicable published 0.1.x adapter versions. Registry lookup in 0.2.0 returns
+`None` for these identifiers; no replacement is selected automatically.

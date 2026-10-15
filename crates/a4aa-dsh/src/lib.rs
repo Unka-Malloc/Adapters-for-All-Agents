@@ -49,7 +49,7 @@ pub const fn dialect() -> &'static Dialect {
 
 /// The `dsh` agent card: `dsh --profile sdk` JSON-RPC over stdio.
 ///
-/// Wire shape verified against a production host: the SDK profile runs a
+/// Protocol: the SDK profile runs a
 /// stock JSON-RPC handshake (`initialize` carries cwd/provider/model/
 /// reasoning effort; the server answers `deepseek-harness-sdk-runtime`).
 /// Sessions are process-scoped — the durable store rejects reusing an id

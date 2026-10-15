@@ -85,8 +85,8 @@ pub struct CliLaneSpec {
     #[serde(default)]
     pub stdin_template: Option<serde_json::Value>,
     /// Treat stdout as newline-delimited JSON: every complete line also
-    /// arrives as `AgentEvent::Raw` and the declared paths below are
-    /// extracted from it.
+    /// can arrive as `AgentEvent::Raw` within the output budget, and the
+    /// declared paths below are extracted even after delivery is truncated.
     #[serde(default)]
     pub json_lines: bool,
     /// Dotted path to the session identifier on a stdout JSON line (for
@@ -245,9 +245,6 @@ pub struct RpcEnvelopeSpec {
     /// Field carrying the command/method name (`"type"`). Also
     /// discriminates inbound frames: response, request, or notification.
     pub method_field: String,
-    /// Emit `"jsonrpc":"2.0"` and use `params`/`result`/`error` members.
-    #[serde(default)]
-    pub jsonrpc_tag: bool,
     /// Outbound call ids render as `"a4aa-<n>"` strings.
     #[serde(default)]
     pub string_ids: bool,
@@ -385,7 +382,7 @@ impl AgentSpec {
     /// Report which profile selectors this concrete lane applies.
     ///
     /// `Session` covers `SessionRequest::config`; `Turn` covers the model and
-    /// effort passed by AwP on each prompt. ACP returns `Negotiated` until a
+    /// effort passed on each prompt. ACP returns `Negotiated` until a
     /// session has reported its configuration choices.
     pub fn selector_support(&self, phase: SelectorPhase) -> SelectorSupportSet {
         self.lane.selector_support(phase)
@@ -532,7 +529,7 @@ fn selector_support(applied: bool) -> SelectorSupport {
 pub enum SelectorPhase {
     /// `SessionRequest::config` during session establishment.
     Session,
-    /// AwP's effective per-turn model and effort.
+    /// The effective per-turn model and effort.
     Turn,
 }
 
@@ -592,8 +589,8 @@ pub enum AgentEvent {
     },
     /// The agent updated its plan.
     Plan { raw: serde_json::Value },
-    /// Output exceeded `max_output_bytes`; delivery is complete up to this
-    /// point and no further chunks arrive.
+    /// Retained output or structured record delivery was truncated. Plain
+    /// text chunks stop at the output budget; control metadata may continue.
     Truncated,
     /// Lane-native event that did not map onto a canonical kind.
     Raw { raw: serde_json::Value },
@@ -676,4 +673,12 @@ pub struct SessionRequest {
     pub env: BTreeMap<String, String>,
     /// Session-scoped configuration applied once the session exists.
     pub config: SessionConfig,
+}
+
+/// One prompt submission.
+#[derive(Clone, Debug, Default)]
+pub struct TurnRequest {
+    pub text: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
