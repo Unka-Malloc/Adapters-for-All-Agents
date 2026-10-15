@@ -67,7 +67,7 @@ pub fn spawn(mut command: Command) -> Result<(SupervisedChild, PtyMaster), Adapt
 /// Linux and Darwin, and a chatty child can never stall the runtime.
 /// Writes share the fd through `dup` on a writer thread fed by a queue.
 pub struct PtyMaster {
-    read_rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
+    read_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
     write_tx: std_mpsc::SyncSender<WriteJob>,
     resize_fd: RawFd,
     observer: SharedObserver,
@@ -79,7 +79,7 @@ struct WriteJob {
     done: tokio::sync::oneshot::Sender<io::Result<()>>,
 }
 
-const WRITE_QUEUE: usize = 8;
+const IO_QUEUE_CAPACITY: usize = 8;
 
 impl PtyMaster {
     fn new(master: OwnedFd) -> Self {
@@ -87,7 +87,7 @@ impl PtyMaster {
             .try_clone()
             .expect("dup of fresh pty master cannot fail");
         let resize_fd = master.as_raw_fd();
-        let (read_tx, read_rx) = mpsc::unbounded_channel();
+        let (read_tx, read_rx) = mpsc::channel(IO_QUEUE_CAPACITY);
         std::thread::spawn(move || {
             let mut master = std::fs::File::from(master);
             let mut buffer = [0u8; READ_CHUNK];
@@ -95,7 +95,7 @@ impl PtyMaster {
                 match master.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        if read_tx.send(Ok(buffer[..count].to_vec())).is_err() {
+                        if read_tx.blocking_send(Ok(buffer[..count].to_vec())).is_err() {
                             return; // receiver gone: stop reading, drop fd
                         }
                     }
@@ -105,15 +105,15 @@ impl PtyMaster {
                         // surface it as a clean EOF marker, not an error.
                         let terminal = error.raw_os_error() == Some(libc::EIO);
                         if !terminal {
-                            let _ = read_tx.send(Err(error));
+                            let _ = read_tx.blocking_send(Err(error));
                         }
                         break;
                     }
                 }
             }
-            let _ = read_tx.send(Ok(Vec::new())); // EOF marker
+            let _ = read_tx.blocking_send(Ok(Vec::new())); // EOF marker
         });
-        let (write_tx, write_rx) = std_mpsc::sync_channel::<WriteJob>(WRITE_QUEUE);
+        let (write_tx, write_rx) = std_mpsc::sync_channel::<WriteJob>(IO_QUEUE_CAPACITY);
         std::thread::spawn(move || {
             let mut writer = std::fs::File::from(writer_fd);
             while let Ok(job) = write_rx.recv() {
@@ -158,6 +158,32 @@ impl PtyMaster {
         }
     }
 
+    /// Independent writer for concurrent terminal input and output pumping.
+    pub fn writer(&self) -> PtyWriter {
+        PtyWriter {
+            write_tx: self.write_tx.clone(),
+            observer: self.observer.clone(),
+        }
+    }
+
+    pub async fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        self.writer().write(bytes).await
+    }
+
+    /// Reflow the terminal. `--print` lanes do not need this; it exists for
+    /// interactive lanes.
+    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        set_winsize(self.resize_fd, cols, rows)
+    }
+}
+
+#[derive(Clone)]
+pub struct PtyWriter {
+    write_tx: std_mpsc::SyncSender<WriteJob>,
+    observer: SharedObserver,
+}
+
+impl PtyWriter {
     /// Queue bytes to the child. Blocks (async) when the write queue is full —
     /// the bound keeps a stalled terminal from growing memory.
     pub async fn write(&self, bytes: &[u8]) -> io::Result<()> {
@@ -189,12 +215,6 @@ impl PtyMaster {
         }
         wait.await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "pty writer dropped"))?
-    }
-
-    /// Reflow the terminal. `--print` lanes do not need this; it exists for
-    /// interactive lanes.
-    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
-        set_winsize(self.resize_fd, cols, rows)
     }
 }
 

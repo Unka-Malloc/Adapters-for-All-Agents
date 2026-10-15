@@ -23,7 +23,7 @@ use crate::model::{
 };
 use crate::observe::{Direction, SharedObserver};
 use crate::supervision::{IoPlan, StdioKind, SupervisedChild};
-use crate::template::{extract_path, substitute, vars, VarSpec, Vars};
+use crate::template::{extract_path, substitute, substitute_text, vars, VarSpec, Vars};
 
 pub struct CliLane {
     pub command: CommandSpec,
@@ -170,7 +170,8 @@ impl CliLane {
     }
 
     /// Run one turn to completion. `events` receives output chunks as they
-    /// arrive; nothing is buffered beyond the configured caps.
+    /// arrive. Output retention follows the configured budget; protocol
+    /// records use a separate bounded parsing buffer.
     pub async fn run_turn(
         &self,
         request: &SessionRequest,
@@ -269,19 +270,26 @@ impl CliLane {
         let mut env = crate::env::resolve(&spec.env, &request.env, &*self.secrets).await?;
         // A `binding_file_env` lane mints the scratch receipt path the
         // agent's installed hook writes this turn's session identity to.
-        let receipt = self.lane.binding_file_env.as_ref().map(|name| {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|span| span.as_nanos())
-                .unwrap_or_default();
-            let path = std::env::temp_dir().join(format!(
-                "a4aa-receipt-{}-{:x}.json",
-                std::process::id(),
-                nonce
-            ));
-            env.insert(name.clone(), path.as_os_str().to_os_string());
-            path
-        });
+        let receipt = self
+            .lane
+            .binding_file_env
+            .as_ref()
+            .map(|name| {
+                let mut builder = tempfile::Builder::new();
+                builder.prefix("a4aa-receipt-");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    builder.permissions(std::fs::Permissions::from_mode(0o700));
+                }
+                let directory = builder.tempdir().map_err(|error| {
+                    AdapterError::io("agent_receipt_directory_failed", "cli/receipt", error)
+                })?;
+                let path = directory.path().join("receipt.json");
+                env.insert(name.clone(), path.as_os_str().to_os_string());
+                Ok::<_, AdapterError>((directory, path))
+            })
+            .transpose()?;
         let command = SupervisedChild::command(&spec, &env, request.cwd.as_deref());
 
         let mut outcome = match effective_stream(self.lane.stream) {
@@ -297,25 +305,45 @@ impl CliLane {
             #[cfg(not(unix))]
             StreamMode::Pty => unreachable!("effective_stream degrades pty off-unix"),
         };
-        if let Some(receipt) = receipt {
-            if let Ok(text) = std::fs::read_to_string(&receipt) {
-                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
-                    if let Some(id) = receipt_session_id(&payload) {
-                        let _ = self.observed.set(id);
-                    }
-                    // `SessionIdAndUsage` receipts can carry the turn's
-                    // token counters — the same aliases a stream `usage`
-                    // object would use; absent fields stay absent.
-                    if self.lane.binding_receipt_shape == BindingReceiptShape::SessionIdAndUsage {
-                        if let Ok(done) = outcome.as_mut() {
-                            if done.usage.is_none() {
-                                done.usage = receipt_usage(&payload);
-                            }
+        if let Some((directory, receipt)) = receipt {
+            let limit = self
+                .max_output_bytes
+                .unwrap_or(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
+                .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES);
+            let metadata = match read_receipt(&receipt, self.lane.binding_receipt_shape, limit) {
+                Ok(metadata) => metadata,
+                Err(mut error) => {
+                    // Keep failed receipt evidence; the external turn may have
+                    // completed, so this error must never invite whole-turn replay.
+                    if let Err(turn_error) = &outcome {
+                        error.detail = Some(format!(
+                            "turn error: {} [{}]",
+                            turn_error.code, turn_error.stage
+                        ));
+                    } else if let Ok(done) = &outcome {
+                        if done.stop_reason != "end_turn" {
+                            error.detail = Some(format!("turn stop reason: {}", done.stop_reason));
                         }
+                    }
+                    let _ = directory.keep();
+                    return Err(error);
+                }
+            };
+            if let Some(metadata) = metadata {
+                let _ = self.observed.set(metadata.session_id);
+                if let Ok(done) = outcome.as_mut() {
+                    if done.usage.is_none() {
+                        done.usage = metadata.usage;
                     }
                 }
             }
-            let _ = std::fs::remove_file(&receipt);
+            if outcome.is_err() {
+                let _ = directory.keep();
+            } else {
+                directory
+                    .close()
+                    .map_err(|_| receipt_error("agent_receipt_cleanup_failed"))?;
+            }
         }
         outcome
     }
@@ -343,31 +371,37 @@ impl CliLane {
                 stderr: StdioKind::Preserve,
             },
         )?;
-        if let Some(payload) = stdin_payload {
-            if let Some(mut stdin) = child.stdin() {
-                let bytes = payload.as_bytes();
-                if let Some(observer) = self.observer.as_ref() {
-                    observer.record("cli.stdin", Direction::Sent, bytes);
-                }
-                // An undelivered prompt must fail the turn — a quiet drop
-                // would let the turn report success for work never asked.
-                tokio::select! {
-                    biased;
-                    _ = cancelled.changed() => {
-                        child.terminate().await?;
-                        return Ok(cancelled_outcome(TurnCollect::default()));
-                    }
-                    result = stdin.write_all(bytes) => {
-                        result.map_err(|e| AdapterError::io("agent_prompt_write_failed", "cli/stdin", e))?;
-                    }
-                }
-            }
+        if let Some(stderr) = child.stderr() {
+            bounds::drain_stderr(stderr, self.observer.clone());
         }
+        let stdin = child.stdin();
         let stdout = child
             .stdout()
             .ok_or_else(|| AdapterError::permanent("agent_pipe_unavailable", "cli/stdio"))?;
-        self.collect(child, Box::new(stdout), events, cancelled)
-            .await
+        let output_cancelled = cancelled.clone();
+        let write = async {
+            if let Some(payload) = stdin_payload {
+                let mut stdin = stdin.ok_or_else(|| {
+                    AdapterError::permanent("agent_pipe_unavailable", "cli/stdin")
+                })?;
+                if let Some(observer) = self.observer.as_ref() {
+                    observer.record("cli.stdin", Direction::Sent, payload.as_bytes());
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => {}
+                    result = stdin.write_all(payload.as_bytes()) => {
+                        result.map_err(|error| AdapterError::io("agent_prompt_write_failed", "cli/stdin", error))?;
+                    }
+                }
+            }
+            Ok::<(), AdapterError>(())
+        };
+        let (_, outcome) = tokio::try_join!(
+            write,
+            self.collect(child, Box::new(stdout), events, output_cancelled)
+        )?;
+        Ok(outcome)
     }
 
     #[cfg(unix)]
@@ -379,21 +413,29 @@ impl CliLane {
         mut cancelled: watch::Receiver<()>,
     ) -> Result<TurnOutcome, AdapterError> {
         let (mut child, master) = crate::transport::pty::spawn(command)?;
+        if let Some(stderr) = child.stderr() {
+            bounds::drain_stderr(stderr, self.observer.clone());
+        }
         let master = master.with_observer(self.observer.clone());
-        if let Some(payload) = stdin_payload {
-            tokio::select! {
-                biased;
-                _ = cancelled.changed() => {
-                    child.terminate().await?;
-                    return Ok(cancelled_outcome(TurnCollect::default()));
-                }
-                result = master.write(payload.as_bytes()) => {
-                    result.map_err(|e| AdapterError::io("agent_prompt_write_failed", "cli/pty", e))?;
+        let writer = master.writer();
+        let output_cancelled = cancelled.clone();
+        let write = async {
+            if let Some(payload) = stdin_payload {
+                tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => {}
+                    result = writer.write(payload.as_bytes()) => {
+                        result.map_err(|error| AdapterError::io("agent_prompt_write_failed", "cli/pty", error))?;
+                    }
                 }
             }
-        }
-        self.collect(child, Box::new(master), events, cancelled)
-            .await
+            Ok::<(), AdapterError>(())
+        };
+        let (_, outcome) = tokio::try_join!(
+            write,
+            self.collect(child, Box::new(master), events, output_cancelled)
+        )?;
+        Ok(outcome)
     }
 
     /// Drain the output stream, emitting chunks, until EOF. There is no
@@ -406,9 +448,6 @@ impl CliLane {
         events: mpsc::UnboundedSender<AgentEvent>,
         mut cancelled: watch::Receiver<()>,
     ) -> Result<TurnOutcome, AdapterError> {
-        if let Some(stderr) = child.stderr() {
-            tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
-        }
         // Turn accumulators: retained text (fallback), NDJSON carry,
         // last-seen usage, and the authoritative result-record text.
         let mut state = TurnCollect::default();
@@ -606,7 +645,7 @@ impl CliLane {
             let selector_field = self.lane.result_selector_field.as_deref().unwrap_or("type");
             if raw.get(selector_field).and_then(Value::as_str) == Some(selector) {
                 if let Some(text) = extract_path(&raw, path).and_then(Value::as_str) {
-                    let retained = bounded_prefix(text, self.max_output_bytes);
+                    let retained = bounds::bounded_prefix(text, self.max_output_bytes);
                     state.result_text = Some(retained.to_owned());
                     if retained.len() < text.len() {
                         signal_truncated(state, events);
@@ -622,9 +661,9 @@ impl CliLane {
         }
     }
 
-    /// Retain a decoded span under the byte cap and signal `Truncated`
-    /// once — the `jsonLines` path, where records are `Raw` events and the
-    /// accumulated text is only the outcome's fallback.
+    /// Retain one UTF-8 prefix under the shared byte budget. Plain streams
+    /// mirror it as a message chunk; structured streams emit Raw separately.
+    /// Both paths signal truncation exactly once.
     fn retain_text(
         &self,
         text: &str,
@@ -634,7 +673,7 @@ impl CliLane {
         let remaining = self
             .max_output_bytes
             .map(|limit| limit.saturating_sub(state.output.len()));
-        let retained = bounded_prefix(text, remaining);
+        let retained = bounds::bounded_prefix(text, remaining);
         state.output.push_str(retained);
         if !self.lane.json_lines && !retained.is_empty() {
             let _ = events.send(AgentEvent::MessageChunk {
@@ -645,14 +684,6 @@ impl CliLane {
             signal_truncated(state, events);
         }
     }
-}
-
-fn bounded_prefix(text: &str, limit: Option<usize>) -> &str {
-    let mut end = limit.unwrap_or(text.len()).min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 /// Everything one CLI turn accumulates while it collects output.
@@ -751,12 +782,9 @@ fn substitute_args(args: &[String], vars: &Vars) -> (Vec<String>, bool) {
         // a flag body (`--{x}`) leave a malformed token: drop the arg.
         let dangling = vars.iter().any(|(key, value)| {
             value.is_empty()
-                && (arg.contains(&format!("={{{key}}}")) || *arg == format!("--{{{key}}}"))
+                && (arg.ends_with(&format!("={{{key}}}")) || *arg == format!("--{{{key}}}"))
         });
-        let mut text = arg.clone();
-        for (key, value) in vars {
-            text = text.replace(&format!("{{{key}}}"), value);
-        }
+        let text = substitute_text(arg, vars);
         let bare = arg.len() > 2 && arg.starts_with('{') && arg.ends_with('}');
         if bare && text.is_empty() {
             if resolved
@@ -775,41 +803,107 @@ fn substitute_args(args: &[String], vars: &Vars) -> (Vec<String>, bool) {
     (resolved, !used_prompt)
 }
 
-/// Session identity inside a binding-file receipt: the hook contract's
-/// `conversationId`-family keys, or the same set nested inside a JSON
-/// `hookPayload` string.
-fn receipt_session_id(payload: &Value) -> Option<String> {
-    let keys = [
-        "conversationId",
-        "conversation_id",
-        "sessionId",
-        "session_id",
-    ];
-    let read = |value: &Value| {
-        keys.iter()
-            .find_map(|key| value.get(*key)?.as_str().map(str::to_owned))
-            .filter(|id| !id.is_empty())
-    };
-    read(payload).or_else(|| {
-        let nested: Value = serde_json::from_str(payload.get("hookPayload")?.as_str()?).ok()?;
-        read(&nested)
-    })
+struct ReceiptMetadata {
+    session_id: String,
+    usage: Option<TokenUsage>,
 }
 
-/// Token counters a receipt may carry under `usage`/`tokenUsage`, top
-/// level or inside a nested JSON `hookPayload` string — the same field
-/// aliases a stream usage object uses.
-fn receipt_usage(payload: &Value) -> Option<TokenUsage> {
-    let find = |value: &Value| {
-        ["usage", "tokenUsage", "token_usage"]
-            .iter()
-            .find_map(|key| value.get(*key))
-            .and_then(token_usage)
+fn receipt_error(code: &'static str) -> AdapterError {
+    let mut error = AdapterError::uncertain(code, "cli/receipt");
+    error.retryable = false;
+    error
+}
+
+/// Missing optional receipts are allowed. Existing but unreadable, oversized,
+/// malformed, or identity-free receipts are failures and remain on disk.
+fn read_receipt(
+    path: &std::path::Path,
+    shape: BindingReceiptShape,
+    limit: usize,
+) -> Result<Option<ReceiptMetadata>, AdapterError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(receipt_error("agent_receipt_read_failed")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(receipt_error("agent_receipt_read_failed")),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(receipt_error("agent_receipt_read_failed")),
     };
-    find(payload).or_else(|| {
-        let nested: Value = serde_json::from_str(payload.get("hookPayload")?.as_str()?).ok()?;
-        find(&nested)
-    })
+    if !file
+        .metadata()
+        .map_err(|_| receipt_error("agent_receipt_read_failed"))?
+        .is_file()
+    {
+        return Err(receipt_error("agent_receipt_read_failed"));
+    }
+    let mut reader = std::io::Read::take(file, limit.saturating_add(1) as u64);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes)
+        .map_err(|_| receipt_error("agent_receipt_read_failed"))?;
+    if bytes.len() > limit {
+        return Err(receipt_error("agent_receipt_too_large"));
+    }
+    let payload: Value =
+        serde_json::from_slice(&bytes).map_err(|_| receipt_error("agent_receipt_invalid"))?;
+    if !payload.is_object() {
+        return Err(receipt_error("agent_receipt_invalid"));
+    }
+    let nested = payload
+        .get("hookPayload")
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| receipt_error("agent_receipt_invalid"))?;
+            let value: Value =
+                serde_json::from_str(text).map_err(|_| receipt_error("agent_receipt_invalid"))?;
+            if !value.is_object() {
+                return Err(receipt_error("agent_receipt_invalid"));
+            }
+            Ok(value)
+        })
+        .transpose()?;
+    let sources = [Some(&payload), nested.as_ref()];
+    let session_id = sources
+        .iter()
+        .flatten()
+        .find_map(|value| {
+            [
+                "conversationId",
+                "conversation_id",
+                "sessionId",
+                "session_id",
+            ]
+            .iter()
+            .find_map(|key| {
+                value
+                    .get(*key)?
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+        .ok_or_else(|| receipt_error("agent_receipt_session_id_missing"))?;
+    let usage = if shape == BindingReceiptShape::SessionIdAndUsage {
+        sources.iter().flatten().find_map(|value| {
+            ["usage", "tokenUsage", "token_usage"]
+                .iter()
+                .find_map(|key| value.get(*key))
+                .and_then(token_usage)
+        })
+    } else {
+        None
+    };
+    Ok(Some(ReceiptMetadata { session_id, usage }))
 }
 
 /// Extract token counters from a usage object. Field aliases cover the
@@ -845,4 +939,34 @@ fn token_usage(value: &Value) -> Option<TokenUsage> {
         || usage.output.is_some()
         || usage.total.is_some())
     .then_some(usage)
+}
+
+#[cfg(all(test, unix))]
+mod receipt_file_type_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn receipts_reject_links_and_pipes_without_waiting_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.json");
+        std::fs::write(&valid, r#"{"sessionId":"fixture"}"#).unwrap();
+        assert!(read_receipt(&valid, BindingReceiptShape::SessionId, 1024)
+            .unwrap()
+            .is_some());
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&valid, &link).unwrap();
+        assert!(read_receipt(&link, BindingReceiptShape::SessionId, 1024).is_err());
+        let pipe = directory.path().join("pipe");
+        let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = read_receipt(&pipe, BindingReceiptShape::SessionId, 1024);
+            send.send(result.is_err()).unwrap();
+        });
+        assert!(receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("receipt read blocked on a special file"));
+    }
 }

@@ -85,6 +85,33 @@ pub(crate) fn vars(input: VarSpec<'_>) -> Vars {
     vars
 }
 
+/// Expand only tokens in the original template. Inserted values are opaque
+/// data, even if they themselves contain placeholder-shaped text.
+pub(crate) fn substitute_text(template: &str, vars: &Vars) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        let tail = &rest[open + 1..];
+        if let Some(end) = tail.find(['{', '}']) {
+            if tail.as_bytes()[end] == b'}' {
+                if let Some(value) = vars.get(&tail[..end]) {
+                    output.push_str(value);
+                } else {
+                    output.push('{');
+                    output.push_str(&tail[..=end]);
+                }
+                rest = &tail[end + 1..];
+                continue;
+            }
+        }
+        output.push('{');
+        rest = tail;
+    }
+    output.push_str(rest);
+    output
+}
+
 /// Recursively substitute `{var}` inside string leaves of a params template.
 ///
 /// A leaf that is exactly `{var}` receives the value as a JSON string — a
@@ -93,18 +120,7 @@ pub(crate) fn vars(input: VarSpec<'_>) -> Vars {
 /// dropped: an absent option must not send `""` onto the wire.
 pub(crate) fn substitute(template: &Value, vars: &Vars) -> Value {
     match template {
-        Value::String(text) => {
-            for (key, value) in vars {
-                if *text == format!("{{{key}}}") {
-                    return Value::String(value.clone());
-                }
-            }
-            let mut result = text.clone();
-            for (key, value) in vars {
-                result = result.replace(&format!("{{{key}}}"), value);
-            }
-            Value::String(result)
-        }
+        Value::String(text) => Value::String(substitute_text(text, vars)),
         Value::Array(items) => {
             Value::Array(items.iter().map(|item| substitute(item, vars)).collect())
         }
@@ -129,4 +145,35 @@ pub(crate) fn extract_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value
         cursor = cursor.get(segment)?;
     }
     Some(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn substitution_never_reinterprets_inserted_values() {
+        let input = "explain {provider} \"quoted\"\nnext";
+        let vars = vars(VarSpec {
+            prompt: input,
+            instructions: Some("keep {sessionId}"),
+            session_id: Some("binding-{provider}"),
+            ..Default::default()
+        });
+        assert_eq!(
+            substitute_text("{prompt}|{instructions}|{sessionId}", &vars),
+            format!("{input}|keep {{sessionId}}|binding-{{provider}}")
+        );
+        assert_eq!(
+            substitute(
+                &json!({"text":"prefix {prompt} suffix", "model":"{model}",
+                                     "instructions":"{instructions}"}),
+                &vars
+            ),
+            json!({"text":format!("prefix {input} suffix"),"instructions":"keep {sessionId}"})
+        );
+        assert_eq!(substitute_text("{{prompt}}", &vars), format!("{{{input}}}"));
+        assert_eq!(substitute_text("{unknown}", &vars), "{unknown}");
+    }
 }

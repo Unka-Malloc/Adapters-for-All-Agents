@@ -165,32 +165,13 @@ printf '"}\n{"session":"continued","usage":{"output_tokens":7}}\n'
     }
 }
 
-#[tokio::test]
-async fn rpc_preserves_text_and_completion_before_acknowledgement() {
+fn rpc_fixture(script: &str, limit: Option<usize>) -> a4aa::AgentSpec {
     use a4aa::{RpcCallSpec, RpcCompletionSpec, RpcLaneSpec};
     use serde_json::json;
-    let script = r#"
-import json,sys
-def send(v): print(json.dumps(v),flush=True)
-pending=None
-for line in sys.stdin:
-    m=json.loads(line)
-    if m.get('method')=='prompt':
-        pending=m['id']
-        for i in range(80):
-            send({'jsonrpc':'2.0','method':'text','params':{'text':str(i)+','}})
-        send({'jsonrpc':'2.0','method':'done','params':{'turn':'t','status':'completed'}})
-        for i in range(80):
-            send({'jsonrpc':'2.0','method':'noise','params':{'index':i}})
-        send({'jsonrpc':'2.0','method':'barrier','params':{}})
-    elif m.get('method')=='release':
-        send({'jsonrpc':'2.0','id':pending,'result':{'id':'t'}})
-        send({'jsonrpc':'2.0','id':m['id'],'result':{}})
-"#;
-    let spec = a4aa::AgentSpec {
+    a4aa::AgentSpec {
         id: "rpc-barrier".into(),
         client_name: None,
-        max_output_bytes: None,
+        max_output_bytes: limit,
         command: CommandSpec {
             program: "python3".into(),
             args: vec!["-u".into(), "-c".into(), script.into()],
@@ -213,7 +194,31 @@ for line in sys.stdin:
             passthrough: vec!["release".into()],
             ..Default::default()
         })),
-    };
+    }
+}
+
+#[tokio::test]
+async fn rpc_preserves_text_and_completion_before_acknowledgement() {
+    use serde_json::json;
+    let script = r#"
+import json,sys
+def send(v): print(json.dumps(v),flush=True)
+pending=None
+for line in sys.stdin:
+    m=json.loads(line)
+    if m.get('method')=='prompt':
+        pending=m['id']
+        for i in range(80):
+            send({'jsonrpc':'2.0','method':'text','params':{'text':str(i)+','}})
+        send({'jsonrpc':'2.0','method':'done','params':{'turn':'t','status':'completed'}})
+        for i in range(80):
+            send({'jsonrpc':'2.0','method':'noise','params':{'index':i}})
+        send({'jsonrpc':'2.0','method':'barrier','params':{}})
+    elif m.get('method')=='release':
+        send({'jsonrpc':'2.0','id':pending,'result':{'id':'t'}})
+        send({'jsonrpc':'2.0','id':m['id'],'result':{}})
+"#;
+    let spec = rpc_fixture(script, None);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = Adapter::new(spec)
         .open_session(SessionRequest::default(), tx)
@@ -371,6 +376,46 @@ async fn cli_empty_optional_selectors_preserve_adjacent_flags() {
 }
 
 #[tokio::test]
+async fn cli_templates_preserve_literal_tokens_in_user_values() {
+    let mut spec = cli("printf '%s\\n' \"$@\"", StreamMode::Stdio, false);
+    let LaneSpec::Cli(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.args = vec![
+        "{prompt}".into(),
+        "mix:{instructions}".into(),
+        "id:{sessionId}".into(),
+    ];
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(
+            SessionRequest {
+                resume: Some("binding-{provider}".into()),
+                config: a4aa::SessionConfig {
+                    instructions: Some("keep {sessionId}".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+    let input = "explain {provider} \"quoted\"\nnext";
+    let result = session
+        .prompt(TurnRequest {
+            text: input.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.text,
+        format!("{input}\nmix:keep {{sessionId}}\nid:binding-{{provider}}\n")
+    );
+}
+
+#[tokio::test]
 async fn cli_open_rejects_failed_or_empty_session_creation() {
     for (script, code) in [
         ("printf diagnostic; exit 1", "agent_session_open_failed"),
@@ -391,4 +436,474 @@ async fn cli_open_rejects_failed_or_empty_session_creation() {
         };
         assert_eq!(error.code, code);
     }
+}
+
+#[tokio::test]
+async fn cli_pumps_input_and_output_concurrently_without_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (stream, output) in [
+        (StreamMode::Stdio, "stdout"),
+        (StreamMode::Stdio, "stderr"),
+        (StreamMode::Pty, "stderr"),
+        (StreamMode::Pty, "stdout"),
+    ] {
+        // Output-before-input is the synchronization barrier: both payloads
+        // exceed pipe capacity, so serial pumping cannot finish naturally.
+        let script = format!(
+            r#"
+import json,sys
+sink=sys.{output}.buffer
+sink.write(b'x' * (8*1024*1024) + b'\n')
+sink.flush()
+prompt=sys.stdin.buffer.readline()
+assert len(prompt)==1048577, len(prompt)
+print(json.dumps({{'type':'result','text':'received:1048576'}}),flush=True)
+"#
+        );
+        let mut spec = cli("", stream, true);
+        spec.command.program = "python3".into();
+        spec.command.args = vec!["-u".into(), "-c".into(), script];
+        spec.max_output_bytes = Some(128);
+        let LaneSpec::Cli(lane) = &mut spec.lane else {
+            unreachable!()
+        };
+        lane.json_lines = true;
+        lane.result_selector = Some("result".into());
+        lane.result_path = Some("text".into());
+        let writes = Arc::new(AtomicUsize::new(0));
+        let count = writes.clone();
+        let adapter = Adapter::new(spec).observer(Some(Arc::new(
+            move |_: &'static str, direction, _: &[u8]| {
+                if direction == Direction::Sent {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = adapter
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            session.prompt(TurnRequest {
+                text: "p".repeat(1024 * 1024),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("bidirectional I/O deadlocked")
+        .unwrap();
+        assert_eq!(result.stop_reason, "end_turn");
+        assert_eq!(result.text, "received:1048576");
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rpc_output_budget_drains_large_turn_without_replay_or_cancel() {
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let script = r#"
+import json,sys
+def send(v): print(json.dumps(v,ensure_ascii=False),flush=True)
+pending=None
+for line in sys.stdin:
+    m=json.loads(line)
+    if m.get('method')=='prompt':
+        assert pending is None
+        pending=m['id']
+        for _ in range(1400):
+            send({'jsonrpc':'2.0','method':'text','params':{'text':'中'*1000}})
+        for _ in range(10000):
+            send({'jsonrpc':'2.0','method':'done','params':{'turn':'t','status':'completed'}})
+        send({'jsonrpc':'2.0','method':'barrier','params':{}})
+    elif m.get('method')=='release':
+        send({'jsonrpc':'2.0','id':pending,'result':{'id':'t'}})
+        send({'jsonrpc':'2.0','id':m['id'],'result':{}})
+    else:
+        raise AssertionError('unexpected request')
+"#;
+    let ready = Arc::new(Notify::new());
+    let signal = ready.clone();
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let calls = prompts.clone();
+    let adapter = Adapter::new(rpc_fixture(script, Some(1024))).observer(Some(Arc::new(
+        move |_: &'static str, direction: Direction, bytes: &[u8]| {
+            let text = std::str::from_utf8(bytes).unwrap();
+            if direction == Direction::Received && text.contains("\"method\":\"barrier\"") {
+                signal.notify_one();
+            }
+            if direction == Direction::Sent && text.contains("\"method\":\"prompt\"") {
+                calls.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    )));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+        text: "run".into(),
+        ..Default::default()
+    }));
+    let mut delivered = 0;
+    let mut truncated = 0;
+    loop {
+        tokio::select! {
+            result=&mut prompt=>panic!("ack not released: {result:?}"),
+            _=ready.notified()=>break,
+            event=rx.recv()=>match event.unwrap() {
+                a4aa::AgentEvent::MessageChunk {text}=>delivered+=text.len(),
+                a4aa::AgentEvent::Truncated=>truncated+=1,
+                _=>{}
+            }
+        }
+    }
+    let a4aa::LaneSession::Rpc(rpc) = session.lane() else {
+        unreachable!()
+    };
+    rpc.call_passthrough("release", json!({})).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            a4aa::AgentEvent::MessageChunk { text } => delivered += text.len(),
+            a4aa::AgentEvent::Truncated => truncated += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(result.text, "中".repeat(341));
+    assert_eq!(result.stop_reason, "completed");
+    assert!(result.truncated);
+    assert_eq!(truncated, 1);
+    assert!(delivered <= 1024);
+    assert_eq!(prompts.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn rpc_cancel_before_ack_uses_real_turn_id_and_idle_cancel_is_harmless() {
+    use serde_json::json;
+    let script = r#"
+import json,sys
+def send(v): print(json.dumps(v),flush=True)
+pending=None
+released=False
+for line in sys.stdin:
+    m=json.loads(line)
+    if m.get('method')=='prompt':
+        if m['params']['text']=='after':
+            send({'jsonrpc':'2.0','id':m['id'],'result':{'id':'next'}})
+            send({'jsonrpc':'2.0','method':'done','params':{'turn':'next','status':'completed'}})
+        else:
+            pending=m['id']
+            send({'jsonrpc':'2.0','method':'ready','params':{}})
+    elif m.get('method')=='release':
+        released=True
+        send({'jsonrpc':'2.0','id':pending,'result':{'id':'real-turn'}})
+        send({'jsonrpc':'2.0','id':m['id'],'result':{}})
+    elif m.get('method')=='cancel':
+        assert released and pending is not None
+        assert m['params']['turnId']=='real-turn'
+        pending=None
+        send({'jsonrpc':'2.0','method':'done','params':{'turn':'real-turn','status':'cancelled'}})
+"#;
+    let mut spec = rpc_fixture(script, None);
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.cancel = Some(a4aa::RpcCallSpec {
+        method: "cancel".into(),
+        params: json!({"turnId":"{turnId}"}),
+    });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    {
+        let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+            text: "run".into(),
+            ..Default::default()
+        }));
+        loop {
+            tokio::select! {
+                result=&mut prompt=>panic!("ack not released: {result:?}"),
+                event=rx.recv()=>if matches!(event,Some(a4aa::AgentEvent::Raw {ref raw}) if raw["method"]=="ready") {break;}
+            }
+        }
+        session.cancel().await.unwrap();
+        let a4aa::LaneSession::Rpc(rpc) = session.lane() else {
+            unreachable!()
+        };
+        rpc.call_passthrough("release", json!({})).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.stop_reason, "cancelled");
+    }
+    session.cancel().await.unwrap();
+    let result = session
+        .prompt(TurnRequest {
+            text: "after".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.stop_reason, "completed");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpc_cancel_during_setup_does_not_dispatch_a_prompt() {
+    use serde_json::json;
+    let script = r#"
+import json,sys
+pending=None
+for line in sys.stdin:
+    m=json.loads(line)
+    if m.get('method')=='configure':
+        pending=m['id']
+        print(json.dumps({'jsonrpc':'2.0','method':'ready','params':{}}),flush=True)
+    elif m.get('method')=='release':
+        print(json.dumps({'jsonrpc':'2.0','id':pending,'result':{}}),flush=True)
+        print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}),flush=True)
+    else:
+        raise AssertionError('cancelled setup dispatched work')
+"#;
+    let mut spec = rpc_fixture(script, None);
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.pre_turn = vec![a4aa::RpcCallSpec {
+        method: "configure".into(),
+        params: json!({}),
+    }];
+    lane.cancel = Some(a4aa::RpcCallSpec {
+        method: "cancel".into(),
+        params: json!({"turnId":"{turnId}"}),
+    });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+        text: "run".into(),
+        ..Default::default()
+    }));
+    loop {
+        tokio::select! {
+            result=&mut prompt=>panic!("setup not released: {result:?}"),
+            event=rx.recv()=>if matches!(event,Some(a4aa::AgentEvent::Raw {ref raw}) if raw["method"]=="ready") {break;}
+        }
+    }
+    session.cancel().await.unwrap();
+    let a4aa::LaneSession::Rpc(rpc) = session.lane() else {
+        unreachable!()
+    };
+    rpc.call_passthrough("release", json!({})).await.unwrap();
+    assert_eq!(prompt.await.unwrap().stop_reason, "cancelled");
+}
+
+#[tokio::test]
+async fn rpc_output_budget_preserves_explicit_process_cancellation() {
+    let script = r#"
+import json,sys
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+    m=json.loads(line)
+    send({'jsonrpc':'2.0','id':m['id'],'result':{'id':'active'}})
+    for _ in range(1000):
+        send({'jsonrpc':'2.0','method':'text','params':{'text':'x'*4096}})
+"#;
+    let mut spec = rpc_fixture(script, Some(1024));
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.kill_on_cancel = true;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    {
+        let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+            text: "run".into(),
+            ..Default::default()
+        }));
+        loop {
+            tokio::select! {
+                result=&mut prompt=>panic!("fixture must wait for cancel: {result:?}"),
+                event=rx.recv()=>if matches!(event,Some(a4aa::AgentEvent::Truncated)) {break;}
+            }
+        }
+        session.cancel().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.stop_reason, "cancelled");
+        assert!(result.truncated);
+        assert!(result.text.len() <= 1024);
+    }
+    session.cancel().await.unwrap();
+    assert!(session
+        .prompt(TurnRequest {
+            text: "after".into(),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    session.close().await.unwrap();
+}
+
+fn receipt_fixture(mode: &str, shape: a4aa::BindingReceiptShape) -> a4aa::AgentSpec {
+    let script = r#"
+import json,os,pathlib,sys
+sys.stdin.readline()
+p=pathlib.Path(os.environ['A4AA_TEST_RECEIPT'])
+mode=sys.argv[1]
+payload={'conversationId':'receipt-session','usage':{'input_tokens':12,'output_tokens':3}}
+if mode=='malformed': p.write_text('{broken')
+elif mode=='nested-bad': p.write_text(json.dumps({'hookPayload':'broken'}))
+elif mode=='unreadable': p.mkdir()
+elif mode=='oversized': p.write_bytes(b'x'*(2*1024*1024))
+elif mode=='no-id': p.write_text('{}')
+elif mode!='missing':
+    if mode=='nested': payload={'hookPayload':json.dumps(payload)}
+    p.write_text(json.dumps(payload))
+print(json.dumps({'receipt':str(p),'resumed':sys.argv[2] if len(sys.argv)>2 else ''}),flush=True)
+"#;
+    let mut spec = cli("", StreamMode::Stdio, true);
+    spec.command.program = "python3".into();
+    spec.command.args = vec!["-u".into(), "-c".into(), script.into(), mode.into()];
+    let LaneSpec::Cli(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.binding_file_env = Some("A4AA_TEST_RECEIPT".into());
+    lane.binding_receipt_shape = shape;
+    lane.resume_args = vec!["{sessionId}".into()];
+    spec
+}
+
+#[tokio::test]
+async fn cli_receipts_supply_binding_resume_and_optional_usage() {
+    use a4aa::BindingReceiptShape::{SessionId, SessionIdAndUsage};
+    for mode in ["top", "nested"] {
+        for shape in [SessionId, SessionIdAndUsage] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let session = Adapter::new(receipt_fixture(mode, shape))
+                .open_session(SessionRequest::default(), tx)
+                .await
+                .unwrap();
+            for expected in ["", "receipt-session"] {
+                let result = session
+                    .prompt(TurnRequest {
+                        text: "run".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let output: serde_json::Value = serde_json::from_str(&result.text).unwrap();
+                assert_eq!(output["resumed"], expected);
+                assert!(!std::path::Path::new(output["receipt"].as_str().unwrap()).exists());
+                assert_eq!(session.session_id(), "receipt-session");
+                if shape == SessionIdAndUsage {
+                    let usage = result.usage.unwrap();
+                    assert_eq!(usage.input, Some(12));
+                    assert_eq!(usage.output, Some(3));
+                    assert_eq!(usage.total, None);
+                } else {
+                    assert!(result.usage.is_none());
+                }
+            }
+            session.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cli_receipt_failures_are_visible_and_keep_evidence() {
+    for (mode, code) in [
+        ("malformed", "agent_receipt_invalid"),
+        ("nested-bad", "agent_receipt_invalid"),
+        ("unreadable", "agent_receipt_read_failed"),
+        ("oversized", "agent_receipt_too_large"),
+        ("no-id", "agent_receipt_session_id_missing"),
+    ] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(receipt_fixture(
+            mode,
+            a4aa::BindingReceiptShape::SessionIdAndUsage,
+        ))
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+        let error = match session
+            .prompt(TurnRequest {
+                text: "run".into(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => panic!("invalid receipt accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, code);
+        assert!(error.uncertain_effect);
+        assert!(!error.retryable);
+        let mut text = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let a4aa::AgentEvent::MessageChunk { text: chunk } = event {
+                text.push_str(&chunk);
+            }
+        }
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let path = std::path::Path::new(output["receipt"].as_str().unwrap());
+        assert!(path.exists());
+        assert_eq!(session.session_id(), "");
+        let directory = path.parent().unwrap();
+        assert!(directory.starts_with(std::env::temp_dir()));
+        assert!(directory
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("a4aa-receipt-"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cli_missing_optional_receipt_is_allowed() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(receipt_fixture(
+        "missing",
+        a4aa::BindingReceiptShape::SessionId,
+    ))
+    .open_session(SessionRequest::default(), tx)
+    .await
+    .unwrap();
+    let result = session
+        .prompt(TurnRequest {
+            text: "run".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.stop_reason, "end_turn");
+    assert_eq!(session.session_id(), "");
+    session.close().await.unwrap();
 }

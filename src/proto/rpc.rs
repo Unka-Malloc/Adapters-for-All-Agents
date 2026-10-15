@@ -13,7 +13,7 @@
 //! configured) is sent as a notification on explicit cancel only.
 
 use serde_json::Value;
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -28,7 +28,7 @@ use crate::model::{
 use crate::observe::SharedObserver;
 use crate::rpc::{CallFailure, JsonRpcPeer, RpcDelegate, RpcErrorObject};
 use crate::supervision::SupervisedChild;
-use crate::template::{extract_path, substitute, vars, VarSpec, Vars};
+use crate::template::{contains_placeholder, extract_path, substitute, vars, VarSpec, Vars};
 use crate::transport::stdio;
 
 /// Host callbacks for an RPC session.
@@ -42,6 +42,8 @@ pub trait RpcSessionDelegate: Send + Sync {
 }
 
 pub struct RpcLane {
+    /// Retained and delivered output budget per turn; None is unbounded.
+    pub max_output_bytes: Option<usize>,
     pub command: CommandSpec,
     pub spec: RpcLaneSpec,
     pub secrets: Arc<dyn SecretResolver>,
@@ -53,20 +55,34 @@ pub struct RpcSession {
     peer: Arc<JsonRpcPeer>,
     child: Mutex<SupervisedChild>,
     spec: RpcLaneSpec,
+    max_output_bytes: Option<usize>,
+    delivery: Arc<TurnDelivery>,
     session_model: Option<String>,
     session_effort: Option<String>,
     session_id: Option<String>,
     cwd: String,
     /// Inbound notifications, for awaiting declared completion methods.
     notifications: TurnNotifications,
-    /// Turn id captured from the in-flight prompt response; `{turnId}`
-    /// substitutes it in `cancel` params.
-    active_turn: std::sync::Mutex<Option<String>>,
-    /// Set by `kill_on_cancel` teardown so the in-flight turn resolves as
-    /// `cancelled` rather than a transport failure.
-    cancelled: std::sync::atomic::AtomicBool,
+    /// One turn's identity and explicit cancellation intent; cleared on every
+    /// return path, including setup/transport errors.
+    control: std::sync::Mutex<TurnControl>,
     /// Serializes prompt turns.
     turn_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct TurnControl {
+    active: bool,
+    dispatched: bool,
+    turn_id: Option<String>,
+    pending_cancel: bool,
+    killed: bool,
+}
+struct TurnScope<'a>(&'a std::sync::Mutex<TurnControl>);
+impl Drop for TurnScope<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = TurnControl::default();
+    }
 }
 
 // Bounded backpressure for relevant turn notifications; terminal messages
@@ -81,13 +97,140 @@ impl Drop for TurnSubscription {
     }
 }
 
-fn cancelled_outcome(text: String) -> TurnOutcome {
+fn cancelled_outcome(text: String, truncated: bool) -> TurnOutcome {
     TurnOutcome {
         stop_reason: "cancelled".into(),
         text,
-        truncated: false,
+        truncated,
         exit_code: None,
         usage: None,
+    }
+}
+
+struct DeliveryBudget {
+    remaining: Option<usize>,
+    truncated: bool,
+}
+impl DeliveryBudget {
+    fn new(remaining: Option<usize>) -> Self {
+        Self {
+            remaining,
+            truncated: false,
+        }
+    }
+    fn truncate(&mut self) -> bool {
+        let first = !self.truncated;
+        self.truncated = true;
+        first
+    }
+}
+
+struct TurnDelivery {
+    delegate: Arc<dyn RpcSessionDelegate>,
+    budget: std::sync::Mutex<DeliveryBudget>,
+}
+impl TurnDelivery {
+    fn truncated(&self) -> bool {
+        self.budget.lock().unwrap().truncated
+    }
+    fn prepare(&self, event: AgentEvent) -> (Option<AgentEvent>, bool) {
+        let mut budget = self.budget.lock().unwrap();
+        match event {
+            AgentEvent::MessageChunk { text } => {
+                let prefix = bounds::bounded_prefix(&text, budget.remaining);
+                let length = prefix.len();
+                let event = (!prefix.is_empty()).then(|| AgentEvent::MessageChunk {
+                    text: prefix.to_owned(),
+                });
+                if let Some(remaining) = &mut budget.remaining {
+                    *remaining -= length;
+                }
+                let truncated = length < text.len() && budget.truncate();
+                (event, truncated)
+            }
+            AgentEvent::Raw { raw } => {
+                if let Some(remaining) = budget.remaining {
+                    // Once exhausted, do not serialize discarded telemetry.
+                    let length = if remaining == 0 {
+                        0
+                    } else {
+                        raw.to_string().len()
+                    };
+                    if remaining == 0 || length > remaining {
+                        budget.remaining = Some(0);
+                        return (None, budget.truncate());
+                    }
+                    budget.remaining = Some(remaining - length);
+                }
+                (Some(AgentEvent::Raw { raw }), false)
+            }
+            event => (Some(event), false),
+        }
+    }
+    async fn dispatch(&self, (event, truncated): (Option<AgentEvent>, bool)) {
+        if let Some(event) = event {
+            self.delegate.on_event(event).await;
+        }
+        if truncated {
+            self.delegate.on_event(AgentEvent::Truncated).await;
+        }
+    }
+    async fn mark_truncated(&self) {
+        let first = self.budget.lock().unwrap().truncate();
+        self.dispatch((None, first)).await;
+    }
+}
+
+/// Uncorrelated terminal records are kept only until the prompt ack arrives.
+/// With a configured budget, excess control metadata is a protocol resource
+/// violation, never a reason to silently lose a terminal and wait forever.
+struct PendingTerminals {
+    entries: HashMap<Option<String>, (String, usize, usize)>,
+    bytes: usize,
+    limit: Option<usize>,
+    overflowed: bool,
+}
+impl PendingTerminals {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            limit,
+            overflowed: false,
+        }
+    }
+    fn insert(&mut self, id: Option<String>, status: String, end: usize) {
+        if self.entries.contains_key(&id) {
+            return;
+        }
+        let bytes = id.as_ref().map_or(0, String::len)
+            + status.len()
+            + std::mem::size_of::<(Option<String>, String, usize, usize)>();
+        if self
+            .limit
+            .is_some_and(|limit| bytes > limit.saturating_sub(self.bytes))
+        {
+            self.overflowed = true;
+            return;
+        }
+        let order = self.entries.len();
+        self.bytes += bytes;
+        self.entries.insert(id, (status, end, order));
+    }
+    fn take(&mut self, id: Option<&str>) -> Option<(String, usize)> {
+        let selected = match id {
+            Some(id) => self.entries.remove(&Some(id.to_owned())),
+            None => self
+                .entries
+                .drain()
+                .min_by_key(|(_, (_, _, order))| *order)
+                .map(|(_, value)| value),
+        };
+        selected.map(|(status, end, _)| (status, end))
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
     }
 }
 
@@ -107,12 +250,17 @@ impl RpcLane {
         let text_method = self.spec.text_event_method.clone();
         let observer = self.observer.clone();
         let notifications: TurnNotifications = Arc::new(std::sync::Mutex::new(None));
+        let delivery = Arc::new(TurnDelivery {
+            delegate: delegate.clone(),
+            budget: std::sync::Mutex::new(DeliveryBudget::new(self.max_output_bytes)),
+        });
         struct Inner {
             delegate: Arc<dyn RpcSessionDelegate>,
             text_method: Option<String>,
             text_path: Option<String>,
             completion_method: Option<String>,
             notifications: TurnNotifications,
+            delivery: Arc<TurnDelivery>,
         }
         #[async_trait::async_trait]
         impl RpcDelegate for Inner {
@@ -130,25 +278,29 @@ impl RpcLane {
                 }
             }
             async fn on_notification(&self, method: &str, params: Value) {
-                if Some(method) == self.text_method.as_deref()
+                let forwarded = if Some(method) == self.text_method.as_deref()
                     || Some(method) == self.completion_method.as_deref()
                 {
-                    let sink = self.notifications.lock().unwrap().clone();
-                    if let Some(sink) = sink {
-                        let _ = sink.send((method.to_owned(), params.clone())).await;
-                    }
-                }
+                    Some(params.clone())
+                } else {
+                    None
+                };
                 let event = if Some(method) == self.text_method.as_deref() {
                     notification_text(&params, self.text_path.as_deref())
                         .map(|text| AgentEvent::MessageChunk { text })
                 } else {
                     None
                 };
-                self.delegate
-                    .on_event(event.unwrap_or(AgentEvent::Raw {
-                        raw: serde_json::json!({"method": method, "params": params}),
-                    }))
-                    .await;
+                let prepared = self.delivery.prepare(event.unwrap_or(AgentEvent::Raw {
+                    raw: serde_json::json!({"method": method, "params": params}),
+                }));
+                if let Some(params) = forwarded {
+                    let sink = self.notifications.lock().unwrap().clone();
+                    if let Some(sink) = sink {
+                        let _ = sink.send((method.to_owned(), params)).await;
+                    }
+                }
+                self.delivery.dispatch(prepared).await;
             }
         }
         let peer = JsonRpcPeer::spawn_with_envelope(
@@ -164,6 +316,7 @@ impl RpcLane {
                     .as_ref()
                     .map(|done| done.method.clone()),
                 notifications: notifications.clone(),
+                delivery: delivery.clone(),
             }),
             observer,
             crate::framing::DEFAULT_MAX_MESSAGE_BYTES,
@@ -248,13 +401,14 @@ impl RpcLane {
             peer,
             child: Mutex::new(child),
             spec: self.spec.clone(),
+            max_output_bytes: self.max_output_bytes,
+            delivery,
             session_model: request.config.model.clone(),
             session_effort: request.config.effort.clone(),
             session_id,
             cwd,
             notifications,
-            active_turn: std::sync::Mutex::new(None),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            control: std::sync::Mutex::new(TurnControl::default()),
             turn_lock: Mutex::new(()),
         })
     }
@@ -281,6 +435,11 @@ impl RpcSession {
         effort: Option<&str>,
     ) -> Result<TurnOutcome, AdapterError> {
         let _guard = self.turn_lock.lock().await;
+        *self.control.lock().unwrap() = TurnControl {
+            active: true,
+            ..Default::default()
+        };
+        let _turn_scope = TurnScope(&self.control);
         let model = model.or(self.session_model.as_deref());
         let effort = effort.or(self.session_effort.as_deref());
         let vars = vars(VarSpec {
@@ -306,6 +465,14 @@ impl RpcSession {
                 .await
                 .map_err(call_failure)?;
         }
+        {
+            let mut control = self.control.lock().unwrap();
+            if control.pending_cancel {
+                return Ok(cancelled_outcome(String::new(), false));
+            }
+            control.dispatched = true;
+        }
+        *self.delivery.budget.lock().unwrap() = DeliveryBudget::new(self.max_output_bytes);
         // Install the reliable per-turn feed before the prompt request. The
         // receiver is drained while awaiting its acknowledgement as well.
         if let Some(done) = &self.spec.completion {
@@ -316,8 +483,8 @@ impl RpcSession {
         }
         let result = match call(&self.peer, &self.spec.prompt, &vars).await {
             Ok(result) => result,
-            Err(_) if self.cancelled.swap(false, Ordering::Relaxed) => {
-                return Ok(cancelled_outcome(String::new()));
+            Err(_) if self.control.lock().unwrap().killed => {
+                return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
             }
             Err(error) => return Err(error),
         };
@@ -326,11 +493,16 @@ impl RpcSession {
             .find_map(|key| result.get(*key).and_then(Value::as_str))
             .unwrap_or("end_turn")
             .to_owned();
+        let text = extract_text(&result, self.spec.result_text_path.as_deref())
+            .unwrap_or_else(|| result.to_string());
+        let retained = bounds::bounded_prefix(&text, self.max_output_bytes);
+        if retained.len() < text.len() {
+            self.delivery.mark_truncated().await;
+        }
         Ok(TurnOutcome {
             stop_reason,
-            text: extract_text(&result, self.spec.result_text_path.as_deref())
-                .unwrap_or_else(|| result.to_string()),
-            truncated: false,
+            text: retained.to_owned(),
+            truncated: self.delivery.truncated(),
             exit_code: None,
             usage: None,
         })
@@ -351,21 +523,31 @@ impl RpcSession {
         let mut text = String::new();
         // A terminal may precede its acknowledgement. Preserve its turn id and
         // text boundary until the response identifies the requested turn.
-        let mut terminals: Vec<(Option<String>, String, usize)> = Vec::new();
+        let mut terminals = PendingTerminals::new(
+            self.max_output_bytes
+                .map(|limit| limit.max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)),
+        );
         loop {
             if acknowledged {
-                if let Some((_, status, end)) = terminals.iter().find(|(id, _, _)| {
-                    done.turn_id_path.is_none() || turn_id.is_none() || *id == turn_id
+                if let Some((status, end)) = terminals.take(if done.turn_id_path.is_some() {
+                    turn_id.as_deref()
+                } else {
+                    None
                 }) {
-                    text.truncate(*end);
-                    *self.active_turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    text.truncate(end);
                     return Ok(TurnOutcome {
-                        stop_reason: status.clone(),
+                        stop_reason: status,
                         text,
-                        truncated: false,
+                        truncated: self.delivery.truncated(),
                         exit_code: None,
                         usage: None,
                     });
+                }
+                if terminals.overflowed {
+                    return Err(AdapterError::uncertain(
+                        "agent_completion_buffer_exceeded",
+                        "rpc/read",
+                    ));
                 }
                 terminals.clear();
             }
@@ -374,19 +556,24 @@ impl RpcSession {
                 result = &mut reply, if !acknowledged => {
                     let result = match result {
                         Ok(result) => result,
-                        Err(_) if self.cancelled.swap(false, Ordering::Relaxed) => {
-                            return Ok(cancelled_outcome(text));
+                        Err(_) if self.control.lock().unwrap().killed => {
+                            return Ok(cancelled_outcome(text, self.delivery.truncated()));
                         }
                         Err(error) => return Err(error),
                     };
                     turn_id = binding(&result);
-                    *self.active_turn.lock().unwrap_or_else(|e| e.into_inner()) = turn_id.clone();
+                    let pending_cancel = {
+                        let mut control = self.control.lock().unwrap();
+                        control.turn_id = turn_id.clone();
+                        std::mem::take(&mut control.pending_cancel)
+                    };
                     acknowledged = true;
+                    if pending_cancel { self.send_cancel(turn_id.as_deref())?; }
                 }
                 notification = feed.recv() => {
                     let Some((method, params)) = notification.filter(|(method, _)| !method.is_empty()) else {
-                        if self.cancelled.swap(false, Ordering::Relaxed) {
-                            return Ok(cancelled_outcome(text));
+                        if self.control.lock().unwrap().killed {
+                            return Ok(cancelled_outcome(text, self.delivery.truncated()));
                         }
                         return Err(AdapterError::uncertain("agent_transport_failed", "rpc/read"));
                     };
@@ -396,10 +583,13 @@ impl RpcSession {
                             continue;
                         }
                         let id = extract_text(&params, done.turn_id_path.as_deref());
-                        terminals.push((id, status.unwrap_or_else(|| "end_turn".to_owned()), text.len()));
+                        if !acknowledged || done.turn_id_path.is_none() || turn_id.is_none() || id == turn_id {
+                            terminals.insert(id, status.unwrap_or_else(|| "end_turn".to_owned()), text.len());
+                        }
                     } else if Some(method.as_str()) == self.spec.text_event_method.as_deref() {
                         if let Some(chunk) = notification_text(&params, self.spec.text_path.as_deref()) {
-                            text.push_str(&chunk);
+                            let remaining = self.max_output_bytes.map(|limit| limit.saturating_sub(text.len()));
+                            text.push_str(bounds::bounded_prefix(&chunk, remaining));
                         }
                     }
                 }
@@ -409,35 +599,72 @@ impl RpcSession {
 
     /// Explicit user cancellation: sends the configured notification, or —
     /// on a `kill_on_cancel` lane — terminates the process, the agent's
-    /// only honest cancel semantic. A killed session cannot run again.
+    /// only honest cancel semantic. Before an acknowledgement, a turn-targeted
+    /// cancellation is retained until the real id arrives. Idle cancellation
+    /// is a no-op. A killed session cannot run again.
     pub async fn cancel(&self) -> Result<(), AdapterError> {
-        if self.spec.kill_on_cancel {
-            self.cancelled.store(true, Ordering::Relaxed);
+        let (kill, turn_id) = {
+            let mut control = self.control.lock().unwrap();
+            if !control.active {
+                return Ok(());
+            }
+            if !control.dispatched {
+                control.pending_cancel = true;
+                return Ok(());
+            }
+            if self.spec.kill_on_cancel {
+                control.killed = true;
+                (true, None)
+            } else {
+                let cancel = self.spec.cancel.as_ref().ok_or_else(|| {
+                    AdapterError::permanent("agent_cancel_unsupported", "session/cancel")
+                })?;
+                if contains_placeholder(&cancel.params, "turnId") && control.turn_id.is_none() {
+                    if self.spec.completion.is_some() {
+                        control.pending_cancel = true;
+                        return Ok(());
+                    }
+                    return Err(AdapterError::permanent(
+                        "agent_cancel_target_unavailable",
+                        "session/cancel",
+                    ));
+                }
+                (false, control.turn_id.clone())
+            }
+        };
+        if kill {
             self.child.lock().await.terminate().await?;
-            return Ok(());
+            Ok(())
+        } else {
+            self.send_cancel(turn_id.as_deref())
         }
-        let Some(cancel) = &self.spec.cancel else {
+    }
+
+    fn send_cancel(&self, turn_id: Option<&str>) -> Result<(), AdapterError> {
+        let cancel =
+            self.spec.cancel.as_ref().ok_or_else(|| {
+                AdapterError::permanent("agent_cancel_unsupported", "session/cancel")
+            })?;
+        if (contains_placeholder(&cancel.params, "turnId") && turn_id.is_none())
+            || (contains_placeholder(&cancel.params, "sessionId") && self.session_id.is_none())
+        {
             return Err(AdapterError::permanent(
-                "agent_cancel_unsupported",
+                "agent_cancel_target_unavailable",
                 "session/cancel",
             ));
-        };
-        let turn_id = self
-            .active_turn
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        }
         let vars = vars(VarSpec {
             session_id: self.session_id.as_deref(),
             cwd: &self.cwd,
-            turn_id: turn_id.as_deref(),
+            turn_id,
             ..Default::default()
         });
-        let params = substitute(&cancel.params, &vars);
-        self.peer.notify(&cancel.method, params).map_err(|error| {
-            AdapterError::uncertain("agent_cancel_failed", "session/cancel")
-                .with_detail(format!("{error:?}"))
-        })
+        self.peer
+            .notify(&cancel.method, substitute(&cancel.params, &vars))
+            .map_err(|error| {
+                AdapterError::uncertain("agent_cancel_failed", "session/cancel")
+                    .with_detail(format!("{error:?}"))
+            })
     }
 
     /// Invoke a declared passthrough method verbatim.
@@ -561,4 +788,34 @@ fn notification_text(params: &Value, text_path: Option<&str>) -> Option<String> 
                 .map(str::to_owned)
         })
         .or_else(|| params.as_str().map(str::to_owned))
+}
+
+#[cfg(test)]
+mod completion_budget_tests {
+    use super::PendingTerminals;
+
+    #[test]
+    fn pending_terminals_deduplicate_and_bound_uncorrelated_records() {
+        let mut pending = PendingTerminals::new(Some(256));
+        for _ in 0..1000 {
+            pending.insert(Some("expected".into()), "completed".into(), 12);
+        }
+        assert_eq!(pending.entries.len(), 1);
+        for i in 0..1000 {
+            pending.insert(Some(format!("foreign-{i}")), "completed".into(), 99);
+        }
+        assert!(pending.overflowed);
+        let payload_bytes: usize = pending
+            .entries
+            .iter()
+            .map(|(id, (status, _, _))| id.as_ref().map_or(0, String::len) + status.len())
+            .sum();
+        assert!(payload_bytes <= 256);
+        assert!(pending.entries.len() < 10);
+        assert_eq!(
+            pending.take(Some("expected")),
+            Some(("completed".into(), 12))
+        );
+        assert!(pending.take(Some("not-retained")).is_none());
+    }
 }

@@ -424,13 +424,6 @@ impl JsonRpcPeer {
             }
             Some(envelope) => {
                 let mut frame = serde_json::Map::new();
-                frame.insert(
-                    envelope.method_field.clone(),
-                    Value::String(method.to_owned()),
-                );
-                if let Some(id) = id {
-                    frame.insert("id".into(), id);
-                }
                 if envelope.params_inline {
                     if let Value::Object(map) = params {
                         frame.extend(map);
@@ -439,6 +432,16 @@ impl JsonRpcPeer {
                     }
                 } else {
                     frame.insert("params".into(), params);
+                }
+                // Protocol control fields belong to the peer, never to
+                // caller-supplied flat parameters. Notifications have no id.
+                frame.insert(
+                    envelope.method_field.clone(),
+                    Value::String(method.to_owned()),
+                );
+                frame.remove("id");
+                if let Some(id) = id {
+                    frame.insert("id".into(), id);
                 }
                 Value::Object(frame)
             }

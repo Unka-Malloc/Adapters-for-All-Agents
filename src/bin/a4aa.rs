@@ -436,6 +436,7 @@ fn fixture_agent() -> i32 {
     let stdout = std::io::stdout();
     let legacy = std::env::var_os("A4AA_FIXTURE_LEGACY").is_some();
     let restore_unknown = std::env::var_os("A4AA_FIXTURE_RESTORE_UNKNOWN").is_some();
+    let model_reply = std::env::var("A4AA_FIXTURE_MODEL_REPLY").unwrap_or_default();
     let require_auth = std::env::var_os("A4AA_FIXTURE_AUTH").is_some();
     let mut authenticated = !require_auth;
     // Current session configuration selections, keyed by slot.
@@ -713,10 +714,19 @@ fn fixture_agent() -> i32 {
                 let model = params.get("modelId").and_then(Value::as_str).unwrap_or("");
                 if option_values("model").iter().any(|(v, _)| *v == model) {
                     selections.insert("model".to_owned(), model.to_owned());
+                    let response = match model_reply.as_str() {
+                        "empty" => json!({}),
+                        "mismatch" => {
+                            selections.insert("model".to_owned(), "fixture-small".to_owned());
+                            json!({"models":models_state(&selections)})
+                        }
+                        "malformed" => json!({"models":{"currentModelId":42}}),
+                        _ => json!({"models":models_state(&selections)}),
+                    };
                     write(
                         &stdout,
                         json!({"jsonrpc": "2.0", "id": id,
-                            "result": {"models": models_state(&selections)}}),
+                            "result": response}),
                     );
                 } else {
                     write(

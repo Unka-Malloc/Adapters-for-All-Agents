@@ -12,7 +12,7 @@ adapter behavior over stdio JSON-RPC.
 | Supervision | `supervision` | Process-group spawn (`command-group`: Unix pgid, Windows Job Object), sanitized environment, bounded pipes, `interrupt` (SIGINT → grace → kill) and tree teardown |
 | Transport | `transport` | Piped stdio and Unix PTY (raw slave, streaming master, resize) |
 | Framing | `framing` | Bounded NDJSON frames (1 MiB default cap) |
-| RPC | `rpc` | Bidirectional JSON-RPC 2.0 peer: correlated outbound calls, peer-initiated requests/notifications dispatched per-task, half-close and fail-closed pending calls |
+| RPC | `rpc` | Bidirectional JSON-RPC 2.0 peer: correlated outbound calls, peer-initiated requests dispatched per-task and notifications delivered in wire order, half-close and fail-closed pending calls |
 | Lanes | `proto` | `acp` (official `agent-client-protocol` 3.x), `rpc` (host-declared methods/params), `cli` (argv template or stdin prompt, stdio or PTY streaming) |
 | Facade | `adapter` | `Adapter` / `AgentSession` lane-erased API: `open_session`, `prompt`, `cancel`, `close`, `before_turn` hook, permission handler |
 | Sidecar | `src/bin/a4aa.rs` | `a4aa serve` — `a4aa.v1` NDJSON-RPC on its own stdio; `a4aa fixture-agent` — deterministic test agent |
@@ -31,7 +31,7 @@ descriptor crate under `crates/`, which depends only on `a4aa`:
 
 ```toml
 # A host that drives only Pi installs exactly one adapter.
-a4aa-pi = "0.1"
+a4aa-pi = "0.2"
 ```
 
 ```rust

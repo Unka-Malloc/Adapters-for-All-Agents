@@ -17,6 +17,12 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Honor explicit CLI cancellation during prompt writes and after output EOF.
 - Bound retained structured CLI output, drain oversized records, and continue
   reading session bindings and usage after the output budget is exhausted.
+- Apply output budgets to RPC results and delivered events without cancelling
+  the turn. Preserve cancellation requested before the prompt acknowledgement.
+- Pump CLI input and output concurrently with bounded terminal read queues.
+- Expand templates once without interpreting placeholder-like user data.
+- Protect flat RPC control fields from parameter overrides, and surface
+  contradictory model acknowledgements and invalid session receipts.
 - Expose the same runtime capabilities through the `a4aa` sidecar.
 - Publish the matching adapter crates and `a4aa-dialects` registry at 0.2.0.
 
@@ -25,7 +31,8 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 Update custom `SessionRequest` values with a `SessionConfig` (or use their
 defaults). Construct CLI lane variants with `LaneSpec::Cli(Box::new(...))`.
 Custom lane descriptors must account for the new configuration and lifecycle
-fields; use defaults for optional behavior. Match the new `AgentEvent::Usage`
+fields; use defaults for optional behavior. Direct `RpcLane` construction now
+supplies `max_output_bytes` (`None` keeps unbounded output). Match the new `AgentEvent::Usage`
 variant when handling events exhaustively. RPC cancellation is asynchronous.
 Existing 0.1.x registry packages remain available for consumers that have not
 updated their source yet.

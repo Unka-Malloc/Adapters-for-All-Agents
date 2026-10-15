@@ -398,6 +398,7 @@ impl Adapter {
                     }
                 }
                 let lane = RpcLane {
+                    max_output_bytes: self.spec.max_output_bytes,
                     command: self.spec.command.clone(),
                     spec: (**spec).clone(),
                     secrets: self.secrets.clone(),

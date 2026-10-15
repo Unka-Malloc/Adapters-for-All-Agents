@@ -36,6 +36,69 @@ struct Noop;
 #[async_trait::async_trait]
 impl RpcDelegate for Noop {}
 
+#[tokio::test]
+async fn flat_parameters_cannot_override_protocol_control_fields() {
+    use a4aa::framing::{read_frame, write_frame, DEFAULT_MAX_MESSAGE_BYTES};
+    let (host, agent) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(host);
+    let peer = JsonRpcPeer::spawn_with_envelope(
+        reader,
+        writer,
+        Arc::new(Noop),
+        a4aa::observe::none(),
+        DEFAULT_MAX_MESSAGE_BYTES,
+        Some(a4aa::RpcEnvelopeSpec {
+            method_field: "type".into(),
+            string_ids: true,
+            params_inline: true,
+            response_method: Some("response".into()),
+            result_field: Some("data".into()),
+            success_field: Some("success".into()),
+            ..Default::default()
+        }),
+    );
+    let (read, mut write) = tokio::io::split(agent);
+    let mut read = tokio::io::BufReader::new(read);
+    let client = async {
+        let result = peer
+            .call(
+                "get_state",
+                json!({"type":"prompt","id":"forged","value":7}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"ok":true}));
+        peer.notify("ping", json!({"type":"prompt","id":"forged","value":9}))
+            .unwrap();
+    };
+    let server = async {
+        let frame = read_frame(&mut read, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame["type"], "get_state");
+        assert_ne!(frame["id"], "forged");
+        assert_eq!(frame["value"], 7);
+        write_frame(
+            &mut write,
+            &json!({"type":"response","id":frame["id"],"success":true,"data":{"ok":true}}),
+        )
+        .await
+        .unwrap();
+        let frame = read_frame(&mut read, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame["type"], "ping");
+        assert!(frame.get("id").is_none());
+        assert_eq!(frame["value"], 9);
+    };
+    tokio::join!(client, server);
+    peer.close().await;
+}
+
 struct Echo;
 #[async_trait::async_trait]
 impl RpcDelegate for Echo {

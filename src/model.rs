@@ -108,6 +108,8 @@ pub struct CliLaneSpec {
     /// an agent-side hook writes the session receipt there and the lane
     /// reads `conversationId`-family keys from it after the turn (for
     /// agents whose identity never reaches stdout).
+    /// Missing receipts are optional. Existing invalid or unreadable receipts
+    /// produce a typed error and remain available for diagnosis.
     #[serde(default)]
     pub binding_file_env: Option<String>,
     /// What the receipt may carry beyond the session id.

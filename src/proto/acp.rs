@@ -934,15 +934,25 @@ async fn set_session_model(
         .block_task()
         .await
         .map_err(|error| protocol_failure("session/set_model", error))?;
-    if let Ok(setup) = SessionSetup::parse(response) {
-        if let Some(models) = setup.models {
-            state.models = Some(models);
-        }
-        if let Some(meta) = setup.meta {
-            state.meta = Some(meta);
-        }
+    let setup = SessionSetup::parse(response).map_err(|mut error| {
+        error.stage = "session/set_model";
+        error
+    })?;
+    if let Some(meta) = setup.meta {
+        state.meta = Some(meta);
     }
-    if let Some(models) = &mut state.models {
+    if let Some(models) = setup.models {
+        let confirmed = models.current_model_id == model_id;
+        state.models = Some(models);
+        if !confirmed {
+            return Err(AdapterError::permanent(
+                "agent_configuration_rejected",
+                "session/set_model",
+            ));
+        }
+    } else if let Some(models) = &mut state.models {
+        // The legacy method permits an empty success acknowledgement. Only
+        // that case uses the requested value; explicit state is authoritative.
         models.current_model_id = model_id.to_owned();
     }
     Ok(())

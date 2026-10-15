@@ -1173,6 +1173,45 @@ async fn acp_session_options_fall_back_to_legacy_surfaces() {
 }
 
 #[tokio::test]
+async fn acp_legacy_model_ack_must_be_decodable_and_consistent() {
+    for (reply, error_code) in [
+        ("empty", None),
+        ("matching", None),
+        ("mismatch", Some("agent_configuration_rejected")),
+        ("malformed", Some("agent_protocol_error")),
+    ] {
+        let adapter = Adapter::new(acp_spec_with_env(&[
+            ("A4AA_FIXTURE_LEGACY", "1"),
+            ("A4AA_FIXTURE_MODEL_REPLY", reply),
+        ]));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = adapter
+            .open_session(
+                SessionRequest {
+                    config: options(Some("fixture-large"), None, None, None),
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await;
+        if let Some(code) = error_code {
+            let error = match result {
+                Ok(_) => panic!("invalid model acknowledgement accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, code);
+            assert_eq!(error.stage, "session/set_model");
+        } else {
+            let session = result.unwrap();
+            assert!(config_of(&session, &mut rx)
+                .await
+                .contains("model=fixture-large"));
+            session.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn acp_authenticate_retries_session_establishment() {
     // A4AA_FIXTURE_AUTH advertises `fixture-auth` and rejects session/new
     // until `authenticate` succeeds — the lane must try the advertised
