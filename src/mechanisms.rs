@@ -46,8 +46,9 @@ pub enum HookEvent {
     Notification,
 }
 
-/// What a hook is for. Dialects that cannot express a semantic difference
-/// carry the command anyway and report `adapted`.
+/// What a hook is for. Dialects that cannot implement the requested intent
+/// report `Unsupported`; generated extension observers accept only `Notify`.
+/// An observation-only callback must never claim to enforce or rewrite.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookIntent {

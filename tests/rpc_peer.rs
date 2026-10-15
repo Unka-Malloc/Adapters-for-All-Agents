@@ -1,6 +1,9 @@
 //! JsonRpcPeer over in-memory duplex transports: correlation, notifications,
 //! bidirectional dispatch under load, and close semantics.
 
+#[path = "support/settings.rs"]
+mod test_settings;
+
 use a4aa::rpc::{CallFailure, JsonRpcPeer, RpcDelegate, RpcErrorObject};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,7 +213,7 @@ async fn slow_delegate_does_not_starve_control_messages() {
     // Give the slow request a moment to be dispatched.
     tokio::task::yield_now().await;
     let control = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        test_settings::WAIT_BUDGET,
         server.call("control", Value::Null),
     )
     .await

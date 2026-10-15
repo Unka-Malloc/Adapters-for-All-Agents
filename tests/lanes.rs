@@ -1,6 +1,9 @@
 //! End-to-end lane tests against `a4aa fixture-agent` — a deterministic ACP
 //! agent shipped in this crate's binary. No network, no real agents.
 
+#[path = "support/settings.rs"]
+mod test_settings;
+
 use a4aa::rpc::JsonRpcPeer;
 use a4aa::{
     Adapter, AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvPolicy, EnvValue, LaneSpec,
@@ -202,7 +205,7 @@ async fn acp_cancel_terminates_deferred_turn() {
         tokio::select! {
             outcome = &mut prompt => panic!("prompt finished before cancel: {outcome:?}"),
             () = async {
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + test_settings::WAIT_BUDGET;
                 while std::time::Instant::now() < deadline {
                     if matches!(rx.try_recv(), Ok(AgentEvent::MessageChunk { .. })) {
                         return;
@@ -213,7 +216,7 @@ async fn acp_cancel_terminates_deferred_turn() {
             } => {}
         }
         session.cancel().await.expect("cancel");
-        tokio::time::timeout(Duration::from_secs(5), &mut prompt)
+        tokio::time::timeout(test_settings::WAIT_BUDGET, &mut prompt)
             .await
             .expect("prompt timed out after cancel")
             .expect("prompt result")
@@ -276,7 +279,7 @@ async fn rpc_cancel_reaches_agent() {
             () = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
         session.cancel().await.expect("cancel");
-        tokio::time::timeout(Duration::from_secs(5), &mut prompt)
+        tokio::time::timeout(test_settings::WAIT_BUDGET, &mut prompt)
             .await
             .expect("prompt timed out after cancel")
             .expect("prompt result")
@@ -881,11 +884,10 @@ async fn cli_output_cap_clamps_to_char_boundary() {
         .open_session(SessionRequest::default(), tx)
         .await
         .expect("open");
-    let outcome =
-        tokio::time::timeout(std::time::Duration::from_secs(10), session.prompt(turn("")))
-            .await
-            .expect("prompt hung")
-            .expect("prompt");
+    let outcome = tokio::time::timeout(test_settings::WAIT_BUDGET, session.prompt(turn("")))
+        .await
+        .expect("prompt hung")
+        .expect("prompt");
     assert!(outcome.truncated);
     assert_eq!(outcome.text.len(), 63); // 21 chars × 3 bytes, clamped
     assert_eq!(outcome.text.chars().count(), 21);
@@ -961,9 +963,9 @@ async fn sidecar_drives_fixture_end_to_end() {
     // Collect streamed session/event notifications while the prompt runs.
     async fn collect(rx: &mut mpsc::UnboundedReceiver<Value>, want: &str) -> String {
         let mut text = String::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + test_settings::WAIT_BUDGET;
         while std::time::Instant::now() < deadline && text != want {
-            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            match tokio::time::timeout(test_settings::WAIT_BUDGET, rx.recv()).await {
                 Ok(Some(params)) => {
                     if let Some(chunk) = params["event"]["text"].as_str() {
                         text.push_str(chunk);

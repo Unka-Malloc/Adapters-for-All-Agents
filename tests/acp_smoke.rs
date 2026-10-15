@@ -1,5 +1,8 @@
 //! Minimal ACP handshake repro: spawn fixture, connect, initialize.
 
+#[path = "support/settings.rs"]
+mod test_settings;
+
 use agent_client_protocol::schema::v1::InitializeRequest;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
@@ -19,7 +22,7 @@ async fn raw_acp_initialize_handshake() {
     let stdout = child.stdout.take().unwrap();
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        test_settings::WAIT_BUDGET,
         agent_client_protocol::Client
             .builder()
             .name("a4aa-smoke")

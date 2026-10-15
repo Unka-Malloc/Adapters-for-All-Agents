@@ -59,6 +59,7 @@ pub struct RpcSession {
     delivery: Arc<TurnDelivery>,
     session_model: Option<String>,
     session_effort: Option<String>,
+    session_instructions: Option<String>,
     session_id: Option<String>,
     cwd: String,
     /// One turn's identity and explicit cancellation intent; cleared on every
@@ -519,6 +520,7 @@ impl RpcLane {
             delivery,
             session_model: request.config.model.clone(),
             session_effort: request.config.effort.clone(),
+            session_instructions: request.config.instructions.clone(),
             session_id,
             cwd,
             control: std::sync::Mutex::new(TurnControl::default()),
@@ -562,6 +564,7 @@ impl RpcSession {
             prompt: text,
             model,
             effort,
+            instructions: self.session_instructions.as_deref(),
             ..Default::default()
         });
         // Per-turn configuration calls (for example model/thinking-level
@@ -982,7 +985,7 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn ingress_bounds_pending_payload_while_callback_awaits_response() {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(crate::test_settings::WAIT_BUDGET, async {
             let host = Arc::new(SlowHost::default());
             let spec = RpcLaneSpec {
                 text_event_method: Some("text".into()), text_path: Some("text".into()),

@@ -116,7 +116,6 @@ pub const AGENT: AgentCard = AgentCard {
         ),
         json_lines: true,
         session_id_path: Some("session_id"),
-        usage_path: Some("usage"),
         open_args: &[],
         binding_file_env: None,
         binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,

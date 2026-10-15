@@ -373,6 +373,7 @@ impl Adapter {
                     }
                 }
                 let lane = AcpLane {
+                    max_output_bytes: self.spec.max_output_bytes,
                     command: self.spec.command.clone(),
                     mcp_servers: mcp_servers.clone(),
                     prefer_load: *prefer_load,

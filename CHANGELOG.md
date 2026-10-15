@@ -15,6 +15,8 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Keep completion notifications and streamed text reliable across bursts that
   arrive before a prompt acknowledgement.
 - Honor explicit CLI cancellation during prompt writes and after output EOF.
+- Preserve ACP cancellation during configuration and bound delivered ACP output
+  without blocking permission or completion handling. Report resume-only support.
 - Bound retained structured CLI output, drain oversized records, and continue
   reading session bindings and usage after the output budget is exhausted.
 - Apply RPC output budgets at notification ingress, before slow host callbacks
@@ -27,6 +29,8 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Retain failed receipt evidence with its location in the typed error.
 - Pump CLI input and output concurrently with bounded terminal read queues.
 - Expand templates once without interpreting placeholder-like user data.
+- Preserve session instructions in RPC prompt and configuration templates.
+- Derive card-generated CLI usage paths from the card's live usage declaration.
 - Protect flat RPC control fields from parameter overrides, and surface
   contradictory model acknowledgements and invalid session receipts.
 - Expose the same runtime capabilities through the `a4aa` sidecar.
@@ -37,8 +41,11 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 Update custom `SessionRequest` values with a `SessionConfig` (or use their
 defaults). Construct CLI lane variants with `LaneSpec::Cli(Box::new(...))`.
 Custom lane descriptors must account for the new configuration and lifecycle
-fields; use defaults for optional behavior. Direct `RpcLane` construction now
-supplies `max_output_bytes` (`None` keeps unbounded output). Match the new `AgentEvent::Usage`
+fields; use defaults for optional behavior. Direct `RpcLane` and `AcpLane`
+construction now supplies `max_output_bytes` (`None` keeps unbounded output).
+Card `CliSurface` no longer repeats `usage_path`; declare it once in
+`UsageSurface.live.path`. Custom `CliLaneSpec` still carries its own usage path.
+Match the new `AgentEvent::Usage`
 variant when handling events exhaustively. RPC cancellation is asynchronous.
 Existing 0.1.x registry packages remain available for consumers that have not
 updated their source yet.

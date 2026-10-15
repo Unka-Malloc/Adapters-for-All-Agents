@@ -78,7 +78,7 @@ impl AgentCard {
                 }),
                 json_lines: cli.json_lines,
                 session_id_path: cli.session_id_path.map(str::to_owned),
-                usage_path: cli.usage_path.map(str::to_owned),
+                usage_path: self.usage.live.as_ref().map(|usage| usage.path.to_owned()),
                 open_args: cli.open_args.iter().map(|arg| (*arg).to_owned()).collect(),
                 binding_file_env: cli.binding_file_env.map(str::to_owned),
                 binding_receipt_shape: cli.binding_receipt_shape,
@@ -206,8 +206,6 @@ pub struct CliSurface {
     pub json_lines: bool,
     /// Dotted path to the session id on a stdout line.
     pub session_id_path: Option<&'static str>,
-    /// Dotted path to a token-usage object on a stdout line.
-    pub usage_path: Option<&'static str>,
     /// argv run once at open when no resume binding exists; the first
     /// non-empty stdout line becomes the session binding.
     pub open_args: &'static [&'static str],

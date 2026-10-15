@@ -105,7 +105,6 @@ pub const AGENT: AgentCard = AgentCard {
         stdin_template: None,
         json_lines: true,
         session_id_path: Some("session_id"),
-        usage_path: None,
         open_args: &["create-chat"],
         binding_file_env: None,
         binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,

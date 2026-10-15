@@ -1,13 +1,15 @@
 //! Deterministic resource and lifecycle regressions. No real agents or network.
 #![cfg(unix)]
 
+#[path = "support/settings.rs"]
+mod test_settings;
+
 use a4aa::observe::Direction;
 use a4aa::{
     Adapter, CliLaneSpec, CommandSpec, EnvPolicy, LaneSpec, PromptChannel, SessionRequest,
     StreamMode, TurnRequest,
 };
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
 fn cli(script: &str, stream: StreamMode, input: bool) -> a4aa::AgentSpec {
@@ -67,7 +69,7 @@ async fn cancel_at(script: &str, stream: StreamMode, input: bool, direction: Dir
         _ = ready.notified() => {}
     }
     session.cancel().await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+    let result = tokio::time::timeout(test_settings::WAIT_BUDGET, prompt)
         .await
         .expect("explicit cancellation did not finish")
         .unwrap();
@@ -243,7 +245,7 @@ for line in sys.stdin:
             unreachable!()
         };
         rpc.call_passthrough("release", json!({})).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+        let result = tokio::time::timeout(test_settings::WAIT_BUDGET, prompt)
             .await
             .expect("terminal notification was lost")
             .unwrap();
@@ -485,7 +487,7 @@ print(json.dumps({{'type':'result','text':'received:1048576'}}),flush=True)
             .await
             .unwrap();
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            test_settings::WAIT_BUDGET,
             session.prompt(TurnRequest {
                 text: "p".repeat(1024 * 1024),
                 ..Default::default()
@@ -566,7 +568,7 @@ for line in sys.stdin:
         unreachable!()
     };
     rpc.call_passthrough("release", json!({})).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+    let result = tokio::time::timeout(test_settings::WAIT_BUDGET, prompt)
         .await
         .unwrap()
         .unwrap();
@@ -641,7 +643,7 @@ for line in sys.stdin:
             unreachable!()
         };
         rpc.call_passthrough("release", json!({})).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+        let result = tokio::time::timeout(test_settings::WAIT_BUDGET, prompt)
             .await
             .unwrap()
             .unwrap();
@@ -744,7 +746,7 @@ for line in sys.stdin:
             }
         }
         session.cancel().await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+        let result = tokio::time::timeout(test_settings::WAIT_BUDGET, prompt)
             .await
             .unwrap()
             .unwrap();
@@ -978,7 +980,7 @@ for line in sys.stdin:
     }
     session.cancel().await.unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), prompt)
+        tokio::time::timeout(test_settings::WAIT_BUDGET, prompt)
             .await
             .unwrap()
             .unwrap()
@@ -1049,4 +1051,56 @@ async fn claude_permission_bypass_requires_an_explicit_selection() {
             permission.is_some()
         );
     }
+}
+
+#[tokio::test]
+async fn rpc_session_instructions_reach_setup_and_prompt_templates() {
+    let script = r#"
+import json,sys
+for line in sys.stdin:
+    m=json.loads(line)
+    assert m['params']['instructions']=='ROLE {prompt}', 'instructions were lost or expanded twice'
+    if m['method']=='configure': result={}
+    else: result={'text':m['params']['instructions']+'|'+m['params']['text']}
+    print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#;
+    let mut spec = rpc_fixture(script, Some(1024));
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.completion = None;
+    lane.result_text_path = Some("text".into());
+    lane.prompt.params = serde_json::json!({"instructions":"{instructions}","text":"{prompt}"});
+    lane.pre_turn = vec![a4aa::RpcCallSpec {
+        method: "configure".into(),
+        params: serde_json::json!({"instructions":"{instructions}"}),
+    }];
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(
+            SessionRequest {
+                config: a4aa::SessionConfig {
+                    instructions: Some("ROLE {prompt}".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+    for text in ["first", "next"] {
+        assert_eq!(
+            session
+                .prompt(TurnRequest {
+                    text: text.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .text,
+            format!("ROLE {{prompt}}|{text}")
+        );
+    }
+    session.close().await.unwrap();
 }

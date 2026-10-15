@@ -973,7 +973,7 @@ mod receipt_file_type_tests {
             send.send(result.is_err()).unwrap();
         });
         assert!(receive
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(crate::test_settings::WAIT_BUDGET)
             .expect("receipt read blocked on a special file"));
     }
 }

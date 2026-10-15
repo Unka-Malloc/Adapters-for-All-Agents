@@ -68,3 +68,7 @@ pub use proto::acp::{PermissionDecision, PermissionPrompt, SessionDelegate};
 pub use proto::rpc::RpcSessionDelegate;
 pub use rpc::{CallFailure, JsonRpcPeer, RpcDelegate, RpcErrorObject};
 pub use supervision::{IoPlan, StdioKind, SupervisedChild};
+
+#[cfg(test)]
+#[path = "../tests/support/settings.rs"]
+mod test_settings;

@@ -94,7 +94,6 @@ pub const AGENT: AgentCard = AgentCard {
         stdin_template: None,
         json_lines: true,
         session_id_path: Some("conversation_id"),
-        usage_path: Some("result.usage"),
         open_args: &[],
         binding_file_env: None,
         binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,

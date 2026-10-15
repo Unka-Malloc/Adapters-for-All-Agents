@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -177,7 +177,7 @@ pub enum PermissionDecision {
 /// permission request is cancelled.
 #[async_trait::async_trait]
 pub trait SessionDelegate: Send + Sync {
-    /// Streamed agent output — already dispatched as it arrives.
+    /// Admitted output, delivered in wire order within the turn's output cap.
     async fn on_event(&self, _event: AgentEvent) {}
 
     async fn on_permission(&self, _prompt: PermissionPrompt) -> PermissionDecision {
@@ -197,9 +197,125 @@ impl SessionDelegate for CollectDelegate {
     }
 }
 
+// The command driver owns each turn's lock even if its caller drops the
+// response future. Cancellation and prompt dispatch share this state so a
+// configuration await cannot erase an explicit cancellation request.
+#[derive(Default)]
+struct TurnState {
+    active: bool,
+    dispatched: bool,
+    cancelled: bool,
+    remaining: Option<usize>,
+    truncated: bool,
+}
+struct ActiveTurn {
+    state: Arc<std::sync::Mutex<TurnState>>,
+    _serial: OwnedMutexGuard<()>,
+}
+impl Drop for ActiveTurn {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.active = false;
+        state.dispatched = false;
+        state.cancelled = false;
+    }
+}
+enum OutputCommand {
+    Event(AgentEvent),
+    Drain(oneshot::Sender<()>),
+}
+#[derive(Clone)]
+struct OutputSink {
+    state: Arc<std::sync::Mutex<TurnState>>,
+    send: mpsc::UnboundedSender<OutputCommand>,
+}
+impl OutputSink {
+    fn new(state: Arc<std::sync::Mutex<TurnState>>, delegate: Arc<dyn SessionDelegate>) -> Self {
+        let (send, mut receive) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = receive.recv().await {
+                match command {
+                    OutputCommand::Event(event) => delegate.on_event(event).await,
+                    OutputCommand::Drain(reply) => {
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+        Self { state, send }
+    }
+    // Runs inline in the SDK notification dispatcher. Admission happens
+    // before enqueueing, so callbacks cannot retain unbounded source payloads
+    // or block response/configuration/permission processing. None is the
+    // caller's explicit choice of unbounded output.
+    fn deliver(&self, event: AgentEvent) -> Result<(), agent_client_protocol::Error> {
+        let mut state = self.state.lock().unwrap();
+        let (event, clipped) = match event {
+            AgentEvent::MessageChunk { text } => {
+                let prefix = bounds::bounded_prefix(&text, state.remaining);
+                let length = prefix.len();
+                let retained = (!prefix.is_empty()).then(|| AgentEvent::MessageChunk {
+                    text: prefix.to_owned(),
+                });
+                if let Some(remaining) = &mut state.remaining {
+                    *remaining -= length;
+                }
+                (retained, length < text.len())
+            }
+            event => {
+                // Non-text updates carry tool/plan/raw payloads. Preserve an
+                // entire admitted record, or drain it without queueing it.
+                if let Some(remaining) = state.remaining {
+                    let length = if remaining == 0 {
+                        0
+                    } else {
+                        serde_json::to_vec(&event)
+                            .map_err(|_| agent_client_protocol::Error::internal_error())?
+                            .len()
+                    };
+                    if remaining == 0 || length > remaining {
+                        (None, true)
+                    } else {
+                        state.remaining = Some(remaining - length);
+                        (Some(event), false)
+                    }
+                } else {
+                    (Some(event), false)
+                }
+            }
+        };
+        if let Some(event) = event {
+            self.send
+                .send(OutputCommand::Event(event))
+                .map_err(|_| agent_client_protocol::Error::internal_error())?;
+        }
+        if clipped {
+            state.remaining = Some(0);
+            if !state.truncated {
+                state.truncated = true;
+                self.send
+                    .send(OutputCommand::Event(AgentEvent::Truncated))
+                    .map_err(|_| agent_client_protocol::Error::internal_error())?;
+            }
+        }
+        Ok(())
+    }
+    async fn drain(&self) -> Result<(), AdapterError> {
+        let (send, receive) = oneshot::channel();
+        self.send
+            .send(OutputCommand::Drain(send))
+            .map_err(|_| output_failure())?;
+        receive.await.map_err(|_| output_failure())
+    }
+}
+fn output_failure() -> AdapterError {
+    AdapterError::uncertain("agent_event_delivery_failed", "acp/events")
+}
+
 enum SessionCommand {
     Prompt {
         request: TurnRequest,
+        turn: ActiveTurn,
         reply: oneshot::Sender<Result<TurnOutcome, AdapterError>>,
     },
     Close,
@@ -214,7 +330,9 @@ pub struct AcpSession {
     capabilities: Capabilities,
     agent_info: Option<AgentInfo>,
     state: Arc<std::sync::Mutex<SessionSetup>>,
-    prompt_lock: Mutex<()>,
+    prompt_lock: Arc<Mutex<()>>,
+    turn_state: Arc<std::sync::Mutex<TurnState>>,
+    max_output_bytes: Option<usize>,
 }
 
 impl AcpSession {
@@ -284,10 +402,26 @@ impl AcpSession {
     /// configuration surface before the prompt; a requested value the
     /// agent cannot express fails the turn rather than being ignored.
     pub async fn prompt(&self, request: TurnRequest) -> Result<TurnOutcome, AdapterError> {
-        let _guard = self.prompt_lock.lock().await;
+        let serial = self.prompt_lock.clone().lock_owned().await;
+        {
+            let mut state = self.turn_state.lock().unwrap();
+            *state = TurnState {
+                active: true,
+                remaining: self.max_output_bytes,
+                ..Default::default()
+            };
+        }
+        let turn = ActiveTurn {
+            state: self.turn_state.clone(),
+            _serial: serial,
+        };
         let (reply, outcome) = oneshot::channel();
         self.command
-            .send(SessionCommand::Prompt { request, reply })
+            .send(SessionCommand::Prompt {
+                request,
+                turn,
+                reply,
+            })
             .map_err(|_| AdapterError::uncertain("agent_connection_closed", "session/prompt"))?;
         outcome
             .await
@@ -298,6 +432,14 @@ impl AcpSession {
     /// Explicit user cancellation only — callers must not invoke this for
     /// transport errors or observer disconnects.
     pub fn cancel(&self) -> Result<(), AdapterError> {
+        let mut state = self.turn_state.lock().unwrap();
+        if !state.active {
+            return Ok(());
+        }
+        state.cancelled = true;
+        if !state.dispatched {
+            return Ok(());
+        }
         self.connection
             .send_notification(CancelNotification::new(self.session_id.clone()))
             .map_err(|error| {
@@ -318,6 +460,8 @@ impl AcpSession {
 
 /// ACP lane bound to one command spec.
 pub struct AcpLane {
+    /// Per-turn retained/delivered output cap; None explicitly permits unbounded output.
+    pub max_output_bytes: Option<usize>,
     pub command: CommandSpec,
     pub mcp_servers: Vec<Value>,
     pub prefer_load: bool,
@@ -353,6 +497,11 @@ impl AcpLane {
         let (ready_tx, ready_rx) = oneshot::channel();
         let ready = Arc::new(ReadySlot::new(Some(ready_tx)));
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let turn_state = Arc::new(std::sync::Mutex::new(TurnState {
+            remaining: self.max_output_bytes,
+            ..Default::default()
+        }));
+        let output = OutputSink::new(turn_state.clone(), delegate.clone());
 
         let driver = tokio::spawn(drive(
             client_name,
@@ -366,6 +515,7 @@ impl AcpLane {
                 prefer_load,
                 resume,
                 config: request.config,
+                output,
             },
             command_rx,
             ready,
@@ -382,7 +532,9 @@ impl AcpLane {
             capabilities: opened.capabilities,
             agent_info: opened.agent_info,
             state: opened.state,
-            prompt_lock: Mutex::new(()),
+            prompt_lock: Arc::new(Mutex::new(())),
+            turn_state,
+            max_output_bytes: self.max_output_bytes,
         })
     }
 }
@@ -406,6 +558,7 @@ struct ServeContext {
     prefer_load: bool,
     resume: Option<String>,
     config: SessionConfig,
+    output: OutputSink,
 }
 
 /// The connection foreground: performs the handshake, then serves turn
@@ -421,7 +574,7 @@ async fn drive(
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
     ready: Arc<ReadySlot>,
 ) {
-    let notify_delegate = delegate.clone();
+    let notify_output = context.output.clone();
     let permission_delegate = delegate.clone();
     let serve_ready = ready.clone();
     let outcome = agent_client_protocol::Client
@@ -430,7 +583,7 @@ async fn drive(
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
                 if let Some(event) = map_update(&notification.update) {
-                    notify_delegate.on_event(event).await;
+                    notify_output.deliver(event)?;
                 }
                 Ok(())
             },
@@ -517,7 +670,11 @@ async fn serve(
 
     while let Some(command) = commands.recv().await {
         match command {
-            SessionCommand::Prompt { request, reply } => {
+            SessionCommand::Prompt {
+                request,
+                turn,
+                reply,
+            } => {
                 // A std::sync::MutexGuard is not Send across `.await`:
                 // take a working copy, run the turn against it, then write
                 // the resulting session state back.
@@ -525,8 +682,18 @@ async fn serve(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
-                let outcome = run_prompt(&connection, &session_id, &mut working, request).await;
+                let mut outcome =
+                    run_prompt(&connection, &session_id, &mut working, request, &turn.state).await;
                 *state.lock().unwrap_or_else(|error| error.into_inner()) = working;
+                if let Err(error) = context.output.drain().await {
+                    outcome = Err(error);
+                }
+                if let Ok(outcome) = &mut outcome {
+                    outcome.truncated = turn.state.lock().unwrap().truncated;
+                }
+                // Clear the old turn before allowing the caller to enqueue
+                // another; retaining the owned guard also protects dropped callers.
+                drop(turn);
                 let _ = reply.send(outcome);
             }
             SessionCommand::Close => return Ok(()),
@@ -1080,18 +1247,42 @@ async fn run_prompt(
     session_id: &str,
     state: &mut SessionSetup,
     request: TurnRequest,
+    control: &std::sync::Mutex<TurnState>,
 ) -> Result<TurnOutcome, AdapterError> {
+    let cancelled = || control.lock().unwrap().cancelled;
+    if cancelled() {
+        return Ok(cancelled_prompt());
+    }
     if let Some(model) = request.model.as_deref() {
-        apply_model(connection, session_id, state, model).await?;
+        let result = apply_model(connection, session_id, state, model).await;
+        if cancelled() {
+            return Ok(cancelled_prompt());
+        }
+        result?;
     }
     if let Some(effort) = request.effort.as_deref() {
-        apply_config_value(connection, session_id, state, "thought_level", effort).await?;
+        let result =
+            apply_config_value(connection, session_id, state, "thought_level", effort).await;
+        if cancelled() {
+            return Ok(cancelled_prompt());
+        }
+        result?;
     }
-    let response = connection
-        .send_request(PromptRequest::new(
+    let pending = {
+        let mut control = control.lock().unwrap();
+        if control.cancelled {
+            return Ok(cancelled_prompt());
+        }
+        // SDK send_request enqueues synchronously. Holding the same lock as
+        // cancel ensures its notification cannot overtake this dispatch.
+        let pending = connection.send_request(PromptRequest::new(
             session_id.to_owned(),
             vec![ContentBlock::Text(TextContent::new(request.text))],
-        ))
+        ));
+        control.dispatched = true;
+        pending
+    };
+    let response = pending
         .block_task()
         .await
         .map_err(|error| protocol_failure("session/prompt", error))?;
@@ -1105,6 +1296,16 @@ async fn run_prompt(
         // ACP's turn-usage field is behind the SDK's unstable feature flag.
         usage: None,
     })
+}
+
+fn cancelled_prompt() -> TurnOutcome {
+    TurnOutcome {
+        stop_reason: "cancelled".into(),
+        text: String::new(),
+        truncated: false,
+        exit_code: None,
+        usage: None,
+    }
 }
 
 fn protocol_failure(stage: &'static str, error: agent_client_protocol::Error) -> AdapterError {
@@ -1128,7 +1329,12 @@ fn capabilities_from(
     Capabilities {
         streaming: true,
         cancellation: true,
-        session_resume: response.agent_capabilities.load_session,
+        session_resume: response.agent_capabilities.load_session
+            || response
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some(),
         permission_prompts: true,
         detail: serde_json::to_value(&response.agent_capabilities).ok(),
     }
@@ -1205,7 +1411,7 @@ fn permission_prompt(request: &RequestPermissionRequest) -> PermissionPrompt {
 }
 
 /// Map a session update onto the canonical event model. Zero-assumption:
-/// updates that carry no canonical kind are forwarded raw — never dropped.
+/// updates without a canonical kind become raw events, subject to the output budget.
 fn map_update(update: &SessionUpdate) -> Option<AgentEvent> {
     let event = match update {
         SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
