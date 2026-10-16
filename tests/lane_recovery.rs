@@ -1400,11 +1400,10 @@ signal.pause()
 // ----------------- owned CLI turns (waiterless dispatch) -----------------
 
 /// A stdin-prompted CLI spec whose agent receives `env` literals — used by
-/// the waiterless-turn tests to make the agent's pid observable.
+/// the waiterless-turn tests to make the agent's pid observable. `sh` keeps
+/// these tests light: they run inside a heavily parallel suite.
 fn pid_reporting_cli(script: &str, env: &[(&str, &std::path::Path)]) -> a4aa::AgentSpec {
-    let mut spec = cli("", StreamMode::Stdio, true);
-    spec.command.program = "python3".into();
-    spec.command.args = vec!["-u".into(), "-c".into(), script.into()];
+    let mut spec = cli(script, StreamMode::Stdio, true);
     spec.command.env = EnvPolicy::Sanitized {
         inherit: vec![],
         set: env
@@ -1458,12 +1457,11 @@ async fn cli_dropped_waiter_leaves_the_owned_turn_to_complete() {
         let directory = tempfile::tempdir().unwrap();
         let pidfile = directory.path().join("turn.pid");
         let script = r#"
-import os,sys,time,pathlib
-pathlib.Path(os.environ['A4AA_TEST_PID']).write_text(str(os.getpid()))
-sys.stdin.readline()
-print('started',flush=True)
-time.sleep(0.3)
-print('finished',flush=True)
+printf '%s' $$ > "$A4AA_TEST_PID"
+read line
+echo started
+sleep 1
+echo finished
 "#;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = Adapter::new(pid_reporting_cli(script, &[("A4AA_TEST_PID", &pidfile)]))
@@ -1511,22 +1509,30 @@ async fn cli_cancel_terminates_a_waiterless_owned_turn() {
     tokio::time::timeout(test_settings::WAIT_BUDGET * 3, async {
         let directory = tempfile::tempdir().unwrap();
         let pidfile = directory.path().join("turn.pid");
+        let once = directory.path().join("turn-once");
         // The first run pauses until cancelled; a later turn exits normally.
+        // The marker is touched BEFORE the barrier-visible echo, so a turn
+        // observed as started has always registered itself.
         let script = r#"
-import os,sys,signal,pathlib
-pid=pathlib.Path(os.environ['A4AA_TEST_PID'])
-first=not pid.exists()
-pid.write_text(str(os.getpid()))
-sys.stdin.readline()
-print('started',flush=True)
-if first: signal.pause()
-print('finished',flush=True)
+printf '%s' $$ > "$A4AA_TEST_PID"
+read line
+if [ -f "$A4AA_TEST_ONCE" ]; then
+  echo started
+  echo finished
+else
+  touch "$A4AA_TEST_ONCE"
+  echo started
+  exec sleep 60
+fi
 "#;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = Adapter::new(pid_reporting_cli(script, &[("A4AA_TEST_PID", &pidfile)]))
-            .open_session(SessionRequest::default(), tx)
-            .await
-            .unwrap();
+        let session = Adapter::new(pid_reporting_cli(
+            script,
+            &[("A4AA_TEST_PID", &pidfile), ("A4AA_TEST_ONCE", &once)],
+        ))
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
         start_waiterless_turn(&session, &mut rx).await;
         let pid = pid_of(&pidfile);
         session.cancel().await.unwrap();
@@ -1557,11 +1563,10 @@ async fn cli_close_terminates_and_reaps_a_waiterless_turn() {
         let directory = tempfile::tempdir().unwrap();
         let pidfile = directory.path().join("turn.pid");
         let script = r#"
-import os,sys,signal,pathlib
-pathlib.Path(os.environ['A4AA_TEST_PID']).write_text(str(os.getpid()))
-sys.stdin.readline()
-print('started',flush=True)
-signal.pause()
+printf '%s' $$ > "$A4AA_TEST_PID"
+read line
+echo started
+exec sleep 60
 "#;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session = Adapter::new(pid_reporting_cli(script, &[("A4AA_TEST_PID", &pidfile)]))

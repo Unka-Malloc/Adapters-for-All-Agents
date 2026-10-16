@@ -733,3 +733,78 @@ fn extension_admission_reports_identical_outcomes_across_rendering_paths() {
         );
     }
 }
+
+#[test]
+fn explicit_subagent_sandbox_requires_an_enforceable_native_knob() {
+    let subagent = |sandbox: Option<&str>| SubagentDecl {
+        name: "reviewer".into(),
+        description: None,
+        model: None,
+        effort: None,
+        sandbox: sandbox.map(str::to_owned),
+        instructions: "Review.".into(),
+    };
+    // Codex's native agent config enforces `sandbox_mode` — the constraint
+    // is emitted and the verdict stays Native.
+    let plan = a4aa_codex::adapt(&MechanismSet {
+        subagents: vec![subagent(Some("read-only"))],
+        ..Default::default()
+    });
+    let artifact = plan
+        .artifacts
+        .iter()
+        .find(|a| a.content.contains("reviewer"))
+        .expect("codex subagent artifact");
+    assert!(artifact.content.contains("sandbox_mode = \"read-only\""));
+    assert_eq!(support(&plan, "subagents.reviewer"), Some(Support::Native));
+
+    // Formats without an enforced knob (frontmatter markdown, Kiro JSON)
+    // fail closed on an explicit sandbox request: Unsupported verdict and
+    // no installable artifact that merely looks constrained.
+    for dialect in [
+        a4aa_claude::dialect(),
+        a4aa_dialects::dialect("kiro").unwrap(),
+    ] {
+        let plan = dialect.adapt(&MechanismSet {
+            subagents: vec![subagent(Some("read-only"))],
+            ..Default::default()
+        });
+        assert_eq!(
+            support(&plan, "subagents.reviewer"),
+            Some(Support::Unsupported),
+            "{}",
+            dialect.id
+        );
+        assert!(
+            !plan
+                .artifacts
+                .iter()
+                .any(|a| a.content.contains("reviewer")),
+            "an unconstrained subagent was emitted for {}: {:?}",
+            dialect.id,
+            plan.artifacts
+        );
+        assert!(
+            plan.artifacts
+                .iter()
+                .all(|a| !a.content.contains("sandbox")),
+            "{}",
+            dialect.id
+        );
+        // An unspecified sandbox keeps the old verdict and artifact.
+        let plan = dialect.adapt(&MechanismSet {
+            subagents: vec![subagent(None)],
+            ..Default::default()
+        });
+        assert_eq!(
+            support(&plan, "subagents.reviewer"),
+            Some(Support::Native),
+            "{}",
+            dialect.id
+        );
+        assert!(plan
+            .artifacts
+            .iter()
+            .any(|a| a.content.contains("reviewer")));
+    }
+}

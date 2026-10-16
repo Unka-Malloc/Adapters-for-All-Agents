@@ -107,8 +107,10 @@ Spawn `a4aa serve`; speak NDJSON JSON-RPC `a4aa.v1` on its stdio:
 {"jsonrpc":"2.0","id":1,"method":"session/open","params":{"protocol":"a4aa.v1","spec":{...},"session":{...}}}
 // → request (returns when the turn ends)
 {"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"...","text":"..."}}
-// → notification
-{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"..."}}
+// → request — cancel must be id-bearing, and the response must be checked:
+//   a notification-form cancel is ignored (with a stderr warning), because
+//   its outcome (cancelled, or unknown session) cannot be reported back
+{"jsonrpc":"2.0","id":3,"method":"session/cancel","params":{"sessionId":"..."}}
 // ← events stream back as notifications
 {"jsonrpc":"2.0","method":"session/event","params":{"sessionId":"...","event":{...}}}
 ```

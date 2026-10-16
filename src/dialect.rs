@@ -589,6 +589,18 @@ fn command_body_md(command: &CommandDecl) -> String {
 fn emit_subagents(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) {
     for sub in &set.subagents {
         let item = format!("subagents.{}", sub.name);
+        // An explicitly requested sandbox must be expressible AND enforced
+        // by the native format. Otherwise fail closed: report the request
+        // unsupported and emit nothing — an unconstrained subagent that
+        // merely looks declared must never be installed.
+        if sub.sandbox.is_some() && !surface_enforces_sandbox(dialect.subagents) {
+            plan.report(
+                item,
+                Support::Unsupported,
+                Some("the agent's subagent format cannot enforce the requested sandbox; nothing was emitted"),
+            );
+            continue;
+        }
         match dialect.subagents {
             SubagentSurface::None => plan.report(
                 item,
@@ -652,6 +664,12 @@ fn emit_subagents(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPl
             }
         }
     }
+}
+
+/// Whether the surface's native subagent format carries a sandbox knob the
+/// agent runtime actually enforces (Codex `sandbox_mode`).
+fn surface_enforces_sandbox(surface: SubagentSurface) -> bool {
+    matches!(surface, SubagentSurface::CodexToml(_))
 }
 
 fn subagent_body_md(sub: &SubagentDecl) -> String {

@@ -24,6 +24,11 @@ crate's adapters verbatim — one subprocess per host process.
 | `session/cancel` | `{sessionId}` | `{}` |
 | `session/close` | `{sessionId}` | `{}` (idempotent) |
 
+`session/cancel` is only defined as an id-bearing request: its outcome
+(cancelled, or an unknown-session error) is acknowledged in the response. A
+notification-form `session/cancel` is ignored with a stderr warning — never
+silently applied.
+
 `AgentSpec` is the crate's canonical spec (serde, `camelCase` fields
 documented in `model.rs`): `id`, `clientName?`, `command{program,args,cwd?,
 env}`, `maxOutputBytes?`, plus the flattened lane — `"lane": "acp" | "rpc" |

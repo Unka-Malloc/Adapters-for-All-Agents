@@ -1866,3 +1866,113 @@ signal.pause()
     .await
     .expect("completion/shutdown race stalled");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_notification_cancel_warns_and_only_request_form_cancels() {
+    use tokio::io::AsyncBufReadExt;
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 2, async {
+        let script = r#"
+import json,sys
+for line in sys.stdin:
+    m=json.loads(line)
+    method=m.get('method')
+    if method=='prompt':
+        print(json.dumps({'jsonrpc':'2.0','method':'ready','params':{'text':'running'}}),flush=True)
+        print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'id':'t'}}),flush=True)
+    elif method=='cancel':
+        print(json.dumps({'jsonrpc':'2.0','method':'done','params':{'turn':'t','status':'cancelled'}}),flush=True)
+"#;
+        let spec = AgentSpec {
+            id: "notify-cancel".into(),
+            client_name: None,
+            max_output_bytes: Some(1024),
+            lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                prompt: RpcCallSpec {
+                    method: "prompt".into(),
+                    params: json!({"text": "{prompt}"}),
+                },
+                cancel: Some(RpcCallSpec {
+                    method: "cancel".into(),
+                    params: json!({}),
+                }),
+                completion: Some(a4aa::RpcCompletionSpec {
+                    method: "done".into(),
+                    turn_id_path: Some("turn".into()),
+                    status_path: Some("status".into()),
+                    status_value: None,
+                }),
+                text_event_method: Some("ready".into()),
+                text_path: Some("text".into()),
+                ..Default::default()
+            })),
+            command: CommandSpec {
+                program: "python3".into(),
+                args: vec!["-u".into(), "-c".into(), script.into()],
+                cwd: None,
+                env: EnvPolicy::default(),
+            },
+        };
+        let mut child = tokio::process::Command::new(FIXTURE)
+            .arg("serve")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = JsonRpcPeer::spawn(
+            child.stdout.take().unwrap(),
+            child.stdin.take().unwrap(),
+            Arc::new(SidecarEvents {
+                notifications: tx,
+                permission_granted: std::sync::atomic::AtomicBool::new(false),
+            }),
+            None,
+            a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+        );
+        let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+        let opened = peer
+            .call("session/open", json!({"spec": spec}))
+            .await
+            .unwrap();
+        let id = opened["sessionId"].as_str().unwrap().to_owned();
+        let pending = peer
+            .start_call("session/prompt", json!({"sessionId": id, "text": "run"}))
+            .unwrap();
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event["sessionId"] == id && event["event"]["text"].as_str() == Some("running") {
+                break;
+            }
+        }
+        // Notification-form cancel: ignored — with a visible stderr warning.
+        peer.notify("session/cancel", json!({"sessionId": id}))
+            .unwrap();
+        let mut saw_warning = String::new();
+        while !saw_warning.contains("notification-style session/cancel ignored") {
+            let mut line = String::new();
+            stderr.read_line(&mut line).await.unwrap();
+            assert!(
+                !line.is_empty(),
+                "sidecar stderr closed before the cancel warning"
+            );
+            saw_warning.push_str(&line);
+        }
+        // The request form cancels: if the notification had cancelled the
+        // turn, this cancel would be an idle no-op and the turn would hang.
+        peer.call("session/cancel", json!({"sessionId": id}))
+            .await
+            .unwrap();
+        let outcome = pending.wait().await.unwrap();
+        assert_eq!(outcome["stopReason"], "cancelled");
+        peer.call("session/close", json!({"sessionId": id}))
+            .await
+            .unwrap();
+        peer.close().await;
+        let _ = child.kill().await;
+    })
+    .await
+    .expect("notification-style cancel did not follow the documented contract");
+}

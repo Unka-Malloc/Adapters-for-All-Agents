@@ -198,6 +198,19 @@ impl RpcDelegate for SidecarDelegate {
         eprintln!("a4aa: protocol error from host: {error}");
     }
 
+    async fn on_notification(&self, method: &str, _params: Value) {
+        // session/cancel is a request: its outcome (including an unknown
+        // session) must be acknowledged. A notification-form cancel would
+        // be dropped by convention — that failure must be visible, since a
+        // host could otherwise believe the turn was cancelled.
+        if method == "session/cancel" {
+            eprintln!(
+                "a4aa: notification-style session/cancel ignored; \
+                 send it as an id-bearing request so the outcome is acknowledged"
+            );
+        }
+    }
+
     async fn on_closed(&self) {
         self.closed.notify_waiters();
     }
