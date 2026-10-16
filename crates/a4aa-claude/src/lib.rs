@@ -84,8 +84,10 @@ pub const fn dialect() -> &'static Dialect {
 /// fixed stream-json argv, the prompt as a `stream-json` user message on
 /// stdin, NDJSON events on stdout (`system/init` carries `session_id`,
 /// `result` carries the reply text and token usage). Resume is a fresh
-/// process with `--resume <id>`; guidance rides `--append-system-prompt`;
-/// the vendor launch default is the `bypassPermissions` mode.
+/// process with `--resume <id>`; guidance rides `--append-system-prompt`.
+/// Permissions follow the agent's own native setting unless the host
+/// explicitly selects one: `bypassPermissions` (or any other
+/// `--permission-mode` value) is passed only on an explicit selection.
 pub const AGENT: AgentCard = AgentCard {
     id: "claude",
     label: "Claude Code",

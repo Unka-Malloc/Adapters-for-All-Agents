@@ -124,6 +124,7 @@ name = "a4aa-kilo-code"
 version = "0.2.0"
 dependencies = [
  "a4aa",
+ "serde_json",
 ]
 
 [[package]]

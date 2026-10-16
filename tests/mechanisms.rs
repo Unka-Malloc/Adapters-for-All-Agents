@@ -79,14 +79,9 @@ fn kilo_nonempty_mechanisms_use_kilo_paths_and_merge_contracts() {
         assert_eq!(artifact.scope, ArtifactScope::UserHome);
         serde_json::from_str::<serde_json::Value>(&artifact.content).unwrap()
     };
-    assert_eq!(
-        config("permission")["allow"],
-        serde_json::json!(["Shell(ls)"])
-    );
-    assert_eq!(
-        config("permission")["deny"],
-        serde_json::json!(["Shell(rm)"])
-    );
+    // Kilo's native `permission` object is a per-tool action map; generic
+    // allow/deny lists are unenforceable there, so the surface fails closed.
+    assert_eq!(support(&plan, "permissions"), Some(Support::Unsupported));
     assert_eq!(config("")["mcp"]["local"]["command"], "fixture-mcp");
     for item in ["hooks.session-start", "hooks.pre-tool-use", "plugins.extra"] {
         assert_eq!(support(&plan, item), Some(Support::Adapted));
@@ -95,7 +90,6 @@ fn kilo_nonempty_mechanisms_use_kilo_paths_and_merge_contracts() {
         "skills.audit",
         "commands.ship",
         "subagents.reviewer",
-        "permissions",
         "mcp-servers",
     ] {
         assert_eq!(support(&plan, item), Some(Support::Native));
