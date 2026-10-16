@@ -295,6 +295,11 @@ impl SidecarDelegate {
                 .next
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        // Backpressure: pause admitting new work while the outbound backlog
+        // is saturated; control paths (cancel/close/permission answers) are
+        // never gated, and no queued frame is ever dropped. A closed peer
+        // releases the wait; the establishment gate below still fails closed.
+        self.peer().await.outbound_headroom().await;
         let events = self.forwarder(id.clone()).await;
         let adapter = Adapter::new(spec).permission(Arc::new(RemotePermission {
             peer: self.peer.clone(),
@@ -424,6 +429,10 @@ impl SidecarDelegate {
             message: format!("unknown session: {session_id}"),
             data: None,
         })?;
+        // Backpressure: pause starting the turn while the outbound backlog
+        // is saturated. Waiting starts no work and starts no dispatch;
+        // cancel/close and in-flight control traffic keep flowing.
+        self.peer().await.outbound_headroom().await;
         let outcome = session
             .prompt(TurnRequest {
                 text,

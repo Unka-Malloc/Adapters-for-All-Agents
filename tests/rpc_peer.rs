@@ -498,3 +498,260 @@ async fn writer_and_reader_failures_share_one_close_notification() {
     .await
     .expect("reader/writer failure coordination stalled");
 }
+
+// ------------------ envelope failure classification ------------------
+
+/// One scripted response classification case over an in-memory transport.
+fn envelope_spec(success_field: Option<&str>, error_field: Option<&str>) -> a4aa::RpcEnvelopeSpec {
+    a4aa::RpcEnvelopeSpec {
+        method_field: "type".into(),
+        string_ids: true,
+        params_inline: true,
+        response_method: Some("response".into()),
+        result_field: Some("data".into()),
+        success_field: success_field.map(str::to_owned),
+        error_field: error_field.map(str::to_owned),
+        ..Default::default()
+    }
+}
+
+/// Drive one call whose scripted response frame is written by the server
+/// side; returns the call's outcome for classification assertions.
+async fn envelope_roundtrip(
+    spec: a4aa::RpcEnvelopeSpec,
+    response: Value,
+) -> Result<Value, CallFailure> {
+    use a4aa::framing::{read_frame, write_frame, DEFAULT_MAX_MESSAGE_BYTES};
+    let method_field = spec.method_field.clone();
+    let response_marker = spec.response_method.clone();
+    let (host, agent) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(host);
+    let peer = JsonRpcPeer::spawn_with_envelope(
+        reader,
+        writer,
+        Arc::new(Noop),
+        None,
+        DEFAULT_MAX_MESSAGE_BYTES,
+        Some(spec),
+    );
+    let (read, mut write) = tokio::io::split(agent);
+    let server = tokio::spawn(async move {
+        let mut read = tokio::io::BufReader::new(read);
+        let request = read_frame(&mut read, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut frame = response;
+        frame["id"] = request["id"].clone();
+        if let Some(marker) = &response_marker {
+            frame[method_field.clone()] = json!(marker);
+        }
+        write_frame(&mut write, &frame).await.unwrap();
+    });
+    let outcome = peer.call("get_state", json!({"value": 7})).await;
+    server.await.unwrap();
+    peer.close().await;
+    outcome
+}
+
+#[tokio::test]
+async fn envelope_response_classification_matrix() {
+    use a4aa::rpc::RpcErrorObject;
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        // The payload a remote failure must carry through untouched.
+        let remote_error = json!({"code": -32042, "message": "denied", "data": {"why": "test"}});
+        let expect_remote = |outcome: Result<Value, CallFailure>| match outcome {
+            Err(CallFailure::Remote(RpcErrorObject {
+                code,
+                message,
+                data,
+            })) => {
+                assert_eq!(code, -32042);
+                assert_eq!(message, "denied");
+                assert_eq!(data, Some(json!({"why": "test"})));
+            }
+            other => panic!("expected remote error, got {other:?}"),
+        };
+
+        // success + error fields declared (the pi shape):
+        let spec = || envelope_spec(Some("success"), Some("error"));
+        let ok = envelope_roundtrip(spec(), json!({"success": true, "data": {"ok": 1} })).await;
+        assert_eq!(ok.unwrap(), json!({"ok": 1}));
+        expect_remote(
+            envelope_roundtrip(
+                spec(),
+                json!({"success": false, "error": remote_error.clone()}),
+            )
+            .await,
+        );
+        // Contradictory success marker plus error content fails closed.
+        expect_remote(
+            envelope_roundtrip(
+                spec(),
+                json!({"success": true, "data": {"ok": 1}, "error": remote_error.clone()}),
+            )
+            .await,
+        );
+        // A missing declared success marker fails closed too.
+        expect_remote(
+            envelope_roundtrip(
+                spec(),
+                json!({"data": {"ok": 1}, "error": remote_error.clone()}),
+            )
+            .await,
+        );
+        match envelope_roundtrip(spec(), json!({"data": {"ok": 1}})).await {
+            Err(CallFailure::Remote(_)) => {}
+            other => panic!("missing success marker must fail closed, got {other:?}"),
+        }
+
+        // No success field: the configured error field alone drives failure.
+        let spec = || envelope_spec(None, Some("error"));
+        let ok = envelope_roundtrip(spec(), json!({"data": {"ok": 2}})).await;
+        assert_eq!(ok.unwrap(), json!({"ok": 2}));
+        expect_remote(
+            envelope_roundtrip(
+                spec(),
+                json!({"error": remote_error.clone(), "data": {"ok": 2}}),
+            )
+            .await,
+        );
+        // A null error value is the absence of failure, not one.
+        let ok = envelope_roundtrip(spec(), json!({"error": Value::Null, "data": {"ok": 3}})).await;
+        assert_eq!(ok.unwrap(), json!({"ok": 3}));
+
+        // A custom error field name is honoured on the read side.
+        match envelope_roundtrip(
+            envelope_spec(None, Some("failure")),
+            json!({"failure": "plain refusal"}),
+        )
+        .await
+        {
+            Err(CallFailure::Remote(error)) => {
+                assert_eq!(error.message, "plain refusal");
+                assert_eq!(error.data, Some(json!("plain refusal")));
+            }
+            other => panic!("expected remote error, got {other:?}"),
+        }
+    })
+    .await
+    .expect("envelope classification matrix stalled");
+}
+
+/// Encode/decode symmetry: an error the peer WRITES for an agent→host
+/// request reads back as the same remote failure on the answering side.
+#[tokio::test]
+async fn envelope_error_roundtrip_is_symmetric() {
+    let spec = envelope_spec(Some("success"), Some("error"));
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let (ar, aw) = tokio::io::split(a);
+    let (br, bw) = tokio::io::split(b);
+    let client = JsonRpcPeer::spawn_with_envelope(
+        ar,
+        aw,
+        Arc::new(Noop),
+        None,
+        a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+        Some(spec.clone()),
+    );
+    let server = JsonRpcPeer::spawn_with_envelope(
+        br,
+        bw,
+        Arc::new(Echo),
+        None,
+        a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+        Some(spec),
+    );
+    match client.call("fail", Value::Null).await {
+        Err(CallFailure::Remote(error)) => {
+            assert_eq!(error.code, -32000);
+            assert_eq!(error.message, "deliberate");
+            assert_eq!(error.data, Some(json!({"why": "test"})));
+        }
+        other => panic!("expected remote error, got {other:?}"),
+    }
+    client.close().await;
+    server.close().await;
+}
+
+// --------------------- outbound send budget ---------------------
+
+/// Queue past the budget with a non-reading remote: admission waits, nothing
+/// is dropped, and draining the remote releases headroom in wire order.
+#[tokio::test]
+async fn outbound_budget_backpressure_and_exact_accounting() {
+    use a4aa::framing::read_frame;
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(client);
+        let peer = JsonRpcPeer::spawn(reader, writer, Arc::new(Noop), None, 4096);
+        let (server_reader, _server_writer) = tokio::io::split(server);
+        let mut server_reader = tokio::io::BufReader::new(server_reader);
+        let payload = "x".repeat(1024 * 1024);
+        // Five ~1 MiB frames exceed the four-frame budget.
+        for index in 0..5 {
+            peer.notify("note", json!({"index": index, "data": payload}))
+                .unwrap();
+        }
+        assert!(peer.outbound_saturated());
+        // Headroom never releases while the remote is not reading.
+        {
+            let headroom = peer.outbound_headroom();
+            tokio::pin!(headroom);
+            tokio::select! {
+                _ = &mut headroom => panic!("headroom released without a drain"),
+                _ = std::future::ready(()) => {}
+            }
+        }
+        // Drain the remote: every frame arrives once, in queue order.
+        for index in 0..5 {
+            let frame = read_frame(&mut server_reader, 4 * 1024 * 1024)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame["method"], "note");
+            assert_eq!(frame["params"]["index"], index);
+            assert_eq!(frame["params"]["data"].as_str().unwrap().len(), 1024 * 1024);
+        }
+        // Every charge is released once its write completes.
+        tokio::time::timeout(test_settings::WAIT_BUDGET, peer.outbound_headroom())
+            .await
+            .expect("headroom never released after the drain");
+        assert!(!peer.outbound_saturated());
+        peer.close().await;
+    })
+    .await
+    .expect("outbound budget accounting stalled");
+}
+
+/// A writer failure with a saturated backlog still settles pending calls and
+/// releases every queued charge exactly once (round-7 failure propagation).
+#[tokio::test]
+async fn writer_failure_releases_queued_budget_and_settles_pending() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(client);
+        let peer = JsonRpcPeer::spawn(reader, writer, Arc::new(Noop), None, 4096);
+        let payload = "x".repeat(1024 * 1024);
+        for _ in 0..5 {
+            peer.notify("note", json!({"data": payload})).unwrap();
+        }
+        assert!(peer.outbound_saturated());
+        let pending = peer.start_call("open", json!({})).unwrap();
+        // The remote vanishes: the next write fails for real.
+        drop(server);
+        assert!(matches!(
+            pending.wait().await,
+            Err(CallFailure::Transport(_))
+        ));
+        // The failure drain released every queued charge: the budget reads
+        // unsaturated and headroom is immediate.
+        assert!(!peer.outbound_saturated());
+        peer.outbound_headroom().await;
+        peer.close().await;
+    })
+    .await
+    .expect("writer failure left the budget charged");
+}

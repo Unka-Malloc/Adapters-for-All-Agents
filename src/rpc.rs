@@ -13,7 +13,7 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -23,6 +23,13 @@ use tokio::task::JoinHandle;
 use crate::framing::{self, FrameError};
 use crate::model::RpcEnvelopeSpec;
 use crate::observe::{Direction, SharedObserver};
+
+/// Outbound backpressure budget: bytes queued for the writer but not yet
+/// written. Sized as four maximum frames plus line slack, so several
+/// full-size frames can be in flight while the queued backlog stays bounded.
+/// This is backpressure for admission ([`JsonRpcPeer::outbound_headroom`]) —
+/// never a quota that fails work or drops a frame.
+pub const DEFAULT_MAX_QUEUED_SEND_BYTES: usize = 4 * framing::DEFAULT_MAX_MESSAGE_BYTES + 1024;
 
 /// Wire error object for a failed request.
 #[derive(Clone, Debug)]
@@ -125,6 +132,13 @@ struct PeerState {
     /// notification-queue EOF) shared by the reader's and writer's failure
     /// paths and by explicit close.
     ingress_closed: AtomicBool,
+    /// Bytes serialized for the writer but not yet written. Charged at
+    /// enqueue, released when the write completes; the writer's failure
+    /// drain releases every queued frame's charge exactly once.
+    queued_send_bytes: AtomicUsize,
+    /// Wakes admission waiters when the backlog drains below the budget or
+    /// the peer closes.
+    headroom_notice: Notify,
 }
 
 impl PeerState {
@@ -133,9 +147,19 @@ impl PeerState {
         // lock after the flag is visible rejects instead of orphaning.
         self.closed.store(true, Ordering::Relaxed);
         self.closed_notice.notify_waiters();
+        self.headroom_notice.notify_waiters();
         let mut pending = self.pending.lock().unwrap();
         for (_, reply) in pending.map.drain() {
             let _ = reply.send(Err(CallFailure::Transport(reason.into())));
+        }
+    }
+
+    /// Release one frame's queued-send charge; wake admission waiters when
+    /// the backlog falls back below the budget.
+    fn release_queued_send(&self, bytes: usize) {
+        let remaining = self.queued_send_bytes.fetch_sub(bytes, Ordering::Relaxed) - bytes;
+        if remaining < DEFAULT_MAX_QUEUED_SEND_BYTES {
+            self.headroom_notice.notify_waiters();
         }
     }
 
@@ -167,8 +191,9 @@ impl PeerState {
 /// `Arc`.
 pub struct JsonRpcPeer {
     /// `None` once `close` has taken the sender — that drop ends the writer
-    /// task, which half-closes the transport.
-    writer: Mutex<Option<mpsc::UnboundedSender<Value>>>,
+    /// task, which half-closes the transport. Frames travel as pre-serialized
+    /// lines so the queued-send charge equals the exact wire bytes.
+    writer: Mutex<Option<mpsc::UnboundedSender<String>>>,
     state: Arc<PeerState>,
     next_id: AtomicU64,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -208,7 +233,7 @@ impl JsonRpcPeer {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Value>();
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<String>();
         // Preserve notification order without blocking responses or inbound
         // requests. EOF is queued after the last event, so completion cannot
         // be overtaken by the transport closing.
@@ -222,6 +247,8 @@ impl JsonRpcPeer {
             closed_notice: Notify::new(),
             notifications,
             ingress_closed: AtomicBool::new(false),
+            queued_send_bytes: AtomicUsize::new(0),
+            headroom_notice: Notify::new(),
         });
 
         // A real write/flush failure on the outbound transport must reach
@@ -233,11 +260,18 @@ impl JsonRpcPeer {
         let writer_task = tokio::spawn(async move {
             let mut writer = writer;
             let mut failed = false;
-            while let Some(frame) = writer_rx.recv().await {
+            while let Some(line) = writer_rx.recv().await {
                 if let Some(observer) = writer_observer.as_ref() {
-                    observer.record("rpc", Direction::Sent, frame.to_string().as_bytes());
+                    observer.record("rpc", Direction::Sent, line.as_bytes());
                 }
-                if framing::write_frame(&mut writer, &frame).await.is_err() {
+                let result = async {
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await
+                }
+                .await;
+                writer_state.release_queued_send(line.len() + 1);
+                if result.is_err() {
                     failed = true;
                     break;
                 }
@@ -250,6 +284,13 @@ impl JsonRpcPeer {
                 failed = true;
             }
             if failed {
+                // Release every queued frame's charge exactly once: close the
+                // channel first so a racing enqueue fails (and uncharges
+                // itself) instead of queuing past the drain.
+                writer_rx.close();
+                while let Ok(line) = writer_rx.try_recv() {
+                    writer_state.release_queued_send(line.len() + 1);
+                }
                 writer_state.transport_failed("writer_failed", &writer_delegate);
             }
         });
@@ -352,9 +393,10 @@ impl JsonRpcPeer {
         match frame.get("id") {
             Some(id) => {
                 let id = id.clone();
-                let Some(writer) = self.writer.lock().unwrap().clone() else {
+                if self.writer.lock().unwrap().is_none() {
                     return;
-                };
+                }
+                let peer = Arc::clone(self);
                 tokio::spawn(async move {
                     // The delegate runs on a nested task: a panic there
                     // surfaces as a JoinError here, so the peer always gets
@@ -381,7 +423,7 @@ impl JsonRpcPeer {
                             }
                         }),
                     };
-                    let _ = writer.send(response);
+                    let _ = peer.enqueue(response);
                 });
             }
             None => {
@@ -396,7 +438,7 @@ impl JsonRpcPeer {
     /// whose `method_field` equals `response_method` completes a pending
     /// call; any other `id`-bearing frame is an agent→host request; an
     /// id-less frame is a notification.
-    fn dispatch_envelope(&self, frame: Value, delegate: Arc<dyn RpcDelegate>) {
+    fn dispatch_envelope(self: &Arc<Self>, frame: Value, delegate: Arc<dyn RpcDelegate>) {
         let Some(envelope) = &self.envelope else {
             return;
         };
@@ -414,10 +456,21 @@ impl JsonRpcPeer {
             let reply =
                 id_key(&id).and_then(|key| self.state.pending.lock().unwrap().map.remove(&key));
             if let Some(reply) = reply {
-                let failed = envelope
-                    .success_field
-                    .as_deref()
-                    .is_some_and(|field| frame.get(field) == Some(&Value::Bool(false)));
+                // Classification matrix: with a declared success marker the
+                // response must read `true` to succeed — `false`, a missing
+                // marker, or contradictory error content all fail closed.
+                // Without a success marker, configured error content marks
+                // failure and its absence means success. Either way the
+                // remote code, message and data are preserved.
+                let error_content = frame
+                    .get(envelope.error_field.as_deref().unwrap_or("error"))
+                    .filter(|error| !error.is_null());
+                let failed = match envelope.success_field.as_deref() {
+                    Some(field) => {
+                        frame.get(field) != Some(&Value::Bool(true)) || error_content.is_some()
+                    }
+                    None => error_content.is_some(),
+                };
                 let outcome = if failed {
                     let error = frame
                         .get(envelope.error_field.as_deref().unwrap_or("error"))
@@ -435,7 +488,15 @@ impl JsonRpcPeer {
                                     .map(str::to_owned)
                             })
                             .unwrap_or_else(|| "remote error".to_owned()),
-                        data: (!error.is_null()).then_some(error),
+                        // Symmetric with the write side: an object error's
+                        // `data` member is the payload; a bare string or
+                        // other scalar error is preserved whole.
+                        data: match &error {
+                            Value::Object(_) => {
+                                error.get("data").cloned().filter(|data| !data.is_null())
+                            }
+                            _ => (!error.is_null()).then_some(error.clone()),
+                        },
                     }))
                 } else {
                     Ok(frame
@@ -449,9 +510,10 @@ impl JsonRpcPeer {
         }
         match id {
             Some(id) => {
-                let Some(writer) = self.writer.lock().unwrap().clone() else {
+                if self.writer.lock().unwrap().is_none() {
                     return;
-                };
+                }
+                let peer = Arc::clone(self);
                 let method_field = envelope.method_field.clone();
                 let response_method = envelope.response_method.clone();
                 let command_field = envelope.command_field.clone();
@@ -499,7 +561,7 @@ impl JsonRpcPeer {
                             );
                         }
                     }
-                    let _ = writer.send(Value::Object(response));
+                    let _ = peer.enqueue(Value::Object(response));
                 });
             }
             None => {
@@ -558,9 +620,9 @@ impl JsonRpcPeer {
         if self.state.closed.load(Ordering::Relaxed) {
             return Err(CallFailure::Transport("peer_closed".into()));
         }
-        let Some(writer) = self.writer.lock().unwrap().clone() else {
+        if self.writer.lock().unwrap().is_none() {
             return Err(CallFailure::Transport("peer_closed".into()));
-        };
+        }
         let serial = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (wire_id, key) = if self
             .envelope
@@ -585,7 +647,7 @@ impl JsonRpcPeer {
             pending.map.insert(key.clone(), tx);
         }
         let frame = self.encode_frame(method, params, Some(wire_id));
-        if writer.send(frame).is_err() {
+        if self.enqueue(frame).is_err() {
             self.state.pending.lock().unwrap().map.remove(&key);
             return Err(CallFailure::Transport("writer_closed".into()));
         }
@@ -597,13 +659,55 @@ impl JsonRpcPeer {
         if self.state.closed.load(Ordering::Relaxed) {
             return Err(CallFailure::Transport("peer_closed".into()));
         }
+        if self.writer.lock().unwrap().is_none() {
+            return Err(CallFailure::Transport("peer_closed".into()));
+        }
+        let frame = self.encode_frame(method, params, None);
+        self.enqueue(frame)
+    }
+
+    /// Serialize one frame and queue it for the writer, charging the
+    /// queued-send budget with the exact wire bytes. Queueing never blocks
+    /// and frames are never dropped: the budget exists for admission
+    /// control (`outbound_headroom`), not as a quota on traffic.
+    fn enqueue(&self, frame: Value) -> Result<(), CallFailure> {
         let Some(writer) = self.writer.lock().unwrap().clone() else {
             return Err(CallFailure::Transport("peer_closed".into()));
         };
-        let frame = self.encode_frame(method, params, None);
-        writer
-            .send(frame)
-            .map_err(|_| CallFailure::Transport("writer_closed".into()))
+        // A serde_json::Value always serializes.
+        let line = serde_json::to_string(&frame).unwrap_or_default();
+        // +1 for the line terminator the writer appends.
+        let bytes = line.len() + 1;
+        self.state
+            .queued_send_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        if writer.send(line).is_err() {
+            self.state
+                .queued_send_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+            return Err(CallFailure::Transport("writer_closed".into()));
+        }
+        Ok(())
+    }
+
+    /// Whether queued-but-unsent outbound bytes have reached the budget.
+    pub fn outbound_saturated(&self) -> bool {
+        self.state.queued_send_bytes.load(Ordering::Relaxed) >= DEFAULT_MAX_QUEUED_SEND_BYTES
+    }
+
+    /// Wait until the queued-send backlog drains below the budget, or the
+    /// peer closes. Admission control for work-starting requests: pausing
+    /// here never fails work and never drops a queued frame.
+    pub async fn outbound_headroom(&self) {
+        loop {
+            let headroom = self.state.headroom_notice.notified();
+            tokio::pin!(headroom);
+            headroom.as_mut().enable();
+            if !self.outbound_saturated() || self.state.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            headroom.await;
+        }
     }
 
     /// Wait for transport closure, including explicit close after an ack.
