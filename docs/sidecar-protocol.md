@@ -48,6 +48,12 @@ lanes. Typed adapter errors appear in the JSON-RPC error's `data` object as
 
 ## Lifecycle
 
-stdin EOF is the shutdown signal: the sidecar closes every open session
-(terminating agent process trees), fails pending calls with
-`peer_closed`, and exits 0.
+`session/close` also closes an active turn through the shared session handle.
+It acknowledges only after process cleanup; new prompts are rejected once
+closing starts. A cleanup failure remains visible through the retained session
+entry; a successful close removes the entry.
+
+stdin EOF closes every open session, including sessions still referenced by
+active requests. Pending turns settle with cancellation or a closed-session
+error; calls left on a closed transport fail with `peer_closed`. The sidecar
+exits 0 after successful cleanup, or nonzero if session cleanup fails.

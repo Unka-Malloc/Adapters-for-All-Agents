@@ -33,9 +33,17 @@ It is a breaking update from 0.1.x; update the core and adapter crates together.
 - Keep dispatched RPC turns owned by the session driver when a caller drops
   its waiting future; serialize request admission with explicit cancellation.
 - Clean up descendants before reaping exited process-group leaders. On macOS,
-  distinguish zombie-only groups from real signal permission failures.
+  distinguish groups already in exit from real signal permission failures.
 - Preserve required empty prompt arguments and JSON fields; omit only optional
   selectors that were not provided.
+- Interpret removable CLI flags from literal templates, never expanded user text.
+- Close active sessions through shared handles, including sidecar close and EOF,
+  and reject new work once closing starts. Preserve cleanup failures without
+  acknowledging a successful close.
+- Propagate required RPC initialized-notification failures at the handshake stage.
+- Resume Codex sessions without replaying historical turn payloads to the host.
+  Fail pending RPC calls when a frame cannot be decoded instead of waiting for
+  a response that was discarded.
 - Derive card-generated CLI usage paths from the card's live usage declaration.
 - Protect flat RPC control fields from parameter overrides, and surface
   contradictory model acknowledgements and invalid session receipts.

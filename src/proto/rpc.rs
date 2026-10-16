@@ -14,6 +14,7 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
@@ -71,6 +72,8 @@ struct RpcState {
     control: std::sync::Mutex<TurnControl>,
     /// Serializes prompt turns.
     turn_lock: Arc<Mutex<()>>,
+    closing: AtomicBool,
+    close_lock: Mutex<bool>,
 }
 
 #[derive(Default)]
@@ -491,7 +494,7 @@ impl RpcLane {
             )
             .await?;
             if let Some(initialized) = &self.spec.initialized {
-                let _ = peer.notify(initialized, Value::Object(serde_json::Map::new()));
+                send_initialized(&peer, initialized)?;
             }
         }
 
@@ -542,6 +545,8 @@ impl RpcLane {
                 cwd,
                 control: std::sync::Mutex::new(TurnControl::default()),
                 turn_lock: Arc::new(Mutex::new(())),
+                closing: AtomicBool::new(false),
+                close_lock: Mutex::new(false),
             }),
         })
     }
@@ -566,6 +571,12 @@ impl RpcSession {
         effort: Option<&str>,
     ) -> Result<TurnOutcome, AdapterError> {
         let serial = self.state.turn_lock.clone().lock_owned().await;
+        if self.state.closing.load(Ordering::Acquire) {
+            return Err(AdapterError::permanent(
+                "agent_session_closed",
+                "rpc/prompt",
+            ));
+        }
         {
             let mut control = self.state.control.lock().unwrap();
             if control.recovery_required {
@@ -611,7 +622,7 @@ impl RpcSession {
     ) -> Result<Value, AdapterError> {
         self.state.call_passthrough(method, params).await
     }
-    pub async fn close(self) -> Result<(), AdapterError> {
+    pub async fn close(&self) -> Result<(), AdapterError> {
         self.state.close().await
     }
 }
@@ -893,6 +904,9 @@ impl RpcState {
         method: &str,
         params: Value,
     ) -> Result<Value, AdapterError> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(AdapterError::permanent("agent_session_closed", "rpc/call"));
+        }
         if !self.spec.passthrough.iter().any(|entry| entry == method) {
             return Err(AdapterError::permanent(
                 "agent_method_not_admitted",
@@ -903,6 +917,11 @@ impl RpcState {
     }
 
     pub async fn close(&self) -> Result<(), AdapterError> {
+        self.closing.store(true, Ordering::Release);
+        let mut closed = self.close_lock.lock().await;
+        if *closed {
+            return Ok(());
+        }
         let active = {
             let mut control = self.control.lock().unwrap();
             if control.active {
@@ -921,8 +940,18 @@ impl RpcState {
         }
         self.peer.close().await;
         let mut child = self.child.lock().await;
-        child.terminate().await.map(|_| ())
+        child.terminate().await?;
+        *closed = true;
+        Ok(())
     }
+}
+
+fn send_initialized(peer: &JsonRpcPeer, method: &str) -> Result<(), AdapterError> {
+    peer.notify(method, Value::Object(serde_json::Map::new()))
+        .map_err(|error| {
+            AdapterError::uncertain("agent_initialize_failed", "rpc/initialized")
+                .with_detail(format!("{error:?}"))
+        })
 }
 
 async fn call(peer: &JsonRpcPeer, spec: &RpcCallSpec, vars: &Vars) -> Result<Value, AdapterError> {
@@ -1051,6 +1080,20 @@ mod ingress_tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn initialized_notification_failure_keeps_its_handshake_stage() {
+        struct Sink;
+        #[async_trait::async_trait]
+        impl RpcDelegate for Sink {}
+        let (client, _server) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(client);
+        let peer = JsonRpcPeer::spawn(reader, writer, Arc::new(Sink), None, 1024);
+        peer.close().await;
+        let error = send_initialized(&peer, "initialized").unwrap_err();
+        assert_eq!(error.code, "agent_initialize_failed");
+        assert_eq!(error.stage, "rpc/initialized");
+    }
 
     #[derive(Default)]
     struct SlowHost {

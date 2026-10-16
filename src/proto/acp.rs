@@ -27,6 +27,7 @@ use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
@@ -230,9 +231,12 @@ struct OutputSink {
     send: mpsc::UnboundedSender<OutputCommand>,
 }
 impl OutputSink {
-    fn new(state: Arc<std::sync::Mutex<TurnState>>, delegate: Arc<dyn SessionDelegate>) -> Self {
+    fn new(
+        state: Arc<std::sync::Mutex<TurnState>>,
+        delegate: Arc<dyn SessionDelegate>,
+    ) -> (Self, JoinHandle<()>) {
         let (send, mut receive) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             while let Some(command) = receive.recv().await {
                 match command {
                     OutputCommand::Event(event) => delegate.on_event(event).await,
@@ -242,7 +246,7 @@ impl OutputSink {
                 }
             }
         });
-        Self { state, send }
+        (Self { state, send }, worker)
     }
     // Runs inline in the SDK notification dispatcher. Admission happens
     // before enqueueing, so callbacks cannot retain unbounded source payloads
@@ -318,14 +322,26 @@ enum SessionCommand {
         turn: ActiveTurn,
         reply: oneshot::Sender<Result<TurnOutcome, AdapterError>>,
     },
+    // Wake the command loop after shared process termination, including
+    // when close was called from a protocol callback in the driver itself.
     Close,
+}
+
+async fn stop_owned_task(task: JoinHandle<()>) {
+    if tokio::task::try_id() != Some(task.id()) {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 /// An open ACP session: one process, one connection, one session id.
 pub struct AcpSession {
     command: mpsc::UnboundedSender<SessionCommand>,
     connection: ConnectionTo<Agent>,
-    driver: JoinHandle<()>,
+    driver: Mutex<Option<JoinHandle<()>>>,
+    output_worker: Mutex<Option<JoinHandle<()>>>,
+    child: Arc<Mutex<SupervisedChild>>,
+    closed: AtomicBool,
     session_id: String,
     capabilities: Capabilities,
     agent_info: Option<AgentInfo>,
@@ -403,6 +419,12 @@ impl AcpSession {
     /// agent cannot express fails the turn rather than being ignored.
     pub async fn prompt(&self, request: TurnRequest) -> Result<TurnOutcome, AdapterError> {
         let serial = self.prompt_lock.clone().lock_owned().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(AdapterError::permanent(
+                "agent_session_closed",
+                "session/prompt",
+            ));
+        }
         {
             let mut state = self.turn_state.lock().unwrap();
             *state = TurnState {
@@ -448,12 +470,21 @@ impl AcpSession {
             })
     }
 
-    /// Close the session: end the command loop, let the connection finish,
-    /// and terminate the process tree.
-    pub async fn close(self) -> Result<(), AdapterError> {
+    /// Shared, idempotent close: terminate the process even during a prompt
+    /// or a blocked host callback, then stop this session's protocol tasks.
+    pub async fn close(&self) -> Result<(), AdapterError> {
+        self.closed.store(true, Ordering::Release);
+        let mut driver = self.driver.lock().await;
+        self.child.lock().await.terminate().await?;
         let _ = self.command.send(SessionCommand::Close);
-        drop(self.command);
-        let _ = self.driver.await;
+        if let Some(driver) = driver.take() {
+            stop_owned_task(driver).await;
+        }
+        if let Some(worker) = self.output_worker.lock().await.take() {
+            // A host may close from on_event itself. Do not abort/await the
+            // callback's own task; its closed queue ends after it returns.
+            stop_owned_task(worker).await;
+        }
         Ok(())
     }
 }
@@ -501,12 +532,13 @@ impl AcpLane {
             remaining: self.max_output_bytes,
             ..Default::default()
         }));
-        let output = OutputSink::new(turn_state.clone(), delegate.clone());
+        let (output, output_worker) = OutputSink::new(turn_state.clone(), delegate.clone());
+        let child = Arc::new(Mutex::new(child));
 
         let driver = tokio::spawn(drive(
             client_name,
             delegate,
-            child,
+            child.clone(),
             child_stdin,
             child_stdout,
             ServeContext {
@@ -523,11 +555,28 @@ impl AcpLane {
 
         let opened = ready_rx
             .await
-            .map_err(|_| AdapterError::uncertain("agent_connection_closed", "session/open"))??;
+            .map_err(|_| AdapterError::uncertain("agent_connection_closed", "session/open"))
+            .and_then(|opened| opened);
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                // Finish owned process cleanup before aborting protocol tasks;
+                // an interrupted cleanup must not obscure the setup failure.
+                child.lock().await.terminate().await?;
+                driver.abort();
+                let _ = driver.await;
+                output_worker.abort();
+                let _ = output_worker.await;
+                return Err(error);
+            }
+        };
         Ok(AcpSession {
             command: command_tx,
             connection: opened.connection,
-            driver,
+            driver: Mutex::new(Some(driver)),
+            output_worker: Mutex::new(Some(output_worker)),
+            child,
+            closed: AtomicBool::new(false),
             session_id: opened.session_id,
             capabilities: opened.capabilities,
             agent_info: opened.agent_info,
@@ -567,7 +616,7 @@ struct ServeContext {
 async fn drive(
     client_name: String,
     delegate: Arc<dyn SessionDelegate>,
-    mut child: SupervisedChild,
+    child: Arc<Mutex<SupervisedChild>>,
     child_stdin: tokio::process::ChildStdin,
     child_stdout: tokio::process::ChildStdout,
     mut context: ServeContext,
@@ -619,7 +668,7 @@ async fn drive(
 
     // The connection is closed (or failed) — either way the process tree
     // must not outlive the session.
-    let _ = child.terminate().await;
+    let _ = child.lock().await.terminate().await;
 
     if let Err(error) = outcome {
         // Handshake failures surface through `ready` if it is still pending;
@@ -669,35 +718,34 @@ async fn serve(
     }
 
     while let Some(command) = commands.recv().await {
-        match command {
+        let (request, turn, reply) = match command {
             SessionCommand::Prompt {
                 request,
                 turn,
                 reply,
-            } => {
-                // A std::sync::MutexGuard is not Send across `.await`:
-                // take a working copy, run the turn against it, then write
-                // the resulting session state back.
-                let mut working = state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
-                let mut outcome =
-                    run_prompt(&connection, &session_id, &mut working, request, &turn.state).await;
-                *state.lock().unwrap_or_else(|error| error.into_inner()) = working;
-                if let Err(error) = context.output.drain().await {
-                    outcome = Err(error);
-                }
-                if let Ok(outcome) = &mut outcome {
-                    outcome.truncated = turn.state.lock().unwrap().truncated;
-                }
-                // Clear the old turn before allowing the caller to enqueue
-                // another; retaining the owned guard also protects dropped callers.
-                drop(turn);
-                let _ = reply.send(outcome);
-            }
+            } => (request, turn, reply),
             SessionCommand::Close => return Ok(()),
+        };
+        // A std::sync::MutexGuard is not Send across `.await`:
+        // take a working copy, run the turn against it, then write
+        // the resulting session state back.
+        let mut working = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let mut outcome =
+            run_prompt(&connection, &session_id, &mut working, request, &turn.state).await;
+        *state.lock().unwrap_or_else(|error| error.into_inner()) = working;
+        if let Err(error) = context.output.drain().await {
+            outcome = Err(error);
         }
+        if let Ok(outcome) = &mut outcome {
+            outcome.truncated = turn.state.lock().unwrap().truncated;
+        }
+        // Clear the old turn before allowing the caller to enqueue
+        // another; retaining the owned guard also protects dropped callers.
+        drop(turn);
+        let _ = reply.send(outcome);
     }
     Ok(())
 }

@@ -233,8 +233,7 @@ impl SupervisedChild {
             #[cfg(target_os = "macos")]
             Err(error)
                 if error.raw_os_error() == Some(libc::EPERM)
-                    && self.leader_exited()?
-                    && self.group_only_has_zombies()? =>
+                    && self.group_has_no_running_members()? =>
             {
                 Ok(())
             }
@@ -243,11 +242,13 @@ impl SupervisedChild {
         }
     }
 
-    // Darwin returns EPERM for a zombie-only process group. Do not treat
-    // arbitrary permission denial as successful termination: the kernel must
-    // confirm every remaining member is a zombie while our leader is unreaped.
+    // Darwin returns EPERM once all members have entered exit(), before the
+    // leader necessarily becomes waitable. Do not accept arbitrary permission
+    // denial: the kernel must confirm every member is exiting or a zombie,
+    // while the unreaped leader still reserves the process-group identity.
     #[cfg(target_os = "macos")]
-    fn group_only_has_zombies(&self) -> io::Result<bool> {
+    fn group_has_no_running_members(&self) -> io::Result<bool> {
+        const PROC_FLAG_INEXIT: u32 = 4; // sys/proc_info.h, process is inside exit().
         let pgid = self
             .pid
             .ok_or_else(|| io::Error::other("missing child identity"))?;
@@ -259,10 +260,13 @@ impl SupervisedChild {
                 .and_then(|n| i32::try_from(n).ok())
                 .ok_or_else(|| io::Error::other("process-group listing exceeds OS buffer size"))?;
             let count = unsafe {
+                *libc::__error() = 0;
                 libc::proc_listpgrppids(pgid as libc::pid_t, members.as_mut_ptr().cast(), bytes)
             };
             if count <= 0 {
-                return Ok(false);
+                return Ok(count == 0
+                    && io::Error::last_os_error().raw_os_error() == Some(0)
+                    && self.leader_exited()?);
             }
             if count as usize == members.len() {
                 members.resize(members.len() * 2, 0);
@@ -283,7 +287,9 @@ impl SupervisedChild {
                 if read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
                     continue; // Reaped after the group listing.
                 }
-                if read != length || info.pbi_status != libc::SZOMB {
+                if read != length
+                    || (info.pbi_status != libc::SZOMB && info.pbi_flags & PROC_FLAG_INEXIT == 0)
+                {
                     return Ok(false);
                 }
             }

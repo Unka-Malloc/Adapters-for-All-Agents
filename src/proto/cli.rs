@@ -184,6 +184,21 @@ impl CliLane {
         // A subscription starts at the current version, so idle cancellation
         // never carries over to a later turn.
         let cancelled = self.cancelled.subscribe();
+        self.run_turn_subscribed(request, prompt, model, effort, events, cancelled)
+            .await
+    }
+
+    /// The facade subscribes before its shared-close check, so closing cannot
+    /// fall into a gap between admission and cancellation subscription.
+    pub(crate) async fn run_turn_subscribed(
+        &self,
+        request: &SessionRequest,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        events: mpsc::UnboundedSender<AgentEvent>,
+        cancelled: watch::Receiver<()>,
+    ) -> Result<TurnOutcome, AdapterError> {
         // The effective session binding: an explicitly requested resume
         // first, then whatever the agent already reported on stdout or a
         // session-creation command.
@@ -781,6 +796,7 @@ fn effective_stream(requested: StreamMode) -> StreamMode {
 fn substitute_args(args: &[String], vars: &Vars) -> (Vec<String>, bool) {
     let mut used_prompt = false;
     let mut resolved = Vec::with_capacity(args.len());
+    let mut previous_literal_flag = false;
     for arg in args {
         if arg.contains("{prompt}") {
             used_prompt = true;
@@ -792,17 +808,17 @@ fn substitute_args(args: &[String], vars: &Vars) -> (Vec<String>, bool) {
             .any(|key| arg.ends_with(&format!("={{{key}}}")) || *arg == format!("--{{{key}}}"));
         let text = substitute_text(arg, vars);
         if vars.is_absent_option(arg) {
-            if resolved
-                .last()
-                .is_some_and(|flag: &String| flag.starts_with('-'))
-            {
+            if previous_literal_flag {
                 resolved.pop();
             }
+            previous_literal_flag = false;
             continue;
         }
         if dangling {
+            previous_literal_flag = false;
             continue;
         }
+        previous_literal_flag = arg.starts_with('-') && !arg.contains('{');
         resolved.push(text);
     }
     (resolved, !used_prompt)

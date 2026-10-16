@@ -1209,6 +1209,38 @@ async fn cli_empty_prompt_keeps_headless_argv_and_rejects_empty_model() {
 }
 
 #[tokio::test]
+async fn optional_selector_never_removes_a_hyphenated_prompt() {
+    let mut spec = cli("", StreamMode::Stdio, false);
+    spec.command = CommandSpec {
+        program: "python3".into(),
+        args: vec![
+            "-c".into(),
+            "import json,sys;print(json.dumps(sys.argv[1:]))".into(),
+        ],
+        cwd: None,
+        env: EnvPolicy::default(),
+    };
+    let LaneSpec::Cli(lane) = &mut spec.lane else {
+        unreachable!()
+    };
+    lane.args = vec!["--print".into(), "{prompt}".into(), "{model}".into()];
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    let result = session
+        .prompt(TurnRequest {
+            text: "--literal-user-text".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let args: Vec<String> = serde_json::from_str(&result.text).unwrap();
+    assert_eq!(args, vec!["--print", "--literal-user-text"]);
+}
+
+#[tokio::test]
 async fn cancellation_cleans_descendants_after_the_agent_leader_exits() {
     for mode in ["stdio", "pty", "rpc"] {
         tokio::time::timeout(test_settings::WAIT_BUDGET, async {

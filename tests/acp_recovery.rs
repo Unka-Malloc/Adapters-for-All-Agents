@@ -7,6 +7,94 @@ mod test_settings;
 use a4aa::{Adapter, AgentEvent, AgentSpec, CommandSpec, LaneSpec, SessionRequest, TurnRequest};
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn host_callbacks_can_close_their_own_session() {
+    use a4aa::proto::acp::{
+        AcpLane, AcpSession, PermissionDecision, PermissionPrompt, SessionDelegate,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+    struct Closer {
+        session: OnceLock<Arc<AcpSession>>,
+        permission: bool,
+        requested: AtomicBool,
+        finished: tokio::sync::Notify,
+    }
+    impl Closer {
+        async fn close_once(&self) {
+            if !self.requested.swap(true, Ordering::Relaxed) {
+                self.session.get().unwrap().close().await.unwrap();
+                self.finished.notify_one();
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl SessionDelegate for Closer {
+        async fn on_event(&self, _: AgentEvent) {
+            if !self.permission {
+                self.close_once().await;
+            }
+        }
+        async fn on_permission(&self, _: PermissionPrompt) -> PermissionDecision {
+            if self.permission {
+                self.close_once().await;
+            }
+            PermissionDecision::Cancelled
+        }
+    }
+    for permission in [false, true] {
+        tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+            let callback = Arc::new(Closer {
+                session: OnceLock::new(),
+                permission,
+                requested: AtomicBool::new(false),
+                finished: tokio::sync::Notify::new(),
+            });
+            let lane = AcpLane {
+                max_output_bytes: Some(4096),
+                command: CommandSpec {
+                    program: env!("CARGO_BIN_EXE_a4aa").into(),
+                    args: vec!["fixture-agent".into()],
+                    cwd: None,
+                    env: Default::default(),
+                },
+                mcp_servers: vec![],
+                prefer_load: false,
+                client_name: "close-fixture".into(),
+                secrets: Arc::new(a4aa::NoSecrets),
+                observer: None,
+            };
+            let session = Arc::new(
+                lane.open(SessionRequest::default(), callback.clone())
+                    .await
+                    .unwrap(),
+            );
+            assert!(callback.session.set(session.clone()).is_ok());
+            let request = TurnRequest {
+                text: if permission {
+                    "needs permission"
+                } else {
+                    "hello"
+                }
+                .into(),
+                ..Default::default()
+            };
+            let (_outcome, ()) =
+                tokio::join!(session.prompt(request), callback.finished.notified());
+            let error = session
+                .prompt(TurnRequest {
+                    text: "after close".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "agent_session_closed");
+        })
+        .await
+        .expect("callback close awaited or aborted its own task");
+    }
+}
+
 fn fixture(script: &str, cwd: &std::path::Path, limit: Option<usize>) -> Adapter {
     Adapter::new(AgentSpec {
         id: "acp-fixture".into(),

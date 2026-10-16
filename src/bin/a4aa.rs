@@ -361,14 +361,14 @@ impl SidecarDelegate {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let session = self.sessions.inner.lock().await.remove(&session_id);
+        let session = self.sessions.inner.lock().await.get(&session_id).cloned();
         match session {
             Some(session) => {
-                match Arc::try_unwrap(session) {
-                    Ok(session) => session.close().await,
-                    Err(_) => Ok(()), // still referenced by an in-flight turn
-                }
-                .map_err(|error| adapter_error(&error))?;
+                session
+                    .close()
+                    .await
+                    .map_err(|error| adapter_error(&error))?;
+                self.sessions.inner.lock().await.remove(&session_id);
                 Ok(json!({}))
             }
             None => Ok(json!({})),
@@ -400,12 +400,14 @@ async fn serve() -> i32 {
         let mut sessions = delegate.sessions.inner.lock().await;
         sessions.drain().map(|(_, session)| session).collect()
     };
+    let mut exit = 0;
     for session in sessions {
-        if let Ok(session) = Arc::try_unwrap(session) {
-            let _ = session.close().await;
+        if let Err(error) = session.close().await {
+            eprintln!("session shutdown failed: {error}");
+            exit = 1;
         }
     }
-    0
+    exit
 }
 
 // --------------------------- fixture-agent ---------------------------

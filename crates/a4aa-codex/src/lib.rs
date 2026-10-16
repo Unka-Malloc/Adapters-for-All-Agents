@@ -95,7 +95,9 @@ pub const AGENT: AgentCard = AgentCard {
         }),
         session_resume: Some(RpcCallDecl {
             method: "thread/resume",
-            params: r#"{"threadId": "{sessionId}"}"#,
+            // The lane needs the binding, not a replay of every historical
+            // item. History remains on the server for the resumed turn.
+            params: r#"{"threadId": "{sessionId}", "excludeTurns": true}"#,
         }),
         prompt: RpcCallDecl {
             method: "turn/start",
@@ -270,6 +272,10 @@ mod tests {
         assert_eq!(rpc.initialized.as_deref(), Some("initialized"));
         assert_eq!(rpc.session_open.as_ref().unwrap().method, "thread/start");
         assert_eq!(rpc.session_resume.as_ref().unwrap().method, "thread/resume");
+        assert_eq!(
+            rpc.session_resume.as_ref().unwrap().params["excludeTurns"],
+            true
+        );
         assert_eq!(rpc.prompt.method, "turn/start");
         assert_eq!(rpc.cancel.as_ref().unwrap().method, "turn/interrupt");
         let done = rpc.completion.as_ref().unwrap();

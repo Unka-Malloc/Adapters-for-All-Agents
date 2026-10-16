@@ -73,7 +73,8 @@ pub trait RpcDelegate: Send + Sync {
     /// Transport closure observed at ingress, independently of queued callbacks.
     fn on_input_closed(&self) {}
 
-    /// A malformed inbound frame arrived. The stream continues.
+    /// An unreadable inbound frame closed the stream. Pending calls have
+    /// already failed because the discarded frame cannot be correlated.
     async fn on_protocol_error(&self, _error: String) {}
 
     /// The inbound stream reached EOF or failed. Delivered exactly once.
@@ -203,7 +204,7 @@ impl JsonRpcPeer {
         let reader_peer = Arc::clone(&peer);
         let reader_task = tokio::spawn(async move {
             let mut reader = BufReader::new(reader);
-            loop {
+            let failure = loop {
                 match framing::read_frame(&mut reader, max_message_bytes).await {
                     Ok(Some(Ok(frame))) => {
                         if let Some(observer) = observer.as_ref() {
@@ -216,27 +217,23 @@ impl JsonRpcPeer {
                         reader_peer.dispatch(frame, Arc::clone(&delegate));
                     }
                     Ok(Some(Err(FrameError::Oversized(size)))) => {
-                        delegate
-                            .on_protocol_error(format!("oversized frame ({size} bytes)"))
-                            .await;
+                        break Some(("oversized_frame", format!("oversized frame ({size} bytes)")));
                     }
                     Ok(Some(Err(FrameError::Invalid(error)))) => {
-                        delegate
-                            .on_protocol_error(format!("invalid frame: {error}"))
-                            .await;
+                        break Some(("invalid_frame", format!("invalid frame: {error}")));
                     }
                     Ok(Some(Err(FrameError::Io(error)))) | Err(error) => {
-                        delegate
-                            .on_protocol_error(format!("transport error: {error}"))
-                            .await;
-                        break;
+                        break Some(("peer_closed", format!("transport error: {error}")));
                     }
-                    Ok(None) => break,
+                    Ok(None) => break None,
                 }
-            }
-            reader_peer.fail_pending("peer_closed");
+            };
+            reader_peer.fail_pending(failure.as_ref().map_or("peer_closed", |(code, _)| code));
             delegate.on_input_closed();
             let _ = reader_peer.notifications.send(None);
+            if let Some((_, message)) = failure {
+                delegate.on_protocol_error(message).await;
+            }
         });
         *peer.reader.lock().unwrap() = Some(reader_task);
         peer
@@ -526,6 +523,9 @@ impl JsonRpcPeer {
 
     /// Send a notification (no response expected).
     pub fn notify(&self, method: &str, params: Value) -> Result<(), CallFailure> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(CallFailure::Transport("peer_closed".into()));
+        }
         let Some(writer) = self.writer.lock().unwrap().clone() else {
             return Err(CallFailure::Transport("peer_closed".into()));
         };
@@ -569,9 +569,9 @@ impl JsonRpcPeer {
     /// In-flight delegate tasks finish in the background; their replies are
     /// simply unsendable.
     pub async fn close(&self) {
-        if self.closed.swap(true, Ordering::Relaxed) {
-            return;
-        }
+        // EOF or an unreadable frame already marks calls closed. Transport
+        // tasks still need releasing when the owner closes that failed peer.
+        let was_closed = self.closed.swap(true, Ordering::Relaxed);
         self.writer.lock().unwrap().take();
         if let Some(task) = self.writer_task.lock().unwrap().take() {
             task.abort();
@@ -580,6 +580,8 @@ impl JsonRpcPeer {
             task.abort();
         }
         self.fail_pending("peer_closed");
-        let _ = self.notifications.send(None);
+        if !was_closed {
+            let _ = self.notifications.send(None);
+        }
     }
 }

@@ -901,6 +901,91 @@ struct SidecarEvents {
     permission_granted: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_shared_close_terminates_active_turns_and_eof_closes_remaining_sessions() {
+    struct FixtureCleanup(Vec<libc::pid_t>);
+    impl Drop for FixtureCleanup {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let mut cleanup = FixtureCleanup(Vec::new());
+    let modes = ["acp", "rpc", "cli", "pty", "eof"];
+    tokio::time::timeout(test_settings::WAIT_BUDGET * modes.len() as u32,async {
+        let mut child=tokio::process::Command::new(FIXTURE).arg("serve")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let (tx,mut rx)=mpsc::unbounded_channel();
+        let peer=JsonRpcPeer::spawn(child.stdout.take().unwrap(),child.stdin.take().unwrap(),
+            Arc::new(SidecarEvents {notifications:tx,permission_granted:std::sync::atomic::AtomicBool::new(false)}),None,a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES);
+        for mode in modes {
+            let script=format!("mode={mode:?}\n{}",r#"
+import os,sys,json,signal
+def send(m): print(json.dumps(m),flush=True)
+payload=json.dumps({'pid':os.getpid()})
+if mode in ['cli','pty']:
+    print(payload,flush=True)
+    signal.pause()
+else:
+    for line in sys.stdin:
+        m=json.loads(line)
+        if m['method']=='initialize': result={'protocolVersion':1,'agentCapabilities':{}}
+        elif m['method']=='session/new': result={'sessionId':'s'}
+        else:
+            if mode=='acp':
+                send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':payload}}}})
+            else: send({'jsonrpc':'2.0','method':'ready','params':{'text':payload}})
+            signal.pause()
+            raise AssertionError('fixture was not terminated')
+        send({'jsonrpc':'2.0','id':m['id'],'result':result})
+"#);
+            let lane=match mode {
+                "acp"=>LaneSpec::Acp {mcp_servers:vec![],prefer_load:false},
+                "cli"|"pty"=>LaneSpec::Cli(Box::new(CliLaneSpec {args:vec!["{prompt}".into()],prompt_channel:PromptChannel::ArgOnly,
+                    stream:if mode=="pty" {StreamMode::Pty}else{StreamMode::Stdio},..Default::default()})),
+                _=>LaneSpec::Rpc(Box::new(RpcLaneSpec {prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
+                    text_event_method:Some("ready".into()),text_path:Some("text".into()),..Default::default()})),
+            };
+            let spec=AgentSpec {id:mode.into(),client_name:None,max_output_bytes:Some(1024),lane,
+                command:CommandSpec {program:"python3".into(),args:vec!["-u".into(),"-c".into(),script],cwd:None,env:EnvPolicy::default()}};
+            let opened=peer.call("session/open",json!({"spec":spec})).await.unwrap();
+            let id=opened["sessionId"].as_str().unwrap();
+            let pending=peer.start_call("session/prompt",json!({"sessionId":id,"text":"run"})).unwrap();
+            let mut text=String::new();
+            let pid=loop {
+                let event=rx.recv().await.unwrap();
+                if event["sessionId"]==id {
+                    if let Some(chunk)=event["event"]["text"].as_str() {
+                        text.push_str(chunk);
+                        if let Ok(value)=serde_json::from_str::<Value>(&text) {
+                            if let Some(pid)=value["pid"].as_i64() {break pid as libc::pid_t;}
+                        }
+                    }
+                }
+            };
+            cleanup.0.push(pid);
+            if mode=="eof" {
+                peer.close().await;
+                assert!(child.wait().await.unwrap().success());
+            } else {
+                peer.call("session/close",json!({"sessionId":id})).await.unwrap();
+                let outcome=pending.wait().await;
+                assert!(outcome.as_ref().is_err() || outcome.as_ref().is_ok_and(|value|value["stopReason"]=="cancelled"));
+                assert!(peer.call("session/prompt",json!({"sessionId":id,"text":"must not run"})).await.is_err());
+                peer.call("session/close",json!({"sessionId":id})).await.unwrap();
+            }
+            assert_eq!(unsafe {libc::kill(pid,0)},-1,"{mode} process survived close acknowledgement");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ESRCH));
+            cleanup.0.pop();
+        }
+    }).await.expect("shared session close did not complete");
+}
+
 #[async_trait::async_trait]
 impl a4aa::RpcDelegate for SidecarEvents {
     async fn on_notification(&self, method: &str, params: Value) {
@@ -1088,7 +1173,7 @@ async fn acp_session_options_unadvertised_fail_closed() {
         Ok(_) => panic!("unadvertised model must fail"),
         Err(error) => error,
     };
-    assert_eq!(error.code, "agent_configuration_unavailable");
+    assert_eq!(error.code, "agent_configuration_unavailable", "{error:?}");
 }
 
 #[tokio::test]

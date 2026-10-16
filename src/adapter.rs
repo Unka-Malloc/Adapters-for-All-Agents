@@ -6,6 +6,7 @@
 //! CLI stdio/PTY). Turn events stream through the `mpsc` sink supplied at
 //! `open_session`; outcomes come back from `prompt`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -42,6 +43,7 @@ pub trait BeforeTurn: Send + Sync {
 pub struct AgentSession {
     lane: LaneSession,
     before_turn: Option<Arc<dyn BeforeTurn>>,
+    closed: AtomicBool,
 }
 
 /// The lane's own session handle behind the erased [`AgentSession`].
@@ -56,6 +58,8 @@ pub struct CliSession {
     lane: Arc<CliLane>,
     request: SessionRequest,
     events: mpsc::UnboundedSender<AgentEvent>,
+    lifecycle: tokio::sync::RwLock<()>,
+    cleanup_failure: std::sync::Mutex<Option<AdapterError>>,
 }
 
 impl CliSession {
@@ -98,6 +102,12 @@ impl AgentSession {
     /// agent. This runs before BeforeTurn, so unsupported selectors cannot
     /// reserve paid work.
     pub fn validate_turn_request(&self, request: &TurnRequest) -> Result<(), AdapterError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(AdapterError::permanent(
+                "agent_session_closed",
+                "session/prompt",
+            ));
+        }
         match &self.lane {
             LaneSession::Acp(session) => session.validate_turn_request(request),
             _ => validate_turn_selectors(self.selector_support(SelectorPhase::Turn), request),
@@ -124,16 +134,36 @@ impl AgentSession {
                     .await
             }
             LaneSession::Cli(session) => {
-                session
+                let _active = session.lifecycle.read().await;
+                let cancelled = session.lane.cancelled.subscribe();
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(AdapterError::permanent(
+                        "agent_session_closed",
+                        "session/prompt",
+                    ));
+                }
+                let outcome = session
                     .lane
-                    .run_turn(
+                    .run_turn_subscribed(
                         &session.request,
                         &request.text,
                         request.model.as_deref(),
                         request.effort.as_deref(),
                         session.events.clone(),
+                        cancelled,
                     )
-                    .await
+                    .await;
+                if let Err(error) = &outcome {
+                    if matches!(
+                        error.code,
+                        "agent_process_terminate_failed"
+                            | "agent_process_wait_failed"
+                            | "agent_process_interrupt_failed"
+                    ) {
+                        *session.cleanup_failure.lock().unwrap() = Some(error.clone());
+                    }
+                }
+                outcome
             }
         }
     }
@@ -155,11 +185,19 @@ impl AgentSession {
     }
 
     /// Close the session and terminate the process tree.
-    pub async fn close(self) -> Result<(), AdapterError> {
-        match self.lane {
+    pub async fn close(&self) -> Result<(), AdapterError> {
+        self.closed.store(true, Ordering::Release);
+        match &self.lane {
             LaneSession::Acp(session) => session.close().await,
             LaneSession::Rpc(session) => session.close().await,
-            LaneSession::Cli(_) => Ok(()),
+            LaneSession::Cli(session) => {
+                session.lane.cancelled.send_replace(());
+                let _finished = session.lifecycle.write().await;
+                match session.cleanup_failure.lock().unwrap().clone() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }
@@ -397,6 +435,7 @@ impl Adapter {
                 Ok(AgentSession {
                     lane: LaneSession::Acp(session),
                     before_turn: self.before_turn.clone(),
+                    closed: AtomicBool::new(false),
                 })
             }
             LaneSpec::Rpc(spec) => {
@@ -420,6 +459,7 @@ impl Adapter {
                 Ok(AgentSession {
                     lane: LaneSession::Rpc(Box::new(session)),
                     before_turn: self.before_turn.clone(),
+                    closed: AtomicBool::new(false),
                 })
             }
             LaneSpec::Cli(lane_spec) => {
@@ -446,8 +486,11 @@ impl Adapter {
                         lane: Arc::new(lane),
                         request,
                         events,
+                        lifecycle: tokio::sync::RwLock::new(()),
+                        cleanup_failure: std::sync::Mutex::new(None),
                     }),
                     before_turn: self.before_turn.clone(),
+                    closed: AtomicBool::new(false),
                 })
             }
         }

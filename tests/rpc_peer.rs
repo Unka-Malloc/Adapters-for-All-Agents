@@ -290,6 +290,38 @@ async fn peer_close_fails_pending_calls() {
 }
 
 #[tokio::test]
+async fn unreadable_responses_fail_pending_calls_without_waiting_for_eof() {
+    use a4aa::framing::{read_frame, write_frame};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        for oversized in [false, true] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (reader, writer) = tokio::io::split(client);
+            let peer = JsonRpcPeer::spawn(reader, writer, Arc::new(Noop), None, 256);
+            let pending = peer.start_call("thread/resume", json!({})).unwrap();
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(reader);
+            let request = read_frame(&mut reader, 4096).await.unwrap().unwrap().unwrap();
+            let expected = if oversized {
+                write_frame(&mut writer, &json!({"id":request["id"],"result":"x".repeat(1024)}))
+                    .await.unwrap();
+                "oversized_frame"
+            } else {
+                writer.write_all(b"invalid response\n").await.unwrap();
+                "invalid_frame"
+            };
+            // Keep the remote writer alive: only protocol failure can settle
+            // this pending call; EOF must not be required for recovery.
+            assert!(matches!(pending.wait().await, Err(CallFailure::Transport(reason)) if reason == expected));
+            assert!(peer.start_call("another", json!({})).is_err());
+            peer.close().await;
+            assert_eq!(reader.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+            drop(writer);
+        }
+    }).await.expect("discarded RPC response left its caller waiting");
+}
+
+#[tokio::test]
 async fn malformed_frames_surface_as_protocol_errors() {
     struct Collect {
         errors: Mutex<Vec<String>>,
