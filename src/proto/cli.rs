@@ -551,7 +551,9 @@ impl CliLane {
             }
         };
         Ok(TurnOutcome {
-            stop_reason: if exit.and_then(|s| s.code()).unwrap_or(0) == 0 {
+            // `ExitStatus::code()` is `None` when a signal killed the child;
+            // success is judged by `success()`, never by a missing code.
+            stop_reason: if exit.is_some_and(|status| status.success()) {
                 "end_turn"
             } else {
                 "error"

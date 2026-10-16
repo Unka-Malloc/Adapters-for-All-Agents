@@ -1302,3 +1302,97 @@ signal.pause()
         }).await.expect("exited-leader cancellation stalled");
     }
 }
+
+#[tokio::test]
+async fn cli_signal_death_is_an_error_never_end_turn() {
+    for stream in [StreamMode::Stdio, StreamMode::Pty] {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // Partial output, then death by SIGTERM: `ExitStatus::code()` is
+        // `None`, and a missing code must never read as success.
+        let session = Adapter::new(cli("printf partial; kill -TERM $$", stream, false))
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        let outcome = session
+            .prompt(TurnRequest {
+                text: "run".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.stop_reason, "error", "{stream:?}");
+        assert_eq!(outcome.exit_code, None, "{stream:?}");
+        assert_eq!(outcome.text, "partial", "{stream:?}");
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cli_explicit_cancel_still_reports_cancelled_not_signal_error() {
+    for stream in [StreamMode::Stdio, StreamMode::Pty] {
+        // Termination of the process tree from an explicit cancel keeps the
+        // `cancelled` outcome — the signal-driven exit status must not leak
+        // into `stop_reason`.
+        cancel_at(
+            "printf ready >&2; exec sleep 60",
+            stream,
+            false,
+            Direction::Stderr,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn rpc_writer_failure_settles_the_turn_and_requires_recovery() {
+    use serde_json::json;
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        // The agent answers session/new only after closing its own stdin,
+        // so the following prompt write deterministically hits a broken
+        // pipe while the reader keeps waiting on an open, silent stdout.
+        let script = r#"
+import json,sys,os,signal
+line=sys.stdin.readline()
+m=json.loads(line)
+os.close(0)
+print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'sessionId':'s'}}),flush=True)
+signal.pause()
+"#;
+        let mut spec = rpc_fixture(script, None);
+        let LaneSpec::Rpc(lane) = &mut spec.lane else {
+            unreachable!()
+        };
+        lane.session_open = Some(a4aa::RpcCallSpec {
+            method: "session/new".into(),
+            params: json!({}),
+        });
+        lane.completion = None;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(spec)
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        let error = session
+            .prompt(TurnRequest {
+                text: "run".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent_transport_failed");
+        assert!(error.uncertain_effect);
+        // The dispatched turn keeps its recovery-required isolation: the
+        // next prompt is refused rather than re-billed on a dead transport.
+        let again = session
+            .prompt(TurnRequest {
+                text: "again".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(again.code, "agent_session_recovery_required");
+        session.close().await.unwrap();
+    })
+    .await
+    .expect("writer failure did not settle the dispatched turn");
+}

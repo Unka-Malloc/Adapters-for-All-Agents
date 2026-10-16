@@ -538,7 +538,7 @@ impl AcpLane {
         let driver = tokio::spawn(drive(
             client_name,
             delegate,
-            child.clone(),
+            Arc::downgrade(&child),
             child_stdin,
             child_stdout,
             ServeContext {
@@ -612,11 +612,15 @@ struct ServeContext {
 
 /// The connection foreground: performs the handshake, then serves turn
 /// commands until close. The child is always terminated before return.
+///
+/// The child arrives as a weak handle: the opener (and later the session)
+/// owns the strong one, so an opener dropped mid-establishment releases it
+/// and its `Drop` kills the tree instead of orphaning a hung handshake.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     client_name: String,
     delegate: Arc<dyn SessionDelegate>,
-    child: Arc<Mutex<SupervisedChild>>,
+    child: std::sync::Weak<Mutex<SupervisedChild>>,
     child_stdin: tokio::process::ChildStdin,
     child_stdout: tokio::process::ChildStdout,
     mut context: ServeContext,
@@ -667,8 +671,11 @@ async fn drive(
         .await;
 
     // The connection is closed (or failed) — either way the process tree
-    // must not outlive the session.
-    let _ = child.lock().await.terminate().await;
+    // must not outlive the session. If the opener was dropped first, its
+    // dropped strong handle already killed the tree.
+    if let Some(child) = child.upgrade() {
+        let _ = child.lock().await.terminate().await;
+    }
 
     if let Err(error) = outcome {
         // Handshake failures surface through `ready` if it is still pending;
@@ -914,7 +921,9 @@ impl SessionCall {
 }
 
 /// Send a session-establishment request, retrying once after an
-/// `authenticate` attempt when the agent advertised auth methods.
+/// `authenticate` attempt when — and only when — establishment failed with
+/// the protocol's authentication-required error and the agent advertised
+/// auth methods. Every other failure returns unchanged.
 async fn call_with_auth_retry(
     connection: &ConnectionTo<Agent>,
     call: &SessionCall,
@@ -924,7 +933,9 @@ async fn call_with_auth_retry(
         Ok(response) => return Ok(response),
         Err(error) => error,
     };
-    if auth_methods.is_empty() {
+    if auth_methods.is_empty()
+        || establish_error.code != agent_client_protocol::ErrorCode::AuthRequired
+    {
         return Err(protocol_failure(call.stage(), establish_error));
     }
     let mut authenticated = false;

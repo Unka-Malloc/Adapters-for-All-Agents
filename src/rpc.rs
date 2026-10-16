@@ -6,14 +6,14 @@
 //! dispatched to the [`RpcDelegate`], and outbound calls correlate on
 //! monotonically increasing numeric ids.
 //!
-//! Shutdown semantics: transport EOF or [`JsonRpcPeer::close`] ends the
-//! reader, completes every pending call with `peer_closed`, and drops the
-//! writer — which sends EOF to the child. Pending calls never hang.
+//! Shutdown semantics: transport EOF, a writer failure, or
+//! [`JsonRpcPeer::close`] marks the peer closed, completes every pending
+//! call with a transport error, and rejects new calls. EOF or `close` drops
+//! the writer — which sends EOF to the child. Pending calls never hang.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -113,19 +113,66 @@ fn id_key(id: &Value) -> Option<String> {
         .or_else(|| id.as_str().map(str::to_owned))
 }
 
+/// Failure state shared with the writer task. The peer owns the writer's
+/// `JoinHandle`, so the writer must not hold a strong `Arc<JsonRpcPeer>`
+/// back — this state carries exactly what failure propagation needs.
+struct PeerState {
+    pending: Mutex<Pending>,
+    closed: AtomicBool,
+    closed_notice: Notify,
+    notifications: mpsc::UnboundedSender<Option<(String, Value)>>,
+    /// Guards the once-only ingress-closed hooks (`on_input_closed` and the
+    /// notification-queue EOF) shared by the reader's and writer's failure
+    /// paths and by explicit close.
+    ingress_closed: AtomicBool,
+}
+
+impl PeerState {
+    fn fail_pending(&self, reason: &'static str) {
+        // Mark closed first so a caller that inserts under the pending
+        // lock after the flag is visible rejects instead of orphaning.
+        self.closed.store(true, Ordering::Relaxed);
+        self.closed_notice.notify_waiters();
+        let mut pending = self.pending.lock().unwrap();
+        for (_, reply) in pending.map.drain() {
+            let _ = reply.send(Err(CallFailure::Transport(reason.into())));
+        }
+    }
+
+    /// The transport failed or ended: fail pending calls, then fire the
+    /// ingress-closed hooks — exactly once across the reader's and the
+    /// writer's failure paths.
+    fn transport_failed(&self, reason: &'static str, delegate: &Arc<dyn RpcDelegate>) {
+        self.fail_pending(reason);
+        self.close_ingress(delegate);
+    }
+
+    fn close_ingress(&self, delegate: &Arc<dyn RpcDelegate>) {
+        if self.ingress_closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        delegate.on_input_closed();
+        let _ = self.notifications.send(None);
+    }
+
+    /// Explicit close ends the notification stream without an ingress hook.
+    fn close_notifications(&self) {
+        if !self.ingress_closed.swap(true, Ordering::AcqRel) {
+            let _ = self.notifications.send(None);
+        }
+    }
+}
+
 /// One JSON-RPC peer. Cheap to clone? No — one peer per transport; share via
 /// `Arc`.
 pub struct JsonRpcPeer {
     /// `None` once `close` has taken the sender — that drop ends the writer
     /// task, which half-closes the transport.
     writer: Mutex<Option<mpsc::UnboundedSender<Value>>>,
-    pending: Mutex<Pending>,
+    state: Arc<PeerState>,
     next_id: AtomicU64,
     reader: Mutex<Option<JoinHandle<()>>>,
-    writer_task: Mutex<Option<JoinHandle<io::Result<()>>>>,
-    closed: std::sync::atomic::AtomicBool,
-    closed_notice: Notify,
-    notifications: mpsc::UnboundedSender<Option<(String, Value)>>,
+    writer_task: Mutex<Option<JoinHandle<()>>>,
     /// Non-stock envelope conventions (`None` = plain JSON-RPC 2.0).
     envelope: Option<RpcEnvelopeSpec>,
 }
@@ -162,24 +209,51 @@ impl JsonRpcPeer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Value>();
-        let writer_observer = observer.clone();
-        let writer_task = tokio::spawn(async move {
-            let mut writer = writer;
-            while let Some(frame) = writer_rx.recv().await {
-                if let Some(observer) = writer_observer.as_ref() {
-                    observer.record("rpc", Direction::Sent, frame.to_string().as_bytes());
-                }
-                framing::write_frame(&mut writer, &frame).await?;
-            }
-            let _ = writer.shutdown().await;
-            Ok(())
-        });
-
         // Preserve notification order without blocking responses or inbound
         // requests. EOF is queued after the last event, so completion cannot
         // be overtaken by the transport closing.
         let (notifications, mut notification_rx) =
             mpsc::unbounded_channel::<Option<(String, Value)>>();
+        let state = Arc::new(PeerState {
+            pending: Mutex::new(Pending {
+                map: HashMap::new(),
+            }),
+            closed: AtomicBool::new(false),
+            closed_notice: Notify::new(),
+            notifications,
+            ingress_closed: AtomicBool::new(false),
+        });
+
+        // A real write/flush failure on the outbound transport must reach
+        // the peer: settle pending calls, mark closed, and run the
+        // ingress-closed hooks (once-guarded against the reader's path).
+        let writer_observer = observer.clone();
+        let writer_state = Arc::clone(&state);
+        let writer_delegate = Arc::clone(&delegate);
+        let writer_task = tokio::spawn(async move {
+            let mut writer = writer;
+            let mut failed = false;
+            while let Some(frame) = writer_rx.recv().await {
+                if let Some(observer) = writer_observer.as_ref() {
+                    observer.record("rpc", Direction::Sent, frame.to_string().as_bytes());
+                }
+                if framing::write_frame(&mut writer, &frame).await.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            // Channel end half-closes the transport. A failed final flush
+            // means the agent may never have seen the last accepted frames
+            // — propagate it like any other writer failure. (`close` aborts
+            // this task, so an explicit close never reaches this path.)
+            if !failed && writer.shutdown().await.is_err() {
+                failed = true;
+            }
+            if failed {
+                writer_state.transport_failed("writer_failed", &writer_delegate);
+            }
+        });
+
         let event_delegate = delegate.clone();
         tokio::spawn(async move {
             while let Some(Some((method, params))) = notification_rx.recv().await {
@@ -189,15 +263,10 @@ impl JsonRpcPeer {
         });
         let peer = Arc::new(Self {
             writer: Mutex::new(Some(writer_tx)),
-            pending: Mutex::new(Pending {
-                map: HashMap::new(),
-            }),
+            state,
             next_id: AtomicU64::new(1),
             reader: Mutex::new(None),
             writer_task: Mutex::new(Some(writer_task)),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            closed_notice: Notify::new(),
-            notifications,
             envelope,
         });
 
@@ -228,9 +297,10 @@ impl JsonRpcPeer {
                     Ok(None) => break None,
                 }
             };
-            reader_peer.fail_pending(failure.as_ref().map_or("peer_closed", |(code, _)| code));
-            delegate.on_input_closed();
-            let _ = reader_peer.notifications.send(None);
+            reader_peer.state.transport_failed(
+                failure.as_ref().map_or("peer_closed", |(code, _)| code),
+                &delegate,
+            );
             if let Some((_, message)) = failure {
                 delegate.on_protocol_error(message).await;
             }
@@ -252,7 +322,7 @@ impl JsonRpcPeer {
             && (frame.get("result").is_some() || frame.get("error").is_some());
         if is_response {
             let key = frame.get("id").and_then(id_key);
-            let reply = key.and_then(|id| self.pending.lock().unwrap().map.remove(&id));
+            let reply = key.and_then(|id| self.state.pending.lock().unwrap().map.remove(&id));
             if let Some(reply) = reply {
                 let outcome = if let Some(error) = frame.get("error") {
                     Err(CallFailure::Remote(RpcErrorObject {
@@ -316,7 +386,7 @@ impl JsonRpcPeer {
             }
             None => {
                 if let Some(notification) = delegate.prepare_notification(method, params) {
-                    let _ = self.notifications.send(Some(notification));
+                    let _ = self.state.notifications.send(Some(notification));
                 }
             }
         }
@@ -341,7 +411,8 @@ impl JsonRpcPeer {
         let is_response =
             id.is_some() && envelope.response_method.as_deref() == Some(method.as_str());
         if let (Some(id), true) = (id.clone(), is_response) {
-            let reply = id_key(&id).and_then(|key| self.pending.lock().unwrap().map.remove(&key));
+            let reply =
+                id_key(&id).and_then(|key| self.state.pending.lock().unwrap().map.remove(&key));
             if let Some(reply) = reply {
                 let failed = envelope
                     .success_field
@@ -433,7 +504,7 @@ impl JsonRpcPeer {
             }
             None => {
                 if let Some(notification) = delegate.prepare_notification(method, params) {
-                    let _ = self.notifications.send(Some(notification));
+                    let _ = self.state.notifications.send(Some(notification));
                 }
             }
         }
@@ -484,7 +555,7 @@ impl JsonRpcPeer {
     /// response. This allows dispatch and cancellation to share a critical
     /// section without holding a lock across an await.
     pub fn start_call(&self, method: &str, params: Value) -> Result<PendingCall, CallFailure> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.state.closed.load(Ordering::Relaxed) {
             return Err(CallFailure::Transport("peer_closed".into()));
         }
         let Some(writer) = self.writer.lock().unwrap().clone() else {
@@ -507,15 +578,15 @@ impl JsonRpcPeer {
             // we hold this lock either closed is already visible or the
             // drain that follows our insert will complete this entry —
             // a call racing peer shutdown cannot be orphaned.
-            let mut pending = self.pending.lock().unwrap();
-            if self.closed.load(Ordering::Relaxed) {
+            let mut pending = self.state.pending.lock().unwrap();
+            if self.state.closed.load(Ordering::Relaxed) {
                 return Err(CallFailure::Transport("peer_closed".into()));
             }
             pending.map.insert(key.clone(), tx);
         }
         let frame = self.encode_frame(method, params, Some(wire_id));
         if writer.send(frame).is_err() {
-            self.pending.lock().unwrap().map.remove(&key);
+            self.state.pending.lock().unwrap().map.remove(&key);
             return Err(CallFailure::Transport("writer_closed".into()));
         }
         Ok(PendingCall(rx))
@@ -523,7 +594,7 @@ impl JsonRpcPeer {
 
     /// Send a notification (no response expected).
     pub fn notify(&self, method: &str, params: Value) -> Result<(), CallFailure> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.state.closed.load(Ordering::Relaxed) {
             return Err(CallFailure::Transport("peer_closed".into()));
         }
         let Some(writer) = self.writer.lock().unwrap().clone() else {
@@ -535,24 +606,13 @@ impl JsonRpcPeer {
             .map_err(|_| CallFailure::Transport("writer_closed".into()))
     }
 
-    fn fail_pending(&self, reason: &'static str) {
-        // Mark closed first so a caller that inserts under the pending
-        // lock after the flag is visible rejects instead of orphaning.
-        self.closed.store(true, Ordering::Relaxed);
-        self.closed_notice.notify_waiters();
-        let mut pending = self.pending.lock().unwrap();
-        for (_, reply) in pending.map.drain() {
-            let _ = reply.send(Err(CallFailure::Transport(reason.into())));
-        }
-    }
-
     /// Wait for transport closure, including explicit close after an ack.
     pub async fn closed(&self) {
         loop {
-            let notice = self.closed_notice.notified();
+            let notice = self.state.closed_notice.notified();
             tokio::pin!(notice);
             notice.as_mut().enable();
-            if self.closed.load(Ordering::Relaxed) {
+            if self.state.closed.load(Ordering::Relaxed) {
                 return;
             }
             notice.await;
@@ -571,7 +631,9 @@ impl JsonRpcPeer {
     pub async fn close(&self) {
         // EOF or an unreadable frame already marks calls closed. Transport
         // tasks still need releasing when the owner closes that failed peer.
-        let was_closed = self.closed.swap(true, Ordering::Relaxed);
+        // fail_pending and the ingress hooks are once-guarded, so a peer
+        // that already failed through its reader or writer stays settled.
+        self.state.fail_pending("peer_closed");
         self.writer.lock().unwrap().take();
         if let Some(task) = self.writer_task.lock().unwrap().take() {
             task.abort();
@@ -579,9 +641,6 @@ impl JsonRpcPeer {
         if let Some(task) = self.reader.lock().unwrap().take() {
             task.abort();
         }
-        self.fail_pending("peer_closed");
-        if !was_closed {
-            let _ = self.notifications.send(None);
-        }
+        self.state.close_notifications();
     }
 }

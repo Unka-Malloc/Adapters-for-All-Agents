@@ -1475,3 +1475,164 @@ async fn sidecar_session_options_and_structured_errors() {
     peer.close().await;
     let _ = child.kill().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_eof_during_establishment_terminates_the_establishing_agent() {
+    struct FixtureCleanup(Vec<libc::pid_t>);
+    impl Drop for FixtureCleanup {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let mut cleanup = FixtureCleanup(Vec::new());
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 2, async {
+        for mode in ["acp", "rpc"] {
+            let directory = tempfile::tempdir().unwrap();
+            let pidfile = directory.path().join("agent.pid");
+            // The agent reports its pid, then never answers `initialize`:
+            // establishment stays in flight with a live process.
+            let script = r#"
+import os,time,pathlib
+pathlib.Path(os.environ['A4AA_TEST_PIDFILE']).write_text(str(os.getpid()))
+time.sleep(3600)
+"#;
+            let lane = match mode {
+                "acp" => LaneSpec::Acp {
+                    mcp_servers: vec![],
+                    prefer_load: false,
+                },
+                _ => LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                    initialize: Some(RpcCallSpec {
+                        method: "initialize".into(),
+                        params: json!({}),
+                    }),
+                    prompt: RpcCallSpec {
+                        method: "prompt".into(),
+                        params: json!({"text": "{prompt}"}),
+                    },
+                    ..Default::default()
+                })),
+            };
+            let spec = AgentSpec {
+                id: format!("establishing-{mode}"),
+                client_name: None,
+                max_output_bytes: Some(1024),
+                lane,
+                command: CommandSpec {
+                    program: "python3".into(),
+                    args: vec!["-u".into(), "-c".into(), script.into()],
+                    cwd: None,
+                    env: fixture_env(&[("A4AA_TEST_PIDFILE", pidfile.to_str().unwrap())]),
+                },
+            };
+            let mut child = tokio::process::Command::new(FIXTURE)
+                .arg("serve")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let peer = JsonRpcPeer::spawn(
+                child.stdout.take().unwrap(),
+                child.stdin.take().unwrap(),
+                Arc::new(SidecarEvents {
+                    notifications: tx,
+                    permission_granted: std::sync::atomic::AtomicBool::new(false),
+                }),
+                None,
+                a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+            );
+            let pending = peer
+                .start_call("session/open", json!({"spec": spec}))
+                .unwrap();
+            // Wait until the agent is spawned and its handshake is in flight.
+            let pid: libc::pid_t = loop {
+                if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = text.trim().parse() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+            };
+            cleanup.0.push(pid);
+            // Host EOF: the sidecar must abort the in-flight establishment,
+            // terminate and reap the establishing agent, and exit cleanly.
+            peer.close().await;
+            assert!(pending.wait().await.is_err());
+            let status = child.wait().await.unwrap();
+            assert!(status.success(), "{mode}: sidecar exit {status:?}");
+            let reaped = tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+                }
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH),
+                    "{mode}"
+                );
+            })
+            .await;
+            if reaped.is_err() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            reaped
+                .unwrap_or_else(|_| panic!("{mode}: establishing agent survived sidecar shutdown"));
+            cleanup.0.pop();
+        }
+    })
+    .await
+    .expect("sidecar EOF cleanup stalled");
+}
+
+#[tokio::test]
+async fn acp_non_auth_establishment_error_never_attempts_authenticate() {
+    // The agent advertises an auth method but fails session/new with a
+    // generic internal error: authenticate must not be attempted, and the
+    // original failure returns unchanged.
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("requests.log");
+    let script = r#"
+import json,sys,os
+log=open(os.environ['A4AA_TEST_LOG'],'a')
+for line in sys.stdin:
+    m=json.loads(line)
+    method=m.get('method','')
+    log.write(method+'\n'); log.flush()
+    if method=='initialize':
+        result={'protocolVersion':1,'agentCapabilities':{},'authMethods':[{'id':'stub-auth','name':'Stub'}]}
+        print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+    elif method=='session/new':
+        print(json.dumps({'jsonrpc':'2.0','id':m['id'],'error':{'code':-32603,'message':'generic failure'}}),flush=True)
+    else:
+        print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}),flush=True)
+"#;
+    let mut spec = acp_spec();
+    spec.command = CommandSpec {
+        program: "python3".into(),
+        args: vec!["-u".into(), "-c".into(), script.into()],
+        cwd: None,
+        env: fixture_env(&[("A4AA_TEST_LOG", log.to_str().unwrap())]),
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let error = match Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+    {
+        Ok(_) => panic!("generic establishment failure must not open"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "agent_protocol_failed");
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(log.contains("session/new"));
+    assert!(
+        !log.contains("authenticate"),
+        "a non-auth failure triggered authenticate: {log}"
+    );
+}

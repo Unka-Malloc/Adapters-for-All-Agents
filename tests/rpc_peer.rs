@@ -353,3 +353,148 @@ async fn malformed_frames_surface_as_protocol_errors() {
     hit_rx.recv().await.expect("protocol error");
     assert!(collector.errors.lock().await[0].contains("invalid"));
 }
+
+// ------------------------- writer failure -------------------------
+
+struct CloseHooks {
+    input_closed: AtomicUsize,
+    closed: AtomicUsize,
+    protocol_errors: AtomicUsize,
+    input_signal: tokio::sync::Notify,
+    closed_signal: tokio::sync::Notify,
+    protocol_signal: tokio::sync::Notify,
+}
+
+impl CloseHooks {
+    fn new() -> Self {
+        Self {
+            input_closed: AtomicUsize::new(0),
+            closed: AtomicUsize::new(0),
+            protocol_errors: AtomicUsize::new(0),
+            input_signal: tokio::sync::Notify::new(),
+            closed_signal: tokio::sync::Notify::new(),
+            protocol_signal: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcDelegate for CloseHooks {
+    fn on_input_closed(&self) {
+        self.input_closed.fetch_add(1, Ordering::Relaxed);
+        self.input_signal.notify_one();
+    }
+    async fn on_closed(&self) {
+        self.closed.fetch_add(1, Ordering::Relaxed);
+        self.closed_signal.notify_one();
+    }
+    async fn on_protocol_error(&self, _error: String) {
+        self.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        self.protocol_signal.notify_one();
+    }
+}
+
+/// Spawn a peer over a real child whose stdin is already closed. `script`
+/// must close fd 0 before writing the readiness byte to stderr, so the
+/// first outbound frame deterministically hits a broken pipe.
+async fn spawn_stdin_closed_peer(
+    script: &str,
+    hooks: Arc<CloseHooks>,
+) -> (tokio::process::Child, Arc<JsonRpcPeer>) {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("sh")
+        .args(["-c", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // Readiness barrier: stdin is guaranteed closed once this byte lands.
+    child
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut [0u8; 1])
+        .await
+        .unwrap();
+    let peer = JsonRpcPeer::spawn(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+        hooks,
+        None,
+        4096,
+    );
+    (child, peer)
+}
+
+/// Regression: a real writer failure (the agent closed its stdin) must
+/// settle pending calls promptly, reject new traffic, and fire the
+/// ingress-closed hooks — no reader EOF is involved at all.
+#[tokio::test]
+async fn writer_failure_fails_pending_calls_and_rejects_new_traffic() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let hooks = Arc::new(CloseHooks::new());
+        // stdout stays open and silent: only the writer failure can settle.
+        let (mut child, peer) =
+            spawn_stdin_closed_peer("exec 0<&-; printf x >&2; exec sleep 60", hooks.clone()).await;
+        let pending = peer.start_call("open", json!({})).unwrap();
+        match pending.wait().await {
+            Err(CallFailure::Transport(_)) => {}
+            other => panic!("expected transport failure, got {other:?}"),
+        }
+        // New traffic is rejected immediately on the failed transport.
+        assert!(matches!(
+            peer.start_call("next", json!({})),
+            Err(CallFailure::Transport(_))
+        ));
+        assert!(matches!(
+            peer.notify("note", json!({})),
+            Err(CallFailure::Transport(_))
+        ));
+        peer.closed().await;
+        hooks.input_signal.notified().await;
+        hooks.closed_signal.notified().await;
+        assert_eq!(hooks.input_closed.load(Ordering::Relaxed), 1);
+        assert_eq!(hooks.closed.load(Ordering::Relaxed), 1);
+        // An explicit close after the failure must not re-fire the hooks.
+        peer.close().await;
+        assert_eq!(hooks.input_closed.load(Ordering::Relaxed), 1);
+        assert_eq!(hooks.closed.load(Ordering::Relaxed), 1);
+        let _ = child.kill().await;
+    })
+    .await
+    .expect("writer failure did not settle the peer");
+}
+
+/// The reader's and writer's failure paths share one close notification: a
+/// garbage inbound frame plus a broken outbound pipe still fire
+/// `on_input_closed`/`on_closed` exactly once.
+#[tokio::test]
+async fn writer_and_reader_failures_share_one_close_notification() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let hooks = Arc::new(CloseHooks::new());
+        let (mut child, peer) = spawn_stdin_closed_peer(
+            "exec 0<&-; printf 'not json\\n'; printf x >&2; exec sleep 60",
+            hooks.clone(),
+        )
+        .await;
+        // The garbage line may fail the peer before this call is enqueued;
+        // either failure shape settles the caller with a transport error.
+        let outcome = match peer.start_call("open", json!({})) {
+            Ok(pending) => pending.wait().await,
+            Err(failure) => Err(failure),
+        };
+        assert!(matches!(outcome, Err(CallFailure::Transport(_))));
+        // Both failure paths ran; the close hooks fired exactly once.
+        hooks.protocol_signal.notified().await;
+        hooks.closed_signal.notified().await;
+        assert_eq!(hooks.input_closed.load(Ordering::Relaxed), 1);
+        assert_eq!(hooks.closed.load(Ordering::Relaxed), 1);
+        assert_eq!(hooks.protocol_errors.load(Ordering::Relaxed), 1);
+        peer.close().await;
+        let _ = child.kill().await;
+    })
+    .await
+    .expect("reader/writer failure coordination stalled");
+}

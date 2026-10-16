@@ -57,6 +57,18 @@ async fn main() {
 struct Sessions {
     inner: Mutex<HashMap<String, Arc<AgentSession>>>,
     next: std::sync::atomic::AtomicU64,
+    /// Set once host shutdown begins: `session/open` stops admitting new
+    /// establishments, and shutdown drains the ones still in flight below.
+    closing: std::sync::atomic::AtomicBool,
+    /// In-flight `session/open` establishment tasks. Shutdown aborts each
+    /// (dropping the open future terminates the spawned agent tree) and
+    /// awaits the abort before exiting; an entry leaves the map once its
+    /// session lands in `inner`.
+    establishing: Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
+    establish_next: std::sync::atomic::AtomicU64,
+    /// A session that lost its shutdown race failed to close cleanly —
+    /// surfaced in the exit code.
+    cleanup_failed: std::sync::atomic::AtomicBool,
 }
 
 impl Sessions {
@@ -64,8 +76,18 @@ impl Sessions {
         Self {
             inner: Mutex::new(HashMap::new()),
             next: std::sync::atomic::AtomicU64::new(1),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            establishing: Mutex::new(HashMap::new()),
+            establish_next: std::sync::atomic::AtomicU64::new(1),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
+}
+
+/// Typed refusal once shutdown has begun: a new open is rejected, never
+/// admitted into a draining sidecar.
+fn sidecar_closing() -> RpcErrorObject {
+    adapter_error(&AdapterError::permanent("sidecar_closing", "session/open"))
 }
 
 struct SidecarDelegate {
@@ -256,14 +278,48 @@ impl SidecarDelegate {
             peer: self.peer.clone(),
             peer_ready: self.peer_ready.clone(),
         }));
-        let session = adapter
-            .open_session(request, events)
-            .await
-            .map_err(|error| adapter_error(&error))?;
+        let adapter_capabilities = adapter.capabilities();
+        // Establishment runs on its own task so shutdown can abort it: the
+        // aborted task drops the open future, which terminates the spawned
+        // agent tree instead of orphaning it.
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        let establishment = tokio::spawn(async move {
+            let _ = reply.send(adapter.open_session(request, events).await);
+        });
+        let key = self
+            .sessions
+            .establish_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            // Admission and shutdown's drain share this lock: once shutdown
+            // begins, no new establishment can register behind it.
+            let mut establishing = self.sessions.establishing.lock().await;
+            if self
+                .sessions
+                .closing
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                drop(establishing);
+                establishment.abort();
+                let _ = establishment.await;
+                return Err(sidecar_closing());
+            }
+            establishing.insert(key, establishment);
+        }
+        let session = match outcome.await {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                self.sessions.establishing.lock().await.remove(&key);
+                return Err(adapter_error(&error));
+            }
+            // Aborted by shutdown: the reply sender dropped with the task,
+            // and the open future's drop terminated the agent tree.
+            Err(_) => return Err(sidecar_closing()),
+        };
         let capabilities = serde_json::to_value(match session.lane() {
             a4aa::LaneSession::Acp(session) => session.capabilities().clone(),
             a4aa::LaneSession::Rpc(session) => session.capabilities(),
-            a4aa::LaneSession::Cli(_) => adapter.capabilities(),
+            a4aa::LaneSession::Cli(_) => adapter_capabilities,
         })
         .unwrap_or(Value::Null);
         let (agent_info, session_state) = match session.lane() {
@@ -276,11 +332,27 @@ impl SidecarDelegate {
             _ => (None, None),
         };
         let native_session_id = session.session_id().to_owned();
-        self.sessions
-            .inner
-            .lock()
-            .await
-            .insert(id.clone(), Arc::new(session));
+        {
+            // Land in the map, unless shutdown began while establishing —
+            // then close what was just opened instead of admitting it.
+            let mut sessions = self.sessions.inner.lock().await;
+            if self
+                .sessions
+                .closing
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                drop(sessions);
+                self.sessions.establishing.lock().await.remove(&key);
+                if session.close().await.is_err() {
+                    self.sessions
+                        .cleanup_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(sidecar_closing());
+            }
+            sessions.insert(id.clone(), Arc::new(session));
+        }
+        self.sessions.establishing.lock().await.remove(&key);
         Ok(json!({
             "sessionId": id,
             "nativeSessionId": native_session_id,
@@ -395,7 +467,22 @@ async fn serve() -> i32 {
     delegate.peer_ready.notify_waiters();
     closed.notified().await;
 
-    // stdin closed: close every session, then finish pending calls.
+    // stdin closed: stop admitting session/opens, terminate establishments
+    // still in flight, then close every live session.
+    delegate
+        .sessions
+        .closing
+        .store(true, std::sync::atomic::Ordering::Release);
+    let establishing: Vec<tokio::task::JoinHandle<()>> = {
+        let mut establishing = delegate.sessions.establishing.lock().await;
+        establishing.drain().map(|(_, task)| task).collect()
+    };
+    for task in establishing {
+        task.abort();
+        // Await the abort landing: dropping the open future terminates the
+        // establishing agent tree before this process exits.
+        let _ = task.await;
+    }
     let sessions: Vec<Arc<AgentSession>> = {
         let mut sessions = delegate.sessions.inner.lock().await;
         sessions.drain().map(|(_, session)| session).collect()
@@ -406,6 +493,13 @@ async fn serve() -> i32 {
             eprintln!("session shutdown failed: {error}");
             exit = 1;
         }
+    }
+    if delegate
+        .sessions
+        .cleanup_failed
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        exit = 1;
     }
     exit
 }
