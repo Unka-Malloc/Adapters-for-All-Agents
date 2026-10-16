@@ -68,7 +68,6 @@ pub struct CliSession {
     /// The RPC lane's recovery contract: set when a completed turn's outcome
     /// was uncertain; the next prompt is refused until the session closes.
     recovery_required: Arc<AtomicBool>,
-    cleanup_failure: Arc<std::sync::Mutex<Option<AdapterError>>>,
 }
 
 impl CliSession {
@@ -167,7 +166,6 @@ impl AgentSession {
                 let session_request = session.request.clone();
                 let events = session.events.clone();
                 let recovery_required = session.recovery_required.clone();
-                let cleanup_failure = session.cleanup_failure.clone();
                 let TurnRequest {
                     text,
                     model,
@@ -204,7 +202,7 @@ impl AgentSession {
                                 | "agent_process_wait_failed"
                                 | "agent_process_interrupt_failed"
                         ) {
-                            *cleanup_failure.lock().unwrap() = Some(error.clone());
+                            *lane.cleanup_failure.lock().unwrap() = Some(error.clone());
                         }
                     }
                     outcome
@@ -241,7 +239,7 @@ impl AgentSession {
             LaneSession::Cli(session) => {
                 session.lane.cancelled.send_replace(());
                 let _finished = session.lifecycle.write().await;
-                match session.cleanup_failure.lock().unwrap().clone() {
+                match session.lane.cleanup_failure.lock().unwrap().clone() {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
@@ -519,6 +517,7 @@ impl Adapter {
                     max_output_bytes: self.spec.max_output_bytes,
                     cancelled: Arc::new(tokio::sync::watch::channel(()).0),
                     observed: Arc::new(std::sync::OnceLock::new()),
+                    cleanup_failure: std::sync::Mutex::new(None),
                 };
                 // An explicitly requested resume is already the session's
                 // binding — report it before the first turn emits anything.
@@ -537,7 +536,6 @@ impl Adapter {
                         lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                         turn: Arc::new(tokio::sync::Mutex::new(())),
                         recovery_required: Arc::new(AtomicBool::new(false)),
-                        cleanup_failure: Arc::new(std::sync::Mutex::new(None)),
                     }),
                     before_turn: self.before_turn.clone(),
                     closed: AtomicBool::new(false),

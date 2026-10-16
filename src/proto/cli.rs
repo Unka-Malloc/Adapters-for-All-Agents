@@ -38,6 +38,16 @@ pub struct CliLane {
     /// Session binding captured from a `sessionIdPath` match on stdout —
     /// the first observed value wins and later turns resume through it.
     pub observed: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// A turn's process-cleanup failure is recorded here and surfaced by
+    /// `AgentSession::close`; an I/O failure's own error stays the turn's
+    /// result and never shadows the cleanup failure.
+    pub cleanup_failure: std::sync::Mutex<Option<AdapterError>>,
+}
+
+impl CliLane {
+    fn record_cleanup_failure(&self, error: AdapterError) {
+        *self.cleanup_failure.lock().unwrap() = Some(error);
+    }
 }
 
 impl CliLane {
@@ -414,11 +424,11 @@ impl CliLane {
             }
             Ok::<(), AdapterError>(())
         };
-        let (_, outcome) = tokio::try_join!(
-            write,
-            self.collect(child, Box::new(stdout), events, output_cancelled)
-        )?;
-        Ok(outcome)
+        // The prompt write rides inside `collect`'s select so a write
+        // failure keeps the child owned: the driver terminates and awaits
+        // it explicitly instead of relying on `Drop`'s best effort.
+        self.collect(child, Box::new(stdout), events, output_cancelled, write)
+            .await
     }
 
     #[cfg(unix)]
@@ -448,22 +458,24 @@ impl CliLane {
             }
             Ok::<(), AdapterError>(())
         };
-        let (_, outcome) = tokio::try_join!(
-            write,
-            self.collect(child, Box::new(master), events, output_cancelled)
-        )?;
-        Ok(outcome)
+        // Same ownership as run_stdio: the write rides inside `collect`.
+        self.collect(child, Box::new(master), events, output_cancelled, write)
+            .await
     }
 
     /// Drain the output stream, emitting chunks, until EOF. There is no
     /// deadline: output EOF is not an exit signal — the process owns its
-    /// cleanup and the real exit status is awaited.
-    async fn collect(
+    /// cleanup and the real exit status is awaited. The prompt `write`
+    /// future rides the same select; a write or read failure still
+    /// terminates and reaps the child explicitly before the original error
+    /// returns, and a cleanup failure is recorded for `close`.
+    async fn collect<W: std::future::Future<Output = Result<(), AdapterError>>>(
         &self,
         mut child: SupervisedChild,
         mut reader: Box<dyn ChunkRead>,
         events: mpsc::UnboundedSender<AgentEvent>,
         mut cancelled: watch::Receiver<()>,
+        write: W,
     ) -> Result<TurnOutcome, AdapterError> {
         // Turn accumulators: retained text (fallback), NDJSON carry,
         // last-seen usage, and the authoritative result-record text.
@@ -473,12 +485,26 @@ impl CliLane {
         // be the agent's bytes verbatim, never U+FFFD-injected.
         let mut pending: Vec<u8> = Vec::new();
         let mut buffer = [0u8; bounds::READ_CHUNK];
+        let mut write = std::pin::pin!(write);
+        let mut write_done = false;
         loop {
             tokio::select! {
                 biased;
                 _ = cancelled.changed() => {
                     child.terminate().await?;
                     return Ok(cancelled_outcome(state));
+                }
+                result = &mut write, if !write_done => {
+                    write_done = true;
+                    if let Err(error) = result {
+                        // The prompt never fully reached the agent: the turn
+                        // is broken, but the process stays owned — terminate
+                        // and await the reap before the error returns.
+                        if let Err(cleanup) = child.terminate().await {
+                            self.record_cleanup_failure(cleanup);
+                        }
+                        return Err(error);
+                    }
                 }
                 count = reader.read(&mut buffer) => {
                     match count {
@@ -520,8 +546,13 @@ impl CliLane {
                         }
                         Err(error) => {
                             // A failed read is not EOF — the turn is broken and the
-                            // caller must see it, not a quiet half-answer.
-                            let _ = child.terminate().await;
+                            // caller must see it, not a quiet half-answer. Same
+                            // ownership: terminate and await the reap, and record
+                            // a cleanup failure rather than shadowing the read
+                            // error with it.
+                            if let Err(cleanup) = child.terminate().await {
+                                self.record_cleanup_failure(cleanup);
+                            }
                             return Err(AdapterError::io(
                                 "agent_output_read_failed",
                                 "cli/stdout",
@@ -1013,6 +1044,7 @@ mod output_prefix_tests {
             max_output_bytes: Some(4),
             cancelled: std::sync::Arc::new(watch::channel(()).0),
             observed: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cleanup_failure: std::sync::Mutex::new(None),
         };
         let (send, mut receive) = mpsc::unbounded_channel();
         let mut state = TurnCollect::default();
