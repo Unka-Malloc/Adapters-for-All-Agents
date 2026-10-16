@@ -1396,3 +1396,240 @@ signal.pause()
     .await
     .expect("writer failure did not settle the dispatched turn");
 }
+
+// ----------------- owned CLI turns (waiterless dispatch) -----------------
+
+/// A stdin-prompted CLI spec whose agent receives `env` literals — used by
+/// the waiterless-turn tests to make the agent's pid observable.
+fn pid_reporting_cli(script: &str, env: &[(&str, &std::path::Path)]) -> a4aa::AgentSpec {
+    let mut spec = cli("", StreamMode::Stdio, true);
+    spec.command.program = "python3".into();
+    spec.command.args = vec!["-u".into(), "-c".into(), script.into()];
+    spec.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: env
+            .iter()
+            .map(|(key, path)| {
+                (
+                    key.to_string(),
+                    a4aa::EnvValue::Literal(path.display().to_string()),
+                )
+            })
+            .collect(),
+    };
+    spec
+}
+
+/// Drive the prompt until the agent's `started` chunk arrives, then drop
+/// the waiter: the turn is now owned by the session alone.
+async fn start_waiterless_turn(
+    session: &a4aa::AgentSession,
+    rx: &mut mpsc::UnboundedReceiver<a4aa::AgentEvent>,
+) {
+    {
+        let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+            text: "one".into(),
+            ..Default::default()
+        }));
+        loop {
+            tokio::select! {
+                result = &mut prompt => panic!("turn finished before the barrier: {result:?}"),
+                event = rx.recv() => {
+                    if matches!(event, Some(a4aa::AgentEvent::MessageChunk { ref text }) if text.contains("started")) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn pid_of(pidfile: &std::path::Path) -> libc::pid_t {
+    std::fs::read_to_string(pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cli_dropped_waiter_leaves_the_owned_turn_to_complete() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 3, async {
+        let directory = tempfile::tempdir().unwrap();
+        let pidfile = directory.path().join("turn.pid");
+        let script = r#"
+import os,sys,time,pathlib
+pathlib.Path(os.environ['A4AA_TEST_PID']).write_text(str(os.getpid()))
+sys.stdin.readline()
+print('started',flush=True)
+time.sleep(0.3)
+print('finished',flush=True)
+"#;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(pid_reporting_cli(script, &[("A4AA_TEST_PID", &pidfile)]))
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        start_waiterless_turn(&session, &mut rx).await;
+        let pid = pid_of(&pidfile);
+        // The detached turn keeps streaming to the session's event sink and
+        // runs to real completion without its waiter.
+        loop {
+            match rx.recv().await {
+                Some(a4aa::AgentEvent::MessageChunk { text }) if text.contains("finished") => {
+                    break;
+                }
+                Some(_) => {}
+                other => panic!("detached turn did not complete: {other:?}"),
+            }
+        }
+        // The turn driver awaited natural exit and reaped the child before
+        // releasing serial admission, so once the next prompt completes the
+        // first child is long gone.
+        let second = session
+            .prompt(TurnRequest {
+                text: "two".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("a cleanly completed detached turn must not poison the session");
+        assert_eq!(second.stop_reason, "end_turn");
+        assert!(second.text.contains("finished"));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        session.close().await.unwrap();
+    })
+    .await
+    .expect("detached CLI turn died with its waiter");
+}
+
+#[tokio::test]
+async fn cli_cancel_terminates_a_waiterless_owned_turn() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 3, async {
+        let directory = tempfile::tempdir().unwrap();
+        let pidfile = directory.path().join("turn.pid");
+        // The first run pauses until cancelled; a later turn exits normally.
+        let script = r#"
+import os,sys,signal,pathlib
+pid=pathlib.Path(os.environ['A4AA_TEST_PID'])
+first=not pid.exists()
+pid.write_text(str(os.getpid()))
+sys.stdin.readline()
+print('started',flush=True)
+if first: signal.pause()
+print('finished',flush=True)
+"#;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(pid_reporting_cli(script, &[("A4AA_TEST_PID", &pidfile)]))
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        start_waiterless_turn(&session, &mut rx).await;
+        let pid = pid_of(&pidfile);
+        session.cancel().await.unwrap();
+        // The cancel reaches the owned turn; the next prompt completing
+        // proves the first turn's task terminated and reaped the process.
+        let second = session
+            .prompt(TurnRequest {
+                text: "two".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("an explicit cancel is a known outcome, not poisoning");
+        assert_eq!(second.stop_reason, "end_turn");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        session.close().await.unwrap();
+    })
+    .await
+    .expect("cancel did not reach the owned turn");
+}
+
+#[tokio::test]
+async fn cli_close_terminates_and_reaps_a_waiterless_turn() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 3, async {
+        let directory = tempfile::tempdir().unwrap();
+        let pidfile = directory.path().join("turn.pid");
+        let script = r#"
+import os,sys,signal,pathlib
+pathlib.Path(os.environ['A4AA_TEST_PID']).write_text(str(os.getpid()))
+sys.stdin.readline()
+print('started',flush=True)
+signal.pause()
+"#;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(pid_reporting_cli(script, &[("A4AA_TEST_PID", &pidfile)]))
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        start_waiterless_turn(&session, &mut rx).await;
+        let pid = pid_of(&pidfile);
+        // close() waits for the owned turn (cancelled via the watch) and
+        // reaps it before returning.
+        session.close().await.unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let error = session
+            .prompt(TurnRequest {
+                text: "after".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent_session_closed");
+    })
+    .await
+    .expect("close did not terminate the owned turn");
+}
+
+#[tokio::test]
+async fn cli_waiterless_turn_with_uncertain_outcome_requires_recovery() {
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 3, async {
+        // The malformed receipt fails the completed turn with an uncertain
+        // receipt error after the agent exits — deterministic, no races.
+        let spec = receipt_fixture("malformed", a4aa::BindingReceiptShape::SessionId);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = Adapter::new(spec)
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap();
+        {
+            let mut prompt = std::pin::pin!(session.prompt(TurnRequest {
+                text: "one".into(),
+                ..Default::default()
+            }));
+            loop {
+                tokio::select! {
+                    result = &mut prompt => panic!("turn finished before the barrier: {result:?}"),
+                    event = rx.recv() => {
+                        // The agent prints its receipt JSON after reading the
+                        // prompt — the turn is in flight when we detach.
+                        if matches!(event, Some(a4aa::AgentEvent::MessageChunk { .. })) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let error = session
+            .prompt(TurnRequest {
+                text: "two".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agent_session_recovery_required");
+        session.close().await.unwrap();
+    })
+    .await
+    .expect("uncertain detached turn did not poison the next prompt");
+}

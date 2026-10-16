@@ -60,15 +60,24 @@ struct Sessions {
     /// Set once host shutdown begins: `session/open` stops admitting new
     /// establishments, and shutdown drains the ones still in flight below.
     closing: std::sync::atomic::AtomicBool,
-    /// In-flight `session/open` establishment tasks. Shutdown aborts each
-    /// (dropping the open future terminates the spawned agent tree) and
-    /// awaits the abort before exiting; an entry leaves the map once its
-    /// session lands in `inner`.
-    establishing: Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
+    /// In-flight `session/open` establishments. Shutdown aborts the ones
+    /// whose open future is still running (dropping it terminates the
+    /// spawned agent tree) and awaits the ones past open; an entry leaves
+    /// the map once its session has landed in `inner`.
+    establishing: Mutex<HashMap<u64, Establishment>>,
     establish_next: std::sync::atomic::AtomicU64,
     /// A session that lost its shutdown race failed to close cleanly —
     /// surfaced in the exit code.
     cleanup_failed: std::sync::atomic::AtomicBool,
+}
+
+/// One in-flight `session/open` establishment.
+struct Establishment {
+    /// Set once `open_session` returned: from that moment the task owns a
+    /// live session through the handoff (map insert or close), so shutdown
+    /// must await it rather than abort it.
+    handoff: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Sessions {
@@ -279,12 +288,66 @@ impl SidecarDelegate {
             peer_ready: self.peer_ready.clone(),
         }));
         let adapter_capabilities = adapter.capabilities();
-        // Establishment runs on its own task so shutdown can abort it: the
-        // aborted task drops the open future, which terminates the spawned
-        // agent tree instead of orphaning it.
-        let (reply, outcome) = tokio::sync::oneshot::channel();
+        // Establishment runs on its own task, which owns the session through
+        // the handoff: once open completes, the same task atomically inserts
+        // the session into the map or — if shutdown began meanwhile — closes
+        // it. The handler only ever receives the rendered response, so a
+        // dropped handler can never strand a live unregistered session.
+        let (reply, outcome) = tokio::sync::oneshot::channel::<Result<Value, AdapterError>>();
+        let sessions = self.sessions.clone();
+        let handoff = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_handoff = handoff.clone();
+        let open_id = id.clone();
         let establishment = tokio::spawn(async move {
-            let _ = reply.send(adapter.open_session(request, events).await);
+            let session = match adapter.open_session(request, events).await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            // No yield between the completed open and this flag: shutdown
+            // never aborts a task that already owns a live session.
+            task_handoff.store(true, std::sync::atomic::Ordering::Release);
+            let capabilities = serde_json::to_value(match session.lane() {
+                a4aa::LaneSession::Acp(session) => session.capabilities().clone(),
+                a4aa::LaneSession::Rpc(session) => session.capabilities(),
+                a4aa::LaneSession::Cli(_) => adapter_capabilities,
+            })
+            .unwrap_or(Value::Null);
+            let (agent_info, session_state) = match session.lane() {
+                a4aa::LaneSession::Acp(session) => (
+                    session
+                        .agent_info()
+                        .map(|info| json!({"name": info.name, "version": info.version})),
+                    Some(session.session_state()),
+                ),
+                _ => (None, None),
+            };
+            let response = json!({
+                "sessionId": open_id,
+                "nativeSessionId": session.session_id(),
+                "capabilities": capabilities,
+                "agentInfo": agent_info.unwrap_or(Value::Null),
+                "sessionState": session_state.unwrap_or(Value::Null),
+            });
+            let mut sessions_map = sessions.inner.lock().await;
+            if sessions.closing.load(std::sync::atomic::Ordering::Acquire) {
+                drop(sessions_map);
+                if session.close().await.is_err() {
+                    sessions
+                        .cleanup_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let _ = reply.send(Err(AdapterError::permanent(
+                    "sidecar_closing",
+                    "session/open",
+                )));
+                return;
+            }
+            sessions_map.insert(open_id, Arc::new(session));
+            drop(sessions_map);
+            let _ = reply.send(Ok(response));
         });
         let key = self
             .sessions
@@ -304,62 +367,25 @@ impl SidecarDelegate {
                 let _ = establishment.await;
                 return Err(sidecar_closing());
             }
-            establishing.insert(key, establishment);
+            establishing.insert(
+                key,
+                Establishment {
+                    handoff,
+                    task: establishment,
+                },
+            );
         }
-        let session = match outcome.await {
-            Ok(Ok(session)) => session,
+        let response = match outcome.await {
+            Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 self.sessions.establishing.lock().await.remove(&key);
                 return Err(adapter_error(&error));
             }
-            // Aborted by shutdown: the reply sender dropped with the task,
-            // and the open future's drop terminated the agent tree.
+            // Aborted by shutdown: the reply sender dropped with the task.
             Err(_) => return Err(sidecar_closing()),
         };
-        let capabilities = serde_json::to_value(match session.lane() {
-            a4aa::LaneSession::Acp(session) => session.capabilities().clone(),
-            a4aa::LaneSession::Rpc(session) => session.capabilities(),
-            a4aa::LaneSession::Cli(_) => adapter_capabilities,
-        })
-        .unwrap_or(Value::Null);
-        let (agent_info, session_state) = match session.lane() {
-            a4aa::LaneSession::Acp(session) => (
-                session
-                    .agent_info()
-                    .map(|info| json!({"name": info.name, "version": info.version})),
-                Some(session.session_state()),
-            ),
-            _ => (None, None),
-        };
-        let native_session_id = session.session_id().to_owned();
-        {
-            // Land in the map, unless shutdown began while establishing —
-            // then close what was just opened instead of admitting it.
-            let mut sessions = self.sessions.inner.lock().await;
-            if self
-                .sessions
-                .closing
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                drop(sessions);
-                self.sessions.establishing.lock().await.remove(&key);
-                if session.close().await.is_err() {
-                    self.sessions
-                        .cleanup_failed
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                return Err(sidecar_closing());
-            }
-            sessions.insert(id.clone(), Arc::new(session));
-        }
         self.sessions.establishing.lock().await.remove(&key);
-        Ok(json!({
-            "sessionId": id,
-            "nativeSessionId": native_session_id,
-            "capabilities": capabilities,
-            "agentInfo": agent_info.unwrap_or(Value::Null),
-            "sessionState": session_state.unwrap_or(Value::Null),
-        }))
+        Ok(response)
     }
 
     async fn session_prompt(&self, params: Value) -> Result<Value, RpcErrorObject> {
@@ -473,15 +499,26 @@ async fn serve() -> i32 {
         .sessions
         .closing
         .store(true, std::sync::atomic::Ordering::Release);
-    let establishing: Vec<tokio::task::JoinHandle<()>> = {
+    let establishing: Vec<Establishment> = {
         let mut establishing = delegate.sessions.establishing.lock().await;
-        establishing.drain().map(|(_, task)| task).collect()
+        establishing.drain().map(|(_, entry)| entry).collect()
     };
-    for task in establishing {
-        task.abort();
-        // Await the abort landing: dropping the open future terminates the
-        // establishing agent tree before this process exits.
-        let _ = task.await;
+    for entry in establishing {
+        // A task still inside `open_session` is aborted: dropping the open
+        // future terminates the spawned agent tree. A task past open owns a
+        // live session and finishes its close-or-insert instead.
+        if !entry.handoff.load(std::sync::atomic::Ordering::Acquire) {
+            entry.task.abort();
+        }
+        if entry.task.await.is_err() && entry.handoff.load(std::sync::atomic::Ordering::Acquire) {
+            // The task owned a live session but never finished its
+            // close-or-insert (aborted at the boundary, or panicked): the
+            // drop killed the tree, but no clean close ran.
+            delegate
+                .sessions
+                .cleanup_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     let sessions: Vec<Arc<AgentSession>> = {
         let mut sessions = delegate.sessions.inner.lock().await;

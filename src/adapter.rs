@@ -58,8 +58,17 @@ pub struct CliSession {
     lane: Arc<CliLane>,
     request: SessionRequest,
     events: mpsc::UnboundedSender<AgentEvent>,
-    lifecycle: tokio::sync::RwLock<()>,
-    cleanup_failure: std::sync::Mutex<Option<AdapterError>>,
+    /// Turn lifecycle: each turn's read guard is held by its driver task, so
+    /// close's write guard waits for every owned turn to finish — including
+    /// one whose caller dropped its waiting future.
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+    /// Serial turn admission; the guard is owned by the driver task, so a
+    /// waiterless turn still blocks the next prompt until it completes.
+    turn: Arc<tokio::sync::Mutex<()>>,
+    /// The RPC lane's recovery contract: set when a completed turn's outcome
+    /// was uncertain; the next prompt is refused until the session closes.
+    recovery_required: Arc<AtomicBool>,
+    cleanup_failure: Arc<std::sync::Mutex<Option<AdapterError>>>,
 }
 
 impl CliSession {
@@ -134,7 +143,13 @@ impl AgentSession {
                     .await
             }
             LaneSession::Cli(session) => {
-                let _active = session.lifecycle.read().await;
+                // The session owns the dispatched turn: this future only
+                // awaits the outcome. Dropping it detaches the waiter — the
+                // driver task keeps the turn, its process, and its
+                // admission/lifecycle guards until real completion (output,
+                // receipt and exit status are still collected and retained).
+                let admission = session.turn.clone().lock_owned().await;
+                let active = session.lifecycle.clone().read_owned().await;
                 let cancelled = session.lane.cancelled.subscribe();
                 if self.closed.load(Ordering::Acquire) {
                     return Err(AdapterError::permanent(
@@ -142,28 +157,61 @@ impl AgentSession {
                         "session/prompt",
                     ));
                 }
-                let outcome = session
-                    .lane
-                    .run_turn_subscribed(
-                        &session.request,
-                        &request.text,
-                        request.model.as_deref(),
-                        request.effort.as_deref(),
-                        session.events.clone(),
-                        cancelled,
-                    )
-                    .await;
-                if let Err(error) = &outcome {
-                    if matches!(
-                        error.code,
-                        "agent_process_terminate_failed"
-                            | "agent_process_wait_failed"
-                            | "agent_process_interrupt_failed"
-                    ) {
-                        *session.cleanup_failure.lock().unwrap() = Some(error.clone());
-                    }
+                if session.recovery_required.load(Ordering::Acquire) {
+                    return Err(AdapterError::uncertain(
+                        "agent_session_recovery_required",
+                        "session/prompt",
+                    ));
                 }
-                outcome
+                let lane = session.lane.clone();
+                let session_request = session.request.clone();
+                let events = session.events.clone();
+                let recovery_required = session.recovery_required.clone();
+                let cleanup_failure = session.cleanup_failure.clone();
+                let TurnRequest {
+                    text,
+                    model,
+                    effort,
+                } = request;
+                let driver = tokio::spawn(async move {
+                    let _admission = admission;
+                    let _active = active;
+                    // Uncertain until the turn reports a known outcome — a
+                    // driver panic unwinds without clearing this.
+                    recovery_required.store(true, Ordering::Release);
+                    let outcome = lane
+                        .run_turn_subscribed(
+                            &session_request,
+                            &text,
+                            model.as_deref(),
+                            effort.as_deref(),
+                            events,
+                            cancelled,
+                        )
+                        .await;
+                    // The RPC lane's recovery contract: only an uncertain
+                    // outcome poisons the next turn; a known outcome
+                    // (success, failure, explicit cancel) leaves the
+                    // session usable.
+                    recovery_required.store(
+                        outcome.as_ref().is_err_and(|error| error.uncertain_effect),
+                        Ordering::Release,
+                    );
+                    if let Err(error) = &outcome {
+                        if matches!(
+                            error.code,
+                            "agent_process_terminate_failed"
+                                | "agent_process_wait_failed"
+                                | "agent_process_interrupt_failed"
+                        ) {
+                            *cleanup_failure.lock().unwrap() = Some(error.clone());
+                        }
+                    }
+                    outcome
+                });
+                driver.await.map_err(|_| {
+                    AdapterError::uncertain("agent_session_driver_failed", "session/prompt")
+                })?
             }
         }
     }
@@ -486,8 +534,10 @@ impl Adapter {
                         lane: Arc::new(lane),
                         request,
                         events,
-                        lifecycle: tokio::sync::RwLock::new(()),
-                        cleanup_failure: std::sync::Mutex::new(None),
+                        lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+                        turn: Arc::new(tokio::sync::Mutex::new(())),
+                        recovery_required: Arc::new(AtomicBool::new(false)),
+                        cleanup_failure: Arc::new(std::sync::Mutex::new(None)),
                     }),
                     before_turn: self.before_turn.clone(),
                     closed: AtomicBool::new(false),

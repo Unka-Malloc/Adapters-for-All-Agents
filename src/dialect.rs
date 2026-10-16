@@ -361,84 +361,78 @@ fn emit_hooks(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) 
                 );
             }
         }
-        HookSurface::Extension { file, kind, map } => match kind {
-            ExtensionKind::Pi => {
-                let mut emitted = Vec::new();
-                for hook in &set.hooks {
-                    if hook.intent != HookIntent::Notify {
-                        plan.report(item(hook), Support::Unsupported,
-                            Some("generated event observers support Notify only; no veto or output injection"));
-                        continue;
-                    }
-                    match map.iter().find(|(event, _)| *event == hook.event) {
-                        Some((_, event)) => {
-                            emitted.push((*event, hook));
-                            plan.report(
-                                item(hook),
-                                Support::Adapted,
-                                Some("emitted as a generated pi extension"),
-                            );
-                        }
-                        None => plan.report(
-                            item(hook),
-                            Support::Unsupported,
-                            Some("no pi extension event equivalent"),
-                        ),
-                    }
+        HookSurface::Extension { file, kind, map } => {
+            // One admission pass for generated-code observers: intent
+            // support and event mapping are dialect-neutral policy with a
+            // single authoritative implementation; only the rendering
+            // format branches per extension kind.
+            let (surface, adapted_note) = match kind {
+                ExtensionKind::Pi => ("pi extension", "emitted as a generated pi extension"),
+                ExtensionKind::OpenCode => (
+                    "opencode plugin",
+                    "emitted inside a generated opencode plugin",
+                ),
+            };
+            let mut emitted = Vec::new();
+            for hook in &set.hooks {
+                if hook.intent != HookIntent::Notify {
+                    plan.report(item(hook), Support::Unsupported,
+                        Some("generated event observers support Notify only; no veto or output injection"));
+                    continue;
                 }
-                if !emitted.is_empty() {
-                    let mut body =
-                        String::from("// @a4aa-managed\nexport default function (pi) {\n");
-                    for (event, hook) in emitted {
-                        let command = serde_json::to_string(&hook.command).unwrap_or_default();
-                        body.push_str(&format!(
-                            "  pi.on('{event}', async () => {{ const {{ execSync }} = await import('node:child_process'); try {{ execSync({command}, {{ stdio: 'pipe' }}) }} catch (_) {{}} }})\n"
-                        ));
+                match map.iter().find(|(event, _)| *event == hook.event) {
+                    Some((_, event)) => {
+                        emitted.push((*event, hook));
+                        plan.report(item(hook), Support::Adapted, Some(adapted_note));
                     }
-                    body.push_str("}\n");
-                    plan.push(ArtifactScope::UserHome, file, body, WriteMode::Create);
+                    None => plan.report(
+                        item(hook),
+                        Support::Unsupported,
+                        Some(&format!("no {surface} event equivalent")),
+                    ),
                 }
             }
-            ExtensionKind::OpenCode => {
-                let mut emitted = Vec::new();
-                for hook in &set.hooks {
-                    if hook.intent != HookIntent::Notify {
-                        plan.report(item(hook), Support::Unsupported,
-                            Some("generated event observers support Notify only; no veto or output injection"));
-                        continue;
-                    }
-                    match map.iter().find(|(event, _)| *event == hook.event) {
-                        Some((_, event)) => {
-                            emitted.push((*event, hook));
-                            plan.report(
-                                item(hook),
-                                Support::Adapted,
-                                Some("emitted inside a generated opencode plugin"),
-                            );
-                        }
-                        None => plan.report(
-                            item(hook),
-                            Support::Unsupported,
-                            Some("no opencode plugin event equivalent"),
-                        ),
-                    }
-                }
-                if !emitted.is_empty() {
-                    let mut body = String::from(
-                        "// @a4aa-managed\nexport const a4aaHooks = async () => ({\n  event: async ({ event }) => {\n",
-                    );
-                    for (event, hook) in emitted {
-                        let command = serde_json::to_string(&hook.command).unwrap_or_default();
-                        body.push_str(&format!(
-                            "    if (event.type === '{event}') {{ const {{ execSync }} = await import('node:child_process'); try {{ execSync({command}) }} catch (_) {{}} }}\n"
-                        ));
-                    }
-                    body.push_str("  },\n})\n");
-                    plan.push(ArtifactScope::UserHome, file, body, WriteMode::Create);
-                }
+            if !emitted.is_empty() {
+                let body = match kind {
+                    ExtensionKind::Pi => pi_extension_body(&emitted),
+                    ExtensionKind::OpenCode => opencode_plugin_body(&emitted),
+                };
+                plan.push(ArtifactScope::UserHome, file, body, WriteMode::Create);
             }
-        },
+        }
     }
+}
+
+/// Pi extension body: one `pi.on` observer per admitted hook. Observers
+/// never veto — a failed command reports the event, command and reason to
+/// the host log (`console.error`, the extension host's diagnostic channel)
+/// and is never rethrown.
+fn pi_extension_body(emitted: &[(&str, &HookDecl)]) -> String {
+    let mut body = String::from("// @a4aa-managed\nexport default function (pi) {\n");
+    for (event, hook) in emitted {
+        let command = serde_json::to_string(&hook.command).unwrap_or_default();
+        body.push_str(&format!(
+            "  pi.on('{event}', async () => {{ const {{ execSync }} = await import('node:child_process'); try {{ execSync({command}, {{ stdio: 'pipe' }}) }} catch (error) {{ console.error('[a4aa] observer hook failed', {{ event: '{event}', command: {command}, reason: String(error) }}) }} }})\n"
+        ));
+    }
+    body.push_str("}\n");
+    body
+}
+
+/// OpenCode plugin body: one event dispatcher per admitted hook, same
+/// fail-open diagnostic contract as [`pi_extension_body`].
+fn opencode_plugin_body(emitted: &[(&str, &HookDecl)]) -> String {
+    let mut body = String::from(
+        "// @a4aa-managed\nexport const a4aaHooks = async () => ({\n  event: async ({ event }) => {\n",
+    );
+    for (event, hook) in emitted {
+        let command = serde_json::to_string(&hook.command).unwrap_or_default();
+        body.push_str(&format!(
+            "    if (event.type === '{event}') {{ const {{ execSync }} = await import('node:child_process'); try {{ execSync({command}) }} catch (error) {{ console.error('[a4aa] observer hook failed', {{ event: '{event}', command: {command}, reason: String(error) }}) }} }}\n"
+        ));
+    }
+    body.push_str("  },\n})\n");
+    body
 }
 
 /// Claude-dialect hook fragment: `{"hooks":{"Event":[{matcher?,hooks:

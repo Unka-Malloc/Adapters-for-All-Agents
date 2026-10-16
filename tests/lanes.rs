@@ -1636,3 +1636,233 @@ for line in sys.stdin:
         "a non-auth failure triggered authenticate: {log}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_eof_after_completed_handoff_closes_the_inserted_session() {
+    struct Guard(Option<libc::pid_t>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let mut guard = Guard(None);
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let directory = tempfile::tempdir().unwrap();
+        let pidfile = directory.path().join("agent.pid");
+        let release = directory.path().join("release");
+        // The agent answers initialize only once the release file exists,
+        // then stays alive: the establishment completes into a live session.
+        let script = r#"
+import os,sys,time,pathlib,json,signal
+pathlib.Path(os.environ['A4AA_TEST_PID']).write_text(str(os.getpid()))
+m=json.loads(sys.stdin.readline())
+release=pathlib.Path(os.environ['A4AA_TEST_RELEASE'])
+while not release.exists(): time.sleep(0.01)
+print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'sessionId':'s'}}),flush=True)
+signal.pause()
+"#;
+        let spec = AgentSpec {
+            id: "gated-handoff".into(),
+            client_name: None,
+            max_output_bytes: Some(1024),
+            lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                initialize: Some(RpcCallSpec {
+                    method: "initialize".into(),
+                    params: json!({}),
+                }),
+                prompt: RpcCallSpec {
+                    method: "prompt".into(),
+                    params: json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            })),
+            command: CommandSpec {
+                program: "python3".into(),
+                args: vec!["-u".into(), "-c".into(), script.into()],
+                cwd: None,
+                env: fixture_env(&[
+                    ("A4AA_TEST_PID", pidfile.to_str().unwrap()),
+                    ("A4AA_TEST_RELEASE", release.to_str().unwrap()),
+                ]),
+            },
+        };
+        let mut child = tokio::process::Command::new(FIXTURE)
+            .arg("serve")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let peer = JsonRpcPeer::spawn(
+            child.stdout.take().unwrap(),
+            child.stdin.take().unwrap(),
+            Arc::new(SidecarEvents {
+                notifications: tx,
+                permission_granted: std::sync::atomic::AtomicBool::new(false),
+            }),
+            None,
+            a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+        );
+        let pending = peer
+            .start_call("session/open", json!({"spec": spec}))
+            .unwrap();
+        let pid: libc::pid_t = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                if let Ok(pid) = text.trim().parse() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+        };
+        guard.0 = Some(pid);
+        // Release the handshake while the host is still connected: the
+        // establishment task inserts the session before replying, so an Ok
+        // response proves the session is owned by the sessions map.
+        std::fs::write(&release, b"1").unwrap();
+        let opened = pending.wait().await.expect("session/open response");
+        assert!(opened["sessionId"].as_str().unwrap().starts_with("a4aa-"));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "session agent not live");
+        // Host EOF: shutdown closes the inserted session through the shared
+        // close path and reaps the agent.
+        peer.close().await;
+        let status = child.wait().await.unwrap();
+        assert!(status.success(), "sidecar exit {status:?}");
+        tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        })
+        .await
+        .expect("inserted session's agent survived sidecar shutdown");
+        guard.0 = None;
+    })
+    .await
+    .expect("completed-handoff shutdown stalled");
+    drop(guard);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_eof_racing_open_completion_never_strands_a_session() {
+    struct Guard(Vec<libc::pid_t>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let mut guard = Guard(Vec::new());
+    tokio::time::timeout(test_settings::WAIT_BUDGET * 8, async {
+        // Drive the completion-vs-shutdown race repeatedly: whichever side
+        // wins, the session is either inserted and closed by shutdown or
+        // closed by the establishment task — never left live and
+        // unregistered.
+        for _ in 0..8 {
+            let directory = tempfile::tempdir().unwrap();
+            let pidfile = directory.path().join("agent.pid");
+            let release = directory.path().join("release");
+            let script = r#"
+import os,sys,time,pathlib,json,signal
+pathlib.Path(os.environ['A4AA_TEST_PID']).write_text(str(os.getpid()))
+m=json.loads(sys.stdin.readline())
+release=pathlib.Path(os.environ['A4AA_TEST_RELEASE'])
+while not release.exists(): time.sleep(0.005)
+print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'sessionId':'s'}}),flush=True)
+signal.pause()
+"#;
+            let spec = AgentSpec {
+                id: "gated-handoff-race".into(),
+                client_name: None,
+                max_output_bytes: Some(1024),
+                lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                    initialize: Some(RpcCallSpec {
+                        method: "initialize".into(),
+                        params: json!({}),
+                    }),
+                    prompt: RpcCallSpec {
+                        method: "prompt".into(),
+                        params: json!({"text": "{prompt}"}),
+                    },
+                    ..Default::default()
+                })),
+                command: CommandSpec {
+                    program: "python3".into(),
+                    args: vec!["-u".into(), "-c".into(), script.into()],
+                    cwd: None,
+                    env: fixture_env(&[
+                        ("A4AA_TEST_PID", pidfile.to_str().unwrap()),
+                        ("A4AA_TEST_RELEASE", release.to_str().unwrap()),
+                    ]),
+                },
+            };
+            let mut child = tokio::process::Command::new(FIXTURE)
+                .arg("serve")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let peer = JsonRpcPeer::spawn(
+                child.stdout.take().unwrap(),
+                child.stdin.take().unwrap(),
+                Arc::new(SidecarEvents {
+                    notifications: tx,
+                    permission_granted: std::sync::atomic::AtomicBool::new(false),
+                }),
+                None,
+                a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+            );
+            let pending = peer
+                .start_call("session/open", json!({"spec": spec}))
+                .unwrap();
+            let pid: libc::pid_t = loop {
+                if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = text.trim().parse() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+            };
+            guard.0.push(pid);
+            // Complete the handshake and start shutdown back to back.
+            std::fs::write(&release, b"1").unwrap();
+            peer.close().await;
+            // The open resolves (inserted-then-closed by shutdown) or fails
+            // (closed by the establishment task, or the host left first) —
+            // both are the contract; an unregistered live session is not.
+            let _ = pending.wait().await;
+            let status = child.wait().await.unwrap();
+            assert!(status.success(), "sidecar exit {status:?}");
+            tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
+                }
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            })
+            .await
+            .expect("raced-open agent survived sidecar shutdown");
+            guard.0.pop();
+        }
+    })
+    .await
+    .expect("completion/shutdown race stalled");
+}
