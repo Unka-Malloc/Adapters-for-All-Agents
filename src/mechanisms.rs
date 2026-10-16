@@ -44,6 +44,8 @@ pub enum HookEvent {
     SubagentStop,
     PermissionRequest,
     Notification,
+    /// After context compaction completes (Devin `PostCompaction`).
+    PostCompaction,
 }
 
 /// What a hook is for. Dialects that cannot implement the requested intent
@@ -160,6 +162,10 @@ pub struct PermissionDecl {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Always-prompt rules where the native store carries a third list
+    /// (Devin and Claude `permissions.ask`); empty where it has none.
+    #[serde(default)]
+    pub ask: Vec<String>,
 }
 
 /// The complete semantic mechanism declaration carried by a profile.

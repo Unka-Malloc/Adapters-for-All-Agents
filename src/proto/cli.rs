@@ -980,17 +980,25 @@ fn token_usage(value: &Value) -> Option<TokenUsage> {
             "cacheReadInputTokens",
             "cache_read_tokens",
         ]),
+        cached_write: pick(&[
+            "cached_write_tokens",
+            "cachedWriteTokens",
+            "cache_write_tokens",
+        ]),
         output: pick(&[
             "output_tokens",
             "outputTokens",
             "completion_tokens",
             "completionTokens",
         ]),
+        thought: pick(&["thought_tokens", "thoughtTokens", "reasoning_tokens"]),
         total: pick(&["total_tokens", "totalTokens"]),
     };
     (usage.input.is_some()
         || usage.cached_input.is_some()
+        || usage.cached_write.is_some()
         || usage.output.is_some()
+        || usage.thought.is_some()
         || usage.total.is_some())
     .then_some(usage)
 }

@@ -39,7 +39,7 @@ use crate::error::AdapterError;
 use crate::model::TurnRequest;
 use crate::model::{
     AgentEvent, AgentInfo, Capabilities, CommandSpec, SelectorPhase, SelectorSupport,
-    SelectorSupportSet, SessionConfig, SessionRequest, TurnOutcome,
+    SelectorSupportSet, SessionConfig, SessionRequest, TokenUsage, TurnOutcome,
 };
 use crate::observe::SharedObserver;
 use crate::supervision::SupervisedChild;
@@ -496,6 +496,9 @@ pub struct AcpLane {
     pub command: CommandSpec,
     pub mcp_servers: Vec<Value>,
     pub prefer_load: bool,
+    /// Resolved lazily on an auth-required refusal and sent as
+    /// `authenticate`'s `_meta.api_key`.
+    pub auth_key: Option<crate::env::EnvSource>,
     pub client_name: String,
     pub secrets: Arc<dyn SecretResolver>,
     pub observer: SharedObserver,
@@ -548,6 +551,8 @@ impl AcpLane {
                 resume,
                 config: request.config,
                 output,
+                auth_key: self.auth_key.clone(),
+                secrets: self.secrets.clone(),
             },
             command_rx,
             ready,
@@ -608,6 +613,8 @@ struct ServeContext {
     resume: Option<String>,
     config: SessionConfig,
     output: OutputSink,
+    auth_key: Option<crate::env::EnvSource>,
+    secrets: Arc<dyn SecretResolver>,
 }
 
 /// The connection foreground: performs the handshake, then serves turn
@@ -825,7 +832,14 @@ async fn open_session(
             mcp_servers: mcp,
         }
     };
-    let response = call_with_auth_retry(connection, &call, &auth_methods).await?;
+    let response = call_with_auth_retry(
+        connection,
+        &call,
+        &auth_methods,
+        context.auth_key.as_ref(),
+        &*context.secrets,
+    )
+    .await?;
     let mut setup = SessionSetup::parse(response)?;
     let session_id = match context.resume.as_deref() {
         Some(binding) => binding.to_owned(),
@@ -928,6 +942,8 @@ async fn call_with_auth_retry(
     connection: &ConnectionTo<Agent>,
     call: &SessionCall,
     auth_methods: &[AuthMethodId],
+    auth_key: Option<&crate::env::EnvSource>,
+    secrets: &dyn SecretResolver,
 ) -> Result<Value, AdapterError> {
     let establish_error = match call.send(connection).await {
         Ok(response) => return Ok(response),
@@ -938,14 +954,23 @@ async fn call_with_auth_retry(
     {
         return Err(protocol_failure(call.stage(), establish_error));
     }
+    // Resolve the declared credential once; an unavailable key skips the
+    // attach but does not block the plain method-id attempts.
+    let api_key = match auth_key {
+        Some(crate::env::EnvSource::HostEnv { host_env }) => std::env::var(host_env).ok(),
+        Some(crate::env::EnvSource::Secret { secret }) => secrets.resolve(secret).await,
+        None => None,
+    };
     let mut authenticated = false;
     for method_id in auth_methods {
-        if connection
-            .send_request(AuthenticateRequest::new(method_id.clone()))
-            .block_task()
-            .await
-            .is_ok()
-        {
+        let mut request = AuthenticateRequest::new(method_id.clone());
+        if let Some(key) = &api_key {
+            request.meta = Some(serde_json::Map::from_iter([(
+                "api_key".to_owned(),
+                Value::String(key.clone()),
+            )]));
+        }
+        if connection.send_request(request).block_task().await.is_ok() {
             authenticated = true;
             break;
         }
@@ -1352,8 +1377,16 @@ async fn run_prompt(
         text: String::new(),
         truncated: false,
         exit_code: None,
-        // ACP's turn-usage field is behind the SDK's unstable feature flag.
-        usage: None,
+        // Reported verbatim when the agent fills the unstable end-turn
+        // usage field; absent data stays absent, never a zero.
+        usage: response.usage.as_ref().map(|usage| TokenUsage {
+            input: Some(usage.input_tokens),
+            cached_input: usage.cached_read_tokens,
+            cached_write: usage.cached_write_tokens,
+            output: Some(usage.output_tokens),
+            thought: usage.thought_tokens,
+            total: Some(usage.total_tokens),
+        }),
     })
 }
 

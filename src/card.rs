@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
-use crate::env::EnvPolicy;
+use crate::env::{EnvPolicy, EnvSource};
 use crate::model::{
     AgentSpec, BindingReceiptShape, CliLaneSpec, CommandSpec, LaneSpec, PromptChannel, RpcCallSpec,
     RpcCompletionSpec, RpcEnvelopeSpec, RpcLaneSpec, SessionScope, StreamMode,
@@ -60,9 +60,14 @@ impl AgentCard {
     /// resume fails closed at open.
     pub fn spec(&self) -> AgentSpec {
         let lane = match &self.surface {
-            AgentSurface::Acp { prefer_load, .. } => LaneSpec::Acp {
+            AgentSurface::Acp {
+                prefer_load,
+                auth_key,
+                ..
+            } => LaneSpec::Acp {
                 mcp_servers: Vec::new(),
                 prefer_load: *prefer_load,
+                auth_key: auth_key.map(AcpAuthKey::source),
             },
             AgentSurface::Cli(cli) => LaneSpec::Cli(Box::new(CliLaneSpec {
                 args: cli.args.iter().map(|arg| (*arg).to_owned()).collect(),
@@ -180,12 +185,42 @@ pub enum AgentSurface {
     Acp {
         prefer_load: bool,
         spawn_args: &'static [&'static str],
+        /// Credential source for the `authenticate` retry: when session
+        /// establishment is refused with auth-required, the lane sends the
+        /// resolved value as `_meta.api_key` alongside the advertised
+        /// method id (Devin's contract). `None` keeps the stock
+        /// method-id-only attempt.
+        auth_key: Option<AcpAuthKey>,
     },
     /// Argv/stdin CLI, one process per turn.
     Cli(CliSurface),
     /// Host-declared JSON-RPC methods over stdio. Cards are `const`, so the
     /// surface rides by reference — `Box` cannot be built in const context.
     Rpc(&'static RpcSurface),
+}
+
+/// Const-declared `api_key` source for the acp `authenticate` retry;
+/// materializes to an [`EnvSource`] on the spec so secret resolution
+/// stays host-side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpAuthKey {
+    /// Read this host environment variable at session open.
+    HostEnv(&'static str),
+    /// Resolve this reference through the host's `SecretResolver`.
+    Secret(&'static str),
+}
+
+impl AcpAuthKey {
+    fn source(self) -> EnvSource {
+        match self {
+            Self::HostEnv(name) => EnvSource::HostEnv {
+                host_env: name.to_owned(),
+            },
+            Self::Secret(reference) => EnvSource::Secret {
+                secret: reference.to_owned(),
+            },
+        }
+    }
 }
 
 /// Process-per-turn CLI contract.

@@ -287,6 +287,7 @@ fn claude_rules_permissions_commands_mcp_native() {
             mode: Some("default".into()),
             allow: vec!["Shell(ls)".into()],
             deny: vec!["Shell(rm)".into()],
+            ..Default::default()
         }),
         mcp_servers: [("fs".to_owned(), serde_json::json!({"command": "fs-mcp"}))]
             .into_iter()
@@ -352,6 +353,7 @@ fn cursor_flat_hooks_and_permissions() {
             mode: Some("yolo".into()),
             allow: vec!["Shell(ls)".into()],
             deny: vec![],
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -422,6 +424,7 @@ fn antigravity_named_bundle_and_unsupported_events() {
             mode: Some("request-review".into()),
             allow: vec!["command(git)".into()],
             deny: vec![],
+            ..Default::default()
         }),
         mcp_servers: [("fs".to_owned(), serde_json::json!({"command": "fs-mcp"}))]
             .into_iter()

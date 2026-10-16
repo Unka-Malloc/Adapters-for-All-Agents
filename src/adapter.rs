@@ -436,6 +436,7 @@ impl Adapter {
             LaneSpec::Acp {
                 mcp_servers,
                 prefer_load,
+                auth_key,
             } => {
                 struct Bridge {
                     events: mpsc::UnboundedSender<AgentEvent>,
@@ -461,6 +462,7 @@ impl Adapter {
                     command: self.spec.command.clone(),
                     mcp_servers: mcp_servers.clone(),
                     prefer_load: *prefer_load,
+                    auth_key: auth_key.clone(),
                     client_name: self
                         .spec
                         .client_name

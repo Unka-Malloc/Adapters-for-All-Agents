@@ -35,6 +35,7 @@ fn acp_spec() -> AgentSpec {
         lane: LaneSpec::Acp {
             mcp_servers: vec![],
             prefer_load: false,
+            auth_key: None,
         },
         command: fixture_command(),
         max_output_bytes: None,
@@ -945,7 +946,7 @@ else:
         send({'jsonrpc':'2.0','id':m['id'],'result':result})
 "#);
             let lane=match mode {
-                "acp"=>LaneSpec::Acp {mcp_servers:vec![],prefer_load:false},
+                "acp"=>LaneSpec::Acp {mcp_servers:vec![],prefer_load:false,auth_key:None},
                 "cli"|"pty"=>LaneSpec::Cli(Box::new(CliLaneSpec {args:vec!["{prompt}".into()],prompt_channel:PromptChannel::ArgOnly,
                     stream:if mode=="pty" {StreamMode::Pty}else{StreamMode::Stdio},..Default::default()})),
                 _=>LaneSpec::Rpc(Box::new(RpcLaneSpec {prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
@@ -1505,6 +1506,7 @@ time.sleep(3600)
                 "acp" => LaneSpec::Acp {
                     mcp_servers: vec![],
                     prefer_load: false,
+                    auth_key: None,
                 },
                 _ => LaneSpec::Rpc(Box::new(RpcLaneSpec {
                     initialize: Some(RpcCallSpec {

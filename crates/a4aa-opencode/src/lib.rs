@@ -84,6 +84,7 @@ pub const AGENT: AgentCard = AgentCard {
         // that already persists sessions; prefer it over re-prompting.
         prefer_load: true,
         spawn_args: &["acp"],
+        auth_key: None,
     },
     detect: DetectSurface {
         binaries: &["opencode"],

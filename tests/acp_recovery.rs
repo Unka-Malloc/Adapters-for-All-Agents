@@ -60,6 +60,7 @@ async fn host_callbacks_can_close_their_own_session() {
                 },
                 mcp_servers: vec![],
                 prefer_load: false,
+                auth_key: None,
                 client_name: "close-fixture".into(),
                 secrets: Arc::new(a4aa::NoSecrets),
                 observer: None,
@@ -109,6 +110,7 @@ fn fixture(script: &str, cwd: &std::path::Path, limit: Option<usize>) -> Adapter
         lane: LaneSpec::Acp {
             mcp_servers: vec![],
             prefer_load: false,
+            auth_key: None,
         },
     })
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::env::EnvPolicy;
+use crate::env::{EnvPolicy, EnvSource};
 use crate::template::{contains_placeholder, contains_placeholder_text};
 
 /// Access lane selected for an agent.
@@ -342,6 +342,12 @@ pub enum LaneSpec {
         /// Try `session/load` when a resume binding exists.
         #[serde(default)]
         prefer_load: bool,
+        /// Credential the lane resolves and sends as `_meta.api_key` on
+        /// the `authenticate` retry when session establishment is refused
+        /// with auth-required. Absent: the stock method-id-only
+        /// authenticate attempt.
+        #[serde(default)]
+        auth_key: Option<EnvSource>,
     },
     Rpc(Box<RpcLaneSpec>),
     Cli(Box<CliLaneSpec>),
@@ -613,7 +619,11 @@ pub struct TokenUsage {
     #[serde(default)]
     pub cached_input: Option<u64>,
     #[serde(default)]
+    pub cached_write: Option<u64>,
+    #[serde(default)]
     pub output: Option<u64>,
+    #[serde(default)]
+    pub thought: Option<u64>,
     #[serde(default)]
     pub total: Option<u64>,
 }

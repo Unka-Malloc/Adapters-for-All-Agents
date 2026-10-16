@@ -116,6 +116,10 @@ pub enum CommandSurface {
     PromptDir(&'static str),
     /// `<dir>/<name>.toml` Gemini command files.
     TomlDir(&'static str),
+    /// Agents whose slash command *is* a skill pack: the declaration emits
+    /// `<dir>/<name>/SKILL.md` with a user-only trigger (Devin, Windsurf
+    /// family). Reported `Adapted` — a command rides the skill mechanism.
+    SkillDir(&'static str),
 }
 
 /// How declarative subagents are stored.
@@ -473,6 +477,7 @@ fn claude_event_name(event: HookEvent) -> String {
         HookEvent::SubagentStop => "SubagentStop",
         HookEvent::PermissionRequest => "PermissionRequest",
         HookEvent::Notification => "Notification",
+        HookEvent::PostCompaction => "PostCompaction",
     }
     .to_owned()
 }
@@ -568,6 +573,19 @@ fn emit_commands(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPla
                 );
                 plan.report(item, Support::Adapted, None);
             }
+            CommandSurface::SkillDir(dir) => {
+                plan.push(
+                    ArtifactScope::UserHome,
+                    &format!("{dir}/{}/SKILL.md", command.name),
+                    skill_command_body(command),
+                    WriteMode::Create,
+                );
+                plan.report(
+                    item,
+                    Support::Adapted,
+                    Some("emitted as a skill slash command"),
+                );
+            }
         }
     }
 }
@@ -582,6 +600,18 @@ fn command_body_md(command: &CommandDecl) -> String {
         }
         None => format!("{}\n", command.content),
     }
+}
+
+/// A command emitted as a skill pack: `name`/`description` frontmatter plus
+/// `triggers: [user]` so the pack stays user-invoked and is never
+/// auto-triggered by the agent — a slash command is not an autonomous skill.
+fn skill_command_body(command: &CommandDecl) -> String {
+    let mut front = format!("---\nname: {}\n", command.name);
+    if let Some(description) = &command.description {
+        front.push_str(&format!("description: {description}\n"));
+    }
+    front.push_str("triggers:\n  - user\n---\n\n");
+    format!("{front}{}\n", command.content)
 }
 
 // ----------------------------- subagents -----------------------------------
@@ -728,6 +758,9 @@ fn emit_permissions(dialect: &Dialect, set: &MechanismSet, plan: &mut Adaptation
                 "allow": permissions.allow,
                 "deny": permissions.deny,
             });
+            if !permissions.ask.is_empty() {
+                fragment["ask"] = serde_json::json!(permissions.ask);
+            }
             match (&permissions.mode, mode_key) {
                 (Some(mode), Some(key)) => {
                     fragment[key] = serde_json::json!(mode);

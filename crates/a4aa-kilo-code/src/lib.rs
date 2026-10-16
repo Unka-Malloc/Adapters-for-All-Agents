@@ -105,6 +105,7 @@ mod tests {
                 mode: None,
                 allow: vec!["Shell(ls)".into()],
                 deny: vec!["Shell(rm)".into()],
+                ask: vec![],
             }),
             mcp_servers: [(
                 "local".to_owned(),

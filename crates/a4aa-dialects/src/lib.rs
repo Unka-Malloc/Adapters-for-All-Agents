@@ -64,6 +64,7 @@ static CARDS: &[(&str, &AgentCard)] = &[
     ("claude", a4aa_claude::card()),
     ("codex", a4aa_codex::card()),
     ("cursor", a4aa_cursor::card()),
+    ("devin", a4aa_devin::card()),
     ("dsh", a4aa_dsh::card()),
     ("opencode", a4aa_opencode::card()),
     ("pi", a4aa_pi::card()),
