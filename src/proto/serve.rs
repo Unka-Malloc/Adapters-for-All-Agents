@@ -510,7 +510,10 @@ impl ServeSession {
                 Some(&json!({"text": request.text})),
             )
             .await?;
-        let user_message = marker["data"]["id"].as_str().unwrap_or_default().to_owned();
+        // Bound this turn by the prompt record's creation time, not its id:
+        // the message feed paginates and the user record ages out of the
+        // newest page on long turns.
+        let marker_ms = marker["data"]["time"]["created"].as_u64().unwrap_or(0);
         // The poll is the turn: no internal deadline, the caller's own
         // supervision decides how long a viable turn may run.
         loop {
@@ -524,9 +527,9 @@ impl ServeSession {
                 )
                 .await?;
             let messages = feed["data"].as_array().cloned().unwrap_or_default();
-            match terminal(&messages, &user_message) {
+            match terminal(&messages, marker_ms) {
                 Some(IdleRecord { outcome, .. }) if outcome == "succeeded" => {
-                    let (text, usage) = collect_output(&messages, &user_message);
+                    let (text, usage) = collect_output(&messages, marker_ms);
                     // No stream exists on this lane: deliver the completed
                     // text as one chunk and the terminal usage record so
                     // observers see the same event shape other lanes emit.
@@ -600,43 +603,46 @@ impl ServeSession {
     }
 }
 
-/// The terminal `idle` record covering the turn's user message, if it has
-/// arrived yet. Messages stream newest-first; the idle record that ends a
-/// turn appears above its user message.
-fn terminal(messages: &[Value], user_message: &str) -> Option<IdleRecord> {
+/// A record's creation time in milliseconds; records without a timestamp
+/// count as the newest so they stay visible.
+fn created_ms(message: &Value) -> u64 {
+    message["time"]["created"].as_u64().unwrap_or(u64::MAX)
+}
+
+/// The terminal `idle` record covering this turn, if it has arrived yet.
+/// Messages stream newest-first; only records at or after `marker_ms` (the
+/// prompt's creation time) belong to this turn — a stale `idle` from an
+/// earlier turn cannot close the poll.
+fn terminal(messages: &[Value], marker_ms: u64) -> Option<IdleRecord> {
     for message in messages {
-        match message["type"].as_str() {
-            Some("idle") => {
-                return Some(IdleRecord {
-                    outcome: message["outcome"].as_str().unwrap_or("failed").to_owned(),
-                    error: message["error"]["message"].as_str().map(str::to_owned),
-                });
-            }
-            _ if message["id"].as_str() == Some(user_message) => return None,
-            _ => {}
+        if created_ms(message) < marker_ms {
+            break;
+        }
+        if message["type"].as_str() == Some("idle") {
+            return Some(IdleRecord {
+                outcome: message["outcome"].as_str().unwrap_or("failed").to_owned(),
+                error: message["error"]["message"].as_str().map(str::to_owned),
+            });
         }
     }
     None
 }
 
 /// Accumulate assistant text and the last usage record from the completed
-/// turn — the messages that arrived after `user_message` in the feed.
-fn collect_output(messages: &[Value], user_message: &str) -> (String, Option<TokenUsage>) {
+/// turn — the assistant records created at or after `marker_ms`.
+fn collect_output(messages: &[Value], marker_ms: u64) -> (String, Option<TokenUsage>) {
     let mut text = String::new();
     let mut usage = None;
     // Feed order is newest-first; walk it in reverse for chronological
-    // output and stop at the user message that started this turn.
-    let mut parts: Vec<&Value> = messages.iter().collect();
+    // output. Records older than the marker belong to earlier turns.
+    let mut parts: Vec<&Value> = messages
+        .iter()
+        .filter(|message| {
+            created_ms(message) >= marker_ms && message["type"].as_str() == Some("assistant")
+        })
+        .collect();
     parts.reverse();
-    let mut in_turn = user_message.is_empty();
     for message in parts {
-        if !in_turn {
-            in_turn = message["id"].as_str() == Some(user_message);
-            continue;
-        }
-        if message["type"].as_str() != Some("assistant") {
-            continue;
-        }
         for part in message["content"].as_array().into_iter().flatten() {
             if part["type"].as_str() == Some("text") {
                 if let Some(chunk) = part["text"].as_str() {
@@ -722,24 +728,41 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_record_is_the_idle_above_the_user_message() {
+    fn the_terminal_record_is_the_idle_at_or_after_the_prompt_marker() {
+        // Newest-first feed; marker 100 separates this turn from the last.
         let messages = vec![
-            json!({"type": "idle", "outcome": "succeeded"}),
-            json!({"id": "m1", "type": "assistant", "content": [{"type": "text", "text": "hi"}]}),
-            json!({"id": "u1", "type": "user"}),
-            json!({"type": "idle", "outcome": "failed"}),
+            json!({"type": "idle", "outcome": "succeeded", "time": {"created": 120}}),
+            json!({"id": "m1", "type": "assistant", "time": {"created": 110},
+                   "content": [{"type": "text", "text": "hi"}]}),
+            json!({"id": "u1", "type": "user", "time": {"created": 100}}),
+            json!({"type": "idle", "outcome": "failed", "time": {"created": 90}}),
         ];
-        let record = terminal(&messages, "u1").unwrap();
+        let record = terminal(&messages, 100).unwrap();
         assert_eq!(record.outcome, "succeeded");
-        // The user message sits above the only terminal record: this turn
-        // is still running.
+        // No idle at or after the marker: this turn is still running, and
+        // the older turn's terminal record must not close the poll.
         let running = vec![
-            json!({"id": "a1", "type": "assistant"}),
-            json!({"id": "u2", "type": "user"}),
-            json!({"type": "idle", "outcome": "succeeded"}),
+            json!({"id": "a1", "type": "assistant", "time": {"created": 105}}),
+            json!({"id": "u2", "type": "user", "time": {"created": 100}}),
+            json!({"type": "idle", "outcome": "succeeded", "time": {"created": 90}}),
         ];
-        assert!(terminal(&running, "u2").is_none());
-        let (text, _) = collect_output(&messages, "u1");
+        assert!(terminal(&running, 100).is_none());
+        // A paginated page whose user record aged out still yields the
+        // turn's output and usage.
+        let (text, usage) = collect_output(&messages[..2], 100);
         assert_eq!(text, "hi");
+        assert!(usage.is_none());
+        let with_tokens = vec![
+            json!({"type": "idle", "outcome": "succeeded", "time": {"created": 120}}),
+            json!({"id": "m1", "type": "assistant", "time": {"created": 110},
+                   "content": [{"type": "text", "text": "hi"}],
+                   "tokens": {"input": 10, "output": 4, "reasoning": 1,
+                              "cache": {"read": 6, "write": 2}}}),
+            json!({"id": "u1", "type": "user", "time": {"created": 100}}),
+        ];
+        let (_, usage) = collect_output(&with_tokens, 100);
+        let usage = usage.unwrap();
+        assert_eq!(usage.input, Some(10));
+        assert_eq!(usage.cached_input, Some(6));
     }
 }
