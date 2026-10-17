@@ -104,7 +104,7 @@ Spawn `a4aa serve`; speak NDJSON JSON-RPC `a4aa.v1` on its stdio:
 
 ```jsonc
 // → request
-{"jsonrpc":"2.0","id":1,"method":"session/open","params":{"protocol":"a4aa.v1","spec":{...},"session":{...}}}
+{"jsonrpc":"2.0","id":1,"method":"session/open","params":{"spec":{...},"options":{...}}}
 // → request (returns when the turn ends)
 {"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"...","text":"..."}}
 // → request — cancel must be id-bearing, and the response must be checked:

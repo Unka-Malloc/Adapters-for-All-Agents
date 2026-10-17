@@ -56,22 +56,29 @@ pub fn all() -> impl Iterator<Item = (&'static str, &'static Dialect)> {
         .chain(std::iter::once(("generic", &GENERIC as &'static Dialect)))
 }
 
-/// `(name, card)` pairs for the adapter crates that publish an
-/// [`AgentCard`]. Cards land per agent — the list grows as crates adopt
-/// them; lookup returns `None` until a card exists.
+/// `(name, card)` pairs — every adapter crate in [`DIALECTS`] publishes an
+/// [`AgentCard`]; only the portable `generic` baseline has none.
 static CARDS: &[(&str, &AgentCard)] = &[
     ("antigravity", a4aa_antigravity::card()),
     ("claude", a4aa_claude::card()),
     ("codex", a4aa_codex::card()),
+    ("commandcode", a4aa_command_code::card()),
     ("cursor", a4aa_cursor::card()),
     ("devin", a4aa_devin::card()),
     ("dsh", a4aa_dsh::card()),
+    ("factory", a4aa_factory::card()),
+    ("grok", a4aa_grok::card()),
+    ("hermes", a4aa_hermes::card()),
+    ("kilocode", a4aa_kilo_code::card()),
+    ("kimicode", a4aa_kimi_code::card()),
+    ("kiro", a4aa_kiro::card()),
+    ("openclaw", a4aa_open_claw::card()),
     ("opencode", a4aa_opencode::card()),
     ("pi", a4aa_pi::card()),
 ];
 
-/// Look an agent's card up by id. `None` until the adapter crate publishes
-/// one — callers fall back to `dialect(name)` for write-surface knowledge.
+/// Look an agent's card up by id. `None` for `generic` and unknown names —
+/// callers fall back to `dialect(name)` for write-surface knowledge.
 pub fn card(name: &str) -> Option<&'static AgentCard> {
     CARDS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
@@ -129,6 +136,12 @@ mod tests {
         for (name, card) in cards() {
             assert_eq!(name, card.id);
             assert_eq!(dialect(name).map(|d| d.id), Some(card.dialect.id));
+        }
+        for (name, _) in all() {
+            if name == "generic" {
+                continue;
+            }
+            assert!(card(name).is_some(), "{name} has a dialect but no card");
         }
     }
 }

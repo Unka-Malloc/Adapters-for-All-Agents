@@ -11,6 +11,20 @@ pub mod pty;
 pub mod stdio;
 pub mod ws;
 
+/// True when `authority` (`host:port`, with an optional `[v6]` host) names a
+/// loopback peer. Agent daemons announce their own endpoints on stdout, so
+/// the announced authority must stay on this host: anything else would
+/// receive the lane's credentials and payloads over a cleartext socket.
+/// Strict literals only — `0.0.0.0`, `127.0.0.2`, and other spellings fail
+/// closed rather than guessing at resolver semantics.
+pub(crate) fn is_loopback_authority(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 /// RFC 4648 base64, standard alphabet — enough for basic-auth blobs and
 /// WebSocket handshake keys without pulling an encoding dependency.
 pub(crate) fn base64(data: &[u8]) -> String {

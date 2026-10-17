@@ -293,7 +293,20 @@ where
             observer.record("stdout", Direction::Received, line.as_bytes());
         }
         if let Some(url) = line.strip_prefix("server listening on ") {
-            base = Some(url.trim().to_owned());
+            let announced = url.trim();
+            let authority = announced
+                .strip_prefix("http://")
+                .unwrap_or(announced)
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            if !crate::transport::is_loopback_authority(authority) {
+                return Err(
+                    AdapterError::permanent("agent_protocol_failed", "session/open")
+                        .with_detail(format!("announced endpoint is not loopback: {announced}")),
+                );
+            }
+            base = Some(announced.to_owned());
         } else if let Some(secret) = line.strip_prefix("server password ") {
             password = Some(secret.trim().to_owned());
         }

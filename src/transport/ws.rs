@@ -63,6 +63,12 @@ fn parse_ws_url(url: &str) -> Result<(&str, &str), AdapterError> {
                 .with_detail(format!("websocket url lacks host:port: {url}")),
         );
     }
+    if !crate::transport::is_loopback_authority(authority) {
+        return Err(
+            AdapterError::permanent("agent_protocol_failed", "ws/connect")
+                .with_detail(format!("websocket endpoint is not loopback: {url}")),
+        );
+    }
     Ok((authority, path))
 }
 
@@ -331,6 +337,24 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ws_url_accepts_loopback_only() {
+        assert!(parse_ws_url("ws://127.0.0.1:9229/rpc").is_ok());
+        assert!(parse_ws_url("ws://localhost:3000").is_ok());
+        assert!(parse_ws_url("ws://[::1]:8080/").is_ok());
+        // An announced endpoint off this host would receive the lane's
+        // credentials over a cleartext socket — fail closed.
+        for hostile in [
+            "ws://203.0.113.9:80/",
+            "ws://attacker.example:443/",
+            "ws://0.0.0.0:9000/",
+            "ws://127.0.0.2:9000/",
+            "wss://127.0.0.1:443/",
+        ] {
+            assert!(parse_ws_url(hostile).is_err(), "{hostile} must fail closed");
+        }
+    }
 
     /// Decode a server→client (unmasked) frame built by hand.
     #[test]
