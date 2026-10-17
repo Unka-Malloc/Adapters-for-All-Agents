@@ -11,14 +11,15 @@
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
 use a4aa::card::{
-    AgentCard, AgentSurface, AttachmentSupport, CompletionDecl, DetectSurface, FeatureSurface,
-    HistoryRoot, InstructionChannel, ModelCatalog, OsPath, RpcCallDecl, RpcSurface, StoreKind,
-    TranscriptUsage, UsageSurface,
+    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
+    DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, OsPath,
+    RpcCallDecl, RpcSurface, RpcTransportDecl, StoreKind, TranscriptUsage, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
     Target,
 };
+use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
 
 /// The `codex` dialect: Codex hooks.json (Claude store), AGENTS.md, TOML subagents, custom prompts, native profiles.
@@ -70,7 +71,7 @@ pub const fn dialect() -> &'static Dialect {
 /// handshake, then `thread/start` (fresh) or `thread/resume` (bound). Turns
 /// run `turn/start` → async `turn/completed`; `turn/interrupt` cancels the
 /// in-flight turn. `account/rateLimits/read`, `model/list`, `thread/unarchive`,
-/// `thread/configure` and `turn/steer` stay available as passthrough.
+/// `turn/steer` stays available as passthrough.
 pub const AGENT: AgentCard = AgentCard {
     id: "codex",
     label: "Codex",
@@ -130,11 +131,55 @@ pub const AGENT: AgentCard = AgentCard {
             "account/rateLimits/read",
             "model/list",
             "thread/unarchive",
-            "thread/configure",
             "turn/steer",
         ],
         spawn_args: &["app-server"],
+        transport: RpcTransportDecl::Stdio,
     }),
+    alternates: &[AlternateLane {
+        // `codex exec --json` batch mode: NDJSON events on stdout —
+        // `thread.started` carries the id, `item.completed` agent_message
+        // items carry the reply text, `turn.completed` carries usage.
+        // Resume reorders argv (`codex exec resume <id> [prompt]`) and
+        // drops creation-only flags (`-C`/`-s` stay on the thread), so
+        // `resume_spawn_args` reorders the prefix and `resume_args`
+        // becomes the complete resume template.
+        surface: AgentSurface::Cli(CliSurface {
+            args: &[
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                "{cwd}",
+                "-m",
+                "{model}",
+                "-s",
+                "{permission}",
+                "{prompt}",
+            ],
+            prompt_channel: PromptChannel::ArgOnly,
+            stream: StreamMode::Stdio,
+            resume_spawn_args: &["exec", "resume", "{sessionId}"],
+            resume_args: &[
+                "--json",
+                "--skip-git-repo-check",
+                "-m",
+                "{model}",
+                "{prompt}",
+            ],
+            stdin_template: None,
+            json_lines: true,
+            session_id_path: Some("thread_id"),
+            open_args: &[],
+            binding_file_env: None,
+            binding_receipt_shape: BindingReceiptShape::SessionId,
+            result_selector: Some("item.completed"),
+            result_selector_field: Some("type"),
+            result_path: Some("item.text"),
+            usage_path: Some("usage"),
+            spawn_args: &["exec"],
+        }),
+        binary: None,
+    }],
     detect: DetectSurface {
         binaries: &["codex"],
         processes: &["codex.exe", "codex"],

@@ -10,20 +10,59 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Default)]
 pub(crate) struct Vars {
     values: BTreeMap<String, String>,
-    absent: Vec<&'static str>,
+    absent: Vec<String>,
 }
 impl Vars {
-    pub(crate) fn absent_names(&self) -> impl Iterator<Item = &&'static str> {
+    pub(crate) fn absent_names(&self) -> impl Iterator<Item = &String> {
         self.absent.iter()
     }
     pub(crate) fn is_absent_option(&self, template: &str) -> bool {
         template
             .strip_prefix('{')
             .and_then(|t| t.strip_suffix('}'))
-            .is_some_and(|name| self.absent.contains(&name))
+            .is_some_and(|name| self.absent.iter().any(|absent| absent == name))
     }
+    /// A resolved `{secret:NAME}` value — stored under its full placeholder
+    /// name so `secret:…` keys can never collide with plain vars.
+    pub(crate) fn set_secret(&mut self, name: &str, value: String) {
+        self.values.insert(format!("secret:{name}"), value);
+    }
+    /// An unresolved `{secret:NAME}` drops its leaf like any absent
+    /// optional selector — the wire never sees the literal placeholder,
+    /// and either/or credential pairs degrade to the credential present.
+    pub(crate) fn absent_secret(&mut self, name: &str) {
+        self.absent.push(format!("secret:{name}"));
+    }
+}
+
+/// `"{secret:NAME}"` placeholder names present in a params template —
+/// resolved by the lane before substitution.
+pub(crate) fn secret_names(template: &Value) -> Vec<String> {
+    fn walk(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                let mut rest = text.as_str();
+                while let Some(open) = rest.find("{secret:") {
+                    let tail = &rest[open + 8..];
+                    if let Some(end) = tail.find('}') {
+                        found.push(tail[..end].to_owned());
+                        rest = &tail[end + 1..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+            Value::Object(map) => map.values().for_each(|value| walk(value, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(template, &mut found);
+    found
 }
 
 /// Whether a template consumes one of the adapter's declared selector
@@ -80,7 +119,8 @@ pub(crate) fn vars(input: VarSpec<'_>) -> Vars {
         ("turnId", input.turn_id),
     ]
     .into_iter()
-    .filter_map(|(name, value)| value.is_none().then_some(name))
+    .filter(|(_, value)| value.is_none())
+    .map(|(name, _)| name.to_owned())
     .collect();
     let mut vars = BTreeMap::new();
     vars.insert("cwd".to_owned(), input.cwd.to_owned());

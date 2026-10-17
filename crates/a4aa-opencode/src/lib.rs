@@ -11,8 +11,8 @@
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
 use a4aa::card::{
-    AgentCard, AgentSurface, AttachmentSupport, DetectSurface, FeatureSurface, HistoryRoot,
-    InstructionChannel, ModelCatalog, OsPath, StoreKind, UsageSurface,
+    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, DetectSurface, FeatureSurface,
+    HistoryRoot, InstructionChannel, ModelCatalog, OsPath, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
@@ -66,26 +66,31 @@ pub const fn dialect() -> &'static Dialect {
 /// The `opencode` agent card: the official `opencode acp` NDJSON-stdio
 /// surface.
 ///
-/// Protocol: `opencode acp` speaks
-/// Agent Client Protocol over stdio — `session/new`, `session/load`,
-/// `session/prompt`, `session/update` streaming, permission requests and
-/// `session/cancel` all ride the protocol, so the card declares the lane
-/// family and the agent contributes only its launch argv
-/// (`acp` subcommand). The companion `opencode serve` HTTP+SSE surface
-/// (default `127.0.0.1:24173`, `/global/health`, `/session/{id}/message`,
-/// `/event`) is a hosted service surface, not this lane — detection and
-/// history still cover the serve-mode state.
+/// Surfaces: the agent's own `opencode serve` HTTP server is the primary
+/// lane — sessions, prompts and streaming ride its loopback REST API. When
+/// the server cannot establish or complete transport, the ordered
+/// alternate drops to `opencode acp` (Agent Client Protocol over stdio:
+/// `session/new`, `session/load`, `session/prompt`, `session/update`
+/// streaming, permission requests, `session/cancel`).
 pub const AGENT: AgentCard = AgentCard {
     id: "opencode",
     label: "OpenCode",
     dialect: &DIALECT,
-    surface: AgentSurface::Acp {
-        // `session/load` is the canonical resume path for an ACP server
-        // that already persists sessions; prefer it over re-prompting.
-        prefer_load: true,
-        spawn_args: &["acp"],
-        auth_key: None,
+    surface: AgentSurface::Serve {
+        // `serve --port 0` binds a free loopback port and announces the
+        // endpoint and password on stdout for the lane to discover.
+        spawn_args: &["serve", "--port", "0"],
     },
+    alternates: &[AlternateLane {
+        surface: AgentSurface::Acp {
+            // `session/load` is the canonical resume path for an ACP server
+            // that already persists sessions; prefer it over re-prompting.
+            prefer_load: true,
+            spawn_args: &["acp"],
+            auth_key: None,
+        },
+        binary: None,
+    }],
     detect: DetectSurface {
         binaries: &["opencode"],
         processes: &["opencode.exe", "opencode"],
@@ -193,12 +198,19 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_the_acp_subcommand() {
+    fn spec_materializes_serve_first_then_acp() {
         let spec = spec();
         assert_eq!(spec.command.program, "opencode");
-        assert_eq!(spec.command.args, vec!["acp".to_string()]);
-        let a4aa::LaneSpec::Acp { prefer_load, .. } = spec.lane else {
-            panic!("opencode drives the acp lane")
+        assert_eq!(spec.command.args, vec!["serve", "--port", "0"]);
+        assert!(matches!(spec.lane, a4aa::LaneSpec::Serve { .. }));
+        let fallback = AGENT
+            .specs()
+            .into_iter()
+            .nth(1)
+            .expect("opencode declares the acp alternate");
+        assert_eq!(fallback.command.args, vec!["acp".to_string()]);
+        let a4aa::LaneSpec::Acp { prefer_load, .. } = fallback.lane else {
+            panic!("opencode's alternate drives the acp lane")
         };
         assert!(prefer_load);
     }

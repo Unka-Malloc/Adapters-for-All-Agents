@@ -448,10 +448,28 @@ impl JsonRpcPeer {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+        // Frame kind lives on `discriminant_field` when one is declared
+        // (`type` on factory-style envelopes) — the method field then
+        // only names requests and notifications. Absent a discriminant
+        // the method slot itself carries the response marker.
+        let discriminant = envelope
+            .discriminant_field
+            .as_deref()
+            .unwrap_or(envelope.method_field.as_str());
+        let kind = frame
+            .get(discriminant)
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let id = frame.get("id").cloned();
-        let params = frame.get(data_field).cloned().unwrap_or(Value::Null);
-        let is_response =
-            id.is_some() && envelope.response_method.as_deref() == Some(method.as_str());
+        let params = match frame.get(data_field) {
+            Some(value) => value.clone(),
+            // A flat envelope carries its payload inline: when the named
+            // member is absent the frame itself is the params document
+            // (pi's `{type, ...fields}` events).
+            None if envelope.data_field.is_some() => frame.clone(),
+            None => Value::Null,
+        };
+        let is_response = id.is_some() && envelope.response_method.as_deref() == Some(kind);
         if let (Some(id), true) = (id.clone(), is_response) {
             let reply =
                 id_key(&id).and_then(|key| self.state.pending.lock().unwrap().map.remove(&key));
@@ -514,7 +532,10 @@ impl JsonRpcPeer {
                     return;
                 }
                 let peer = Arc::clone(self);
-                let method_field = envelope.method_field.clone();
+                let marker_field = envelope
+                    .discriminant_field
+                    .clone()
+                    .unwrap_or_else(|| envelope.method_field.clone());
                 let response_method = envelope.response_method.clone();
                 let command_field = envelope.command_field.clone();
                 let result_field = envelope
@@ -538,7 +559,7 @@ impl JsonRpcPeer {
                     };
                     let mut response = serde_json::Map::new();
                     if let Some(marker) = response_method {
-                        response.insert(method_field, Value::String(marker));
+                        response.insert(marker_field, Value::String(marker));
                     }
                     if let Some(field) = &command_field {
                         response.insert(field.clone(), json!(method));
@@ -592,6 +613,23 @@ impl JsonRpcPeer {
                     }
                 } else {
                     frame.insert("params".into(), params);
+                }
+                // Protocol identity tags ride every outbound frame.
+                for (name, value) in &envelope.const_fields {
+                    frame.insert(name.clone(), Value::String(value.clone()));
+                }
+                // The frame-kind marker follows the call shape, not the
+                // constant set: requests and notifications stamp the
+                // discriminant with their own declared marker.
+                if let Some(field) = &envelope.discriminant_field {
+                    let marker = if id.is_some() {
+                        envelope.request_marker.as_deref()
+                    } else {
+                        envelope.notification_marker.as_deref()
+                    };
+                    if let Some(marker) = marker {
+                        frame.insert(field.clone(), Value::String(marker.to_owned()));
+                    }
                 }
                 // Protocol control fields belong to the peer, never to
                 // caller-supplied flat parameters. Notifications have no id.

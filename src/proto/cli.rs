@@ -234,8 +234,18 @@ impl CliLane {
                 "cli/args",
             ));
         }
-        let mut args = self.lane.args.clone();
-        if binding.is_some() && !self.lane.resume_args.is_empty() {
+        // A resume-shaped argv prefix (a subcommand that reorders argv,
+        // `codex exec resume <id>`) replaces the spawn args wholesale;
+        // in that shape `resume_args` is the complete arg template —
+        // flags valid only at session creation (`-C`, `-s`) do not
+        // reappear. Without a spawn prefix `resume_args` appends.
+        let resume_spawn = binding.is_some() && !self.lane.resume_spawn_args.is_empty();
+        let mut args = if resume_spawn {
+            self.lane.resume_args.clone()
+        } else {
+            self.lane.args.clone()
+        };
+        if !resume_spawn && binding.is_some() && !self.lane.resume_args.is_empty() {
             args.extend(self.lane.resume_args.iter().cloned());
         }
         let model = model.or(request.config.model.as_deref());
@@ -288,6 +298,9 @@ impl CliLane {
             }
         });
         let mut spec = self.command.clone();
+        if resume_spawn {
+            spec.args = substitute_args(&self.lane.resume_spawn_args, &turn_vars).0;
+        }
         // The command's own args are the fixed spawn prefix (subcommands,
         // wrapper flags); the lane's resolved template follows them.
         spec.args.extend(args);

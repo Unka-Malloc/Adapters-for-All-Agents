@@ -10,10 +10,10 @@ adapter behavior over stdio JSON-RPC.
 | Layer | Module | Responsibility |
 | --- | --- | --- |
 | Supervision | `supervision` | Process-group spawn (`command-group`: Unix pgid, Windows Job Object), sanitized environment, bounded pipes, `interrupt` (SIGINT → grace → kill) and tree teardown |
-| Transport | `transport` | Piped stdio and Unix PTY (raw slave, streaming master, resize) |
+| Transport | `transport` | Piped stdio, Unix PTY (raw slave, streaming master, resize) and loopback WebSocket (RFC 6455 client for agent-owned daemons, e.g. `droid daemon --port <n>` announced on stdout) |
 | Framing | `framing` | Bounded NDJSON frames (1 MiB default cap) |
 | RPC | `rpc` | Bidirectional JSON-RPC 2.0 peer: correlated outbound calls, peer-initiated requests dispatched per-task and notifications delivered in wire order, half-close and fail-closed pending calls |
-| Lanes | `proto` | `acp` (official `agent-client-protocol` 3.x), `rpc` (host-declared methods/params), `cli` (argv template or stdin prompt, stdio or PTY streaming) |
+| Lanes | `proto` | `acp` (official `agent-client-protocol` 3.x), `rpc` (host-declared methods/params over stdio or an announced WebSocket daemon), `cli` (argv template or stdin prompt, stdio or PTY streaming), `serve` (the agent's own first-party HTTP server, e.g. `opencode serve --port 0` — discovered on stdout, driven over loopback REST) |
 | Facade | `adapter` | `Adapter` / `AgentSession` lane-erased API: `open_session`, `prompt`, `cancel`, `close`, `before_turn` hook, permission handler |
 | Sidecar | `src/bin/a4aa.rs` | `a4aa serve` — `a4aa.v1` NDJSON-RPC on its own stdio; `a4aa fixture-agent` — deterministic test agent |
 | Mechanisms | `mechanisms` + `dialect` | Semantic declarations (`MechanismSet`) and the descriptor-driven adaptation engine producing an `AdaptationPlan` of artifacts + support report |

@@ -934,10 +934,50 @@ impl SessionCall {
     }
 }
 
-/// Send a session-establishment request, retrying once after an
-/// `authenticate` attempt when — and only when — establishment failed with
-/// the protocol's authentication-required error and the agent advertised
-/// auth methods. Every other failure returns unchanged.
+/// Resolve the declared credential through its source; an unavailable key
+/// resolves to `None` and the caller decides whether to still authenticate.
+async fn resolve_auth_key(
+    auth_key: Option<&crate::env::EnvSource>,
+    secrets: &dyn SecretResolver,
+) -> Option<String> {
+    match auth_key {
+        Some(crate::env::EnvSource::HostEnv { host_env }) => std::env::var(host_env).ok(),
+        Some(crate::env::EnvSource::Secret { secret }) => secrets.resolve(secret).await,
+        None => None,
+    }
+}
+
+/// One authenticate pass over the advertised methods: the resolved key
+/// rides `_meta.api_key` when present, matching the credential-bearing
+/// contract agents like Devin publish. Returns true once any method
+/// succeeds.
+async fn authenticate(
+    connection: &ConnectionTo<Agent>,
+    auth_methods: &[AuthMethodId],
+    api_key: Option<&str>,
+) -> bool {
+    for method_id in auth_methods {
+        let mut request = AuthenticateRequest::new(method_id.clone());
+        if let Some(key) = api_key {
+            request.meta = Some(serde_json::Map::from_iter([(
+                "api_key".to_owned(),
+                Value::String(key.to_owned()),
+            )]));
+        }
+        if connection.send_request(request).block_task().await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Send a session-establishment request. When the agent advertises auth
+/// methods and the host declared a credential, authenticate *before* the
+/// first establishment: some agents — `devin acp` among them — sometimes
+/// accept an unauthenticated `session/new` and then answer with a degraded
+/// model catalog, so waiting for an `AuthRequired` refusal is not enough.
+/// Without a key the order stays demand-driven: establish first, then retry
+/// once after `authenticate` if establishment fails with auth-required.
 async fn call_with_auth_retry(
     connection: &ConnectionTo<Agent>,
     call: &SessionCall,
@@ -945,6 +985,10 @@ async fn call_with_auth_retry(
     auth_key: Option<&crate::env::EnvSource>,
     secrets: &dyn SecretResolver,
 ) -> Result<Value, AdapterError> {
+    let api_key = resolve_auth_key(auth_key, secrets).await;
+    if api_key.is_some() && !auth_methods.is_empty() {
+        authenticate(connection, auth_methods, api_key.as_deref()).await;
+    }
     let establish_error = match call.send(connection).await {
         Ok(response) => return Ok(response),
         Err(error) => error,
@@ -954,28 +998,7 @@ async fn call_with_auth_retry(
     {
         return Err(protocol_failure(call.stage(), establish_error));
     }
-    // Resolve the declared credential once; an unavailable key skips the
-    // attach but does not block the plain method-id attempts.
-    let api_key = match auth_key {
-        Some(crate::env::EnvSource::HostEnv { host_env }) => std::env::var(host_env).ok(),
-        Some(crate::env::EnvSource::Secret { secret }) => secrets.resolve(secret).await,
-        None => None,
-    };
-    let mut authenticated = false;
-    for method_id in auth_methods {
-        let mut request = AuthenticateRequest::new(method_id.clone());
-        if let Some(key) = &api_key {
-            request.meta = Some(serde_json::Map::from_iter([(
-                "api_key".to_owned(),
-                Value::String(key.clone()),
-            )]));
-        }
-        if connection.send_request(request).block_task().await.is_ok() {
-            authenticated = true;
-            break;
-        }
-    }
-    if !authenticated {
+    if !authenticate(connection, auth_methods, api_key.as_deref()).await {
         return Err(protocol_failure(call.stage(), establish_error));
     }
     call.send(connection)

@@ -13,7 +13,7 @@
 use a4aa::card::{
     AgentCard, AgentSurface, AttachmentSupport, CompletionDecl, DetectSurface, EnvelopeDecl,
     FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, RpcCallDecl, RpcSurface,
-    StoreKind, UsageSurface,
+    RpcTransportDecl, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
@@ -89,7 +89,12 @@ pub const AGENT: AgentCard = AgentCard {
             method: "prompt",
             params: r#"{"message": "{prompt}"}"#,
         },
-        cancel: None,
+        // `{type:"abort"}` cancels the turn in-band — the session survives
+        // for resume.
+        cancel: Some(RpcCallDecl {
+            method: "abort",
+            params: "{}",
+        }),
         session_close: None,
         text_event_method: Some("message_update"),
         text_path: Some("assistantMessageEvent.delta"),
@@ -113,7 +118,7 @@ pub const AGENT: AgentCard = AgentCard {
             },
         ],
         session_scope: SessionScope::Agent,
-        kill_on_cancel: true,
+        kill_on_cancel: false,
         envelope: Some(&EnvelopeDecl {
             method_field: "type",
             string_ids: true,
@@ -124,6 +129,10 @@ pub const AGENT: AgentCard = AgentCard {
             error_field: Some("error"),
             success_field: Some("success"),
             command_field: Some("command"),
+            discriminant_field: None,
+            request_marker: None,
+            notification_marker: None,
+            const_fields: &[],
         }),
         passthrough: &[
             "get_state",
@@ -132,8 +141,13 @@ pub const AGENT: AgentCard = AgentCard {
             "get_last_assistant_text",
             "switch_session",
         ],
-        spawn_args: &[],
+        // `--mode rpc` selects the headless JSON protocol — a bare `pi`
+        // on piped stdio falls back to one-shot print mode and never
+        // answers `get_state`.
+        spawn_args: &["--mode", "rpc"],
+        transport: RpcTransportDecl::Stdio,
     }),
+    alternates: &[],
     detect: DetectSurface {
         binaries: &["pi"],
         processes: &["pi.exe", "pi"],
@@ -215,7 +229,10 @@ mod card_tests {
         );
         assert_eq!(rpc.prompt.method, "prompt");
         assert_eq!(rpc.completion.as_ref().unwrap().method, "agent_settled");
-        assert!(rpc.kill_on_cancel);
+        // `{type:"abort"}` cancels in-band — the process survives for the
+        // next turn or a `switch_session` resume.
+        assert!(!rpc.kill_on_cancel);
+        assert_eq!(rpc.cancel.as_ref().unwrap().method, "abort");
         let envelope = rpc.envelope.as_ref().expect("flat envelope");
         assert_eq!(envelope.method_field, "type");
         assert!(envelope.string_ids);

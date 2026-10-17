@@ -25,11 +25,15 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+use a4aa::card::{
+    AgentCard, AgentSurface, AttachmentSupport, DetectSurface, FeatureSurface, HistoryRoot,
+    InstructionChannel, LiveUsage, ModelCatalog, StoreKind, UsageSurface,
+};
 use a4aa::dialect::{
     CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
     SubagentSurface, Target,
 };
-use a4aa::{AdaptationPlan, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
 
 /// The `kilocode` dialect: Kilo plugin hooks, AGENTS.md, skills, command/agent dirs, kilo.json MCP.
 /// No permission surface: see the crate-level note on OpenCode's per-tool
@@ -78,6 +82,77 @@ pub fn adapt(set: &MechanismSet) -> AdaptationPlan {
 /// (registries, `a4aa-dialects`-style lookup tables).
 pub const fn dialect() -> &'static Dialect {
     &DIALECT
+}
+
+/// The `kilo` agent card. `kilo acp` is a verified Agent Client Protocol
+/// endpoint (the OpenCode-fork stock surface): `loadSession`, session
+/// close/fork/list/resume, image and embedded-context prompts, MCP
+/// http/sse. Its auth method is a terminal hint (`kilo auth login`), not a
+/// key `authenticate` can carry.
+pub const AGENT: AgentCard = AgentCard {
+    id: "kilocode",
+    label: "Kilo Code",
+    dialect: &DIALECT,
+    surface: AgentSurface::Acp {
+        prefer_load: true,
+        spawn_args: &["acp"],
+        auth_key: None,
+    },
+    alternates: &[],
+    detect: DetectSurface {
+        binaries: &["kilo", "kilocode"],
+        processes: &["kilo"],
+        // The CLI ships inside the versioned VS Code extension
+        // (`kilocode.kilo-code-<v>-<platform>/bin/kilo`); resolving the
+        // latest extension directory is a host-side scan, not a literal
+        // path a card may declare.
+        binary_dirs: &[],
+        config: &["{home}/.config/kilo/kilo.json"],
+        detection: &["{home}/.config/kilo", "{home}/.local/share/kilo"],
+        apps: &[],
+    },
+    features: FeatureSurface {
+        instructions: InstructionChannel::Compose,
+        execution_modes: &[],
+        permission_modes: &[],
+        permission_default: None,
+        attachments: AttachmentSupport::None,
+        // `--variant` carries reasoning effort.
+        effort: true,
+        steer: false,
+        models: ModelCatalog::CliArgs(&["models"]),
+    },
+    usage: UsageSurface {
+        live: Some(LiveUsage {
+            event: "session/update",
+            path: "usage",
+        }),
+        transcript: None,
+        hosted: None,
+    },
+    history: &[
+        HistoryRoot {
+            path: "{home}/.local/share/kilo",
+            kind: "kilo-session-store",
+            store: StoreKind::SqliteDb,
+        },
+        HistoryRoot {
+            path: "{home}/.config/kilo",
+            kind: "kilo-config",
+            store: StoreKind::Directory,
+        },
+    ],
+};
+
+/// The full card, for hosts that compose over `&'static AgentCard`.
+pub const fn card() -> &'static AgentCard {
+    &AGENT
+}
+
+/// The materialized runtime spec — `Adapter::new(spec())` is the entire
+/// launch path for hosts that keep no spec table of their own.
+pub fn spec() -> AgentSpec {
+    AGENT.spec()
 }
 
 #[cfg(test)]

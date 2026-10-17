@@ -12,8 +12,8 @@
 
 use a4aa::card::{
     AgentCard, AgentSurface, AttachmentSupport, CompletionDecl, DetectSurface, FeatureSurface,
-    HistoryRoot, InstructionChannel, ModelCatalog, RpcCallDecl, RpcSurface, StoreKind,
-    TranscriptUsage, UsageSurface,
+    HistoryRoot, InstructionChannel, ModelCatalog, RpcCallDecl, RpcSurface, RpcTransportDecl,
+    StoreKind, TranscriptUsage, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
@@ -105,7 +105,9 @@ pub const AGENT: AgentCard = AgentCard {
         envelope: None,
         passthrough: &[],
         spawn_args: &["--profile", "sdk"],
+        transport: RpcTransportDecl::Stdio,
     }),
+    alternates: &[],
     detect: DetectSurface {
         binaries: &["dsh"],
         processes: &["dsh.exe", "dsh"],

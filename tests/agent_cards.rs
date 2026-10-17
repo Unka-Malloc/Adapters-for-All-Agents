@@ -294,7 +294,13 @@ printf '{"type":"init","session_id":"%s"}\n' "$sid"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]},"session_id":"%s"}\n' "$sid"
 printf '{"type":"result","result":"answer for %s","session_id":"%s"}\n' "$prev" "$sid"
 "#;
-    let mut spec = a4aa_cursor::spec();
+    // The card's declared CLI alternate carries the stream-json template
+    // this fixture speaks.
+    let mut spec = a4aa_cursor::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("cursor declares the cli alternate");
     spec.command = CommandSpec {
         program: "sh".into(),
         args: vec![
@@ -331,7 +337,11 @@ printf '{"event":"step_update","step_update":{"step_type":"agent_response","stat
 response="model=$model;effort=$effort;mode=$mode;resume=$resume"
 printf '{"event":"result","result":{"conversation_id":"%s","status":"SUCCESS","response":"%s","usage":{"input_tokens":10,"cache_read_tokens":2,"output_tokens":5,"total_tokens":17}}}\n' "$sid" "$response"
 "#;
-    let mut spec = a4aa_antigravity::spec();
+    let mut spec = a4aa_antigravity::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("antigravity declares the cli alternate");
     spec.command = sh(script);
     spec
 }
@@ -494,7 +504,11 @@ async fn antigravity_cancel_terminates_the_streaming_process() {
 printf '{"event":"init","conversation_id":"agy-cancel"}\n'
 while :; do sleep 1; done
 "#;
-    let mut spec = a4aa_antigravity::spec();
+    let mut spec = a4aa_antigravity::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("antigravity declares the cli alternate");
     spec.command = sh(script);
     let (session, mut events) = open(spec, session()).await;
     let session = std::sync::Arc::new(session);
@@ -525,7 +539,11 @@ printf '{"event":"init","conversation_id":"agy-error"}\n'
 printf '{"event":"result","result":{"conversation_id":"agy-error","status":"ERROR","response":"","error":"fixture failure"}}\n'
 exit 1
 "#;
-    let mut spec = a4aa_antigravity::spec();
+    let mut spec = a4aa_antigravity::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("antigravity declares the cli alternate");
     spec.command = sh(script);
     let (session, _events) = open(spec, session()).await;
     let outcome = session.prompt(turn("fail")).await.expect("error outcome");
@@ -546,12 +564,319 @@ fn registry_exposes_all_five_second_batch_cards() {
     }
     let opencode = a4aa_dialects::card("opencode").unwrap();
     let spec = opencode.spec();
-    assert_eq!(spec.command.args, vec!["acp".to_string()]);
+    assert_eq!(spec.command.args, vec!["serve", "--port", "0"]);
+    assert!(matches!(spec.lane, LaneSpec::Serve { .. }));
+    let alternate = opencode.specs().into_iter().nth(1).unwrap();
+    assert_eq!(alternate.command.args, vec!["acp".to_string()]);
     assert!(matches!(
-        spec.lane,
+        alternate.lane,
         LaneSpec::Acp {
             prefer_load: true,
             ..
         }
     ));
+}
+
+/// Factory-shaped stream-jsonrpc surface: factory-tagged envelopes,
+/// `droid.initialize_session` → `droid.add_user_message` → the
+/// `agent_turn_completed` session notification ends the turn.
+fn factory_jsonrpc_like_spec() -> AgentSpec {
+    let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"droid.initialize_session"'*)
+      printf '{"type":"response","id":"%s","result":{"sessionId":"droid-s-1"}}\n' "$id" ;;
+    *'"method":"droid.load_session"'*)
+      printf '{"type":"response","id":"%s","result":{"session":{"messages":[]}}}\n' "$id" ;;
+    *'"method":"droid.add_user_message"'*)
+      printf '{"type":"response","id":"%s","result":{}}\n' "$id"
+      printf '{"type":"notification","method":"droid.session_notification","params":{"sessionId":"droid-s-1","notification":{"type":"assistant_text_delta","textDelta":"factory "}}}\n'
+      printf '{"type":"notification","method":"droid.session_notification","params":{"sessionId":"droid-s-1","notification":{"type":"assistant_text_delta","textDelta":"reply"}}}\n'
+      printf '{"type":"notification","method":"droid.session_notification","params":{"sessionId":"droid-s-1","notification":{"type":"droid_working_state_changed","newState":"idle"}}}\n'
+      printf '{"type":"notification","method":"droid.session_notification","params":{"sessionId":"droid-s-1","notification":{"type":"agent_turn_completed","reason":"end_turn"}}}\n' ;;
+    *'"method":"droid.interrupt_session"'*|*'"method":"droid.close_session"'*)
+      printf '{"type":"response","id":"%s","result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+    let mut spec = a4aa_factory::card()
+        .specs()
+        .into_iter()
+        .nth(2)
+        .expect("factory declares the stream-jsonrpc alternate");
+    spec.command = sh(script);
+    spec
+}
+
+#[tokio::test]
+async fn factory_jsonrpc_open_completion_and_binding() {
+    let (session, mut events) = open(factory_jsonrpc_like_spec(), session()).await;
+    assert_eq!(session.session_id(), "droid-s-1");
+
+    let outcome = session.prompt(turn("hi")).await.expect("prompt");
+    // `agent_turn_completed` ends the turn; working-state churn did not.
+    assert_eq!(outcome.stop_reason, "agent_turn_completed");
+    assert_eq!(outcome.text, "factory reply");
+    let mut chunks = String::new();
+    while let Ok(event) = events.try_recv() {
+        if let AgentEvent::MessageChunk { text } = event {
+            chunks.push_str(&text);
+        }
+    }
+    assert_eq!(chunks, "factory reply");
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn factory_jsonrpc_resume_keeps_the_requested_binding() {
+    let mut request = session();
+    request.resume = Some("durable-droid-9".into());
+    let (session, _events) = open(factory_jsonrpc_like_spec(), request).await;
+    // `droid.load_session` echoes no id — the requested binding stands.
+    assert_eq!(session.session_id(), "durable-droid-9");
+    session.close().await.expect("close");
+}
+
+/// `droid daemon --port <n>` — the WebSocket transport end to end. The test
+/// hosts the socket itself; the fixture prints the daemon's announce line
+/// and stays alive. Server-side frames exercise masking, the Factory
+/// envelope discriminant, `daemon.authenticate` secrets, session binding
+/// and notification-driven completion.
+#[tokio::test]
+async fn factory_daemon_websocket_lane() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Only the API key resolves — the absent `FACTORY_TOKEN` must drop its
+    // leaf instead of failing or shipping a literal placeholder.
+    struct TestSecrets;
+    #[async_trait::async_trait]
+    impl a4aa::SecretResolver for TestSecrets {
+        async fn resolve(&self, reference: &str) -> Option<String> {
+            (reference == "FACTORY_API_KEY").then(|| "fk-test".into())
+        }
+    }
+
+    async fn read_frame(socket: &mut tokio::net::TcpStream) -> serde_json::Value {
+        let mut head = [0u8; 2];
+        socket.read_exact(&mut head).await.unwrap();
+        let mut len = (head[1] & 0x7f) as u64;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            socket.read_exact(&mut ext).await.unwrap();
+            len = u16::from_be_bytes(ext) as u64;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            socket.read_exact(&mut ext).await.unwrap();
+            len = u64::from_be_bytes(ext);
+        }
+        assert!(head[1] & 0x80 != 0, "client frames must be masked");
+        let mut mask = [0u8; 4];
+        socket.read_exact(&mut mask).await.unwrap();
+        let mut payload = vec![0u8; len as usize];
+        socket.read_exact(&mut payload).await.unwrap();
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    async fn write_frame(socket: &mut tokio::net::TcpStream, value: &serde_json::Value) {
+        let payload = serde_json::to_vec(value).unwrap();
+        let mut out = vec![0x81u8];
+        if payload.len() < 126 {
+            out.push(payload.len() as u8);
+        } else {
+            out.push(126);
+            out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(&payload);
+        socket.write_all(&out).await.unwrap();
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let seen_clone = seen.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: a4aa\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        const TAGS: &[(&str, &str)] = &[
+            ("jsonrpc", "2.0"),
+            ("factoryApiVersion", "1.0.0"),
+            ("factoryProtocolVersion", "1.269.0"),
+        ];
+        let respond = |id: serde_json::Value, result: serde_json::Value| {
+            let mut frame = serde_json::Map::new();
+            for (key, value) in TAGS {
+                frame.insert((*key).into(), (*value).into());
+            }
+            frame.insert("type".into(), "response".into());
+            frame.insert("id".into(), id);
+            frame.insert("result".into(), result);
+            serde_json::Value::Object(frame)
+        };
+        loop {
+            let request = read_frame(&mut socket).await;
+            seen_clone.lock().unwrap().push(request.clone());
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or("") {
+                "daemon.authenticate" => {
+                    write_frame(
+                        &mut socket,
+                        &respond(id, serde_json::json!({"userId":"u","orgId":"o"})),
+                    )
+                    .await;
+                }
+                "daemon.initialize_session" => {
+                    write_frame(
+                        &mut socket,
+                        &respond(id, serde_json::json!({"sessionId":"droid-d-1"})),
+                    )
+                    .await;
+                }
+                "daemon.add_user_message" => {
+                    write_frame(&mut socket, &respond(id, serde_json::json!({}))).await;
+                    let mut note = serde_json::Map::new();
+                    for (key, value) in TAGS {
+                        note.insert((*key).into(), (*value).into());
+                    }
+                    note.insert("type".into(), "notification".into());
+                    note.insert("method".into(), "daemon.session_notification".into());
+                    note.insert(
+                        "params".into(),
+                        serde_json::json!({"sessionId":"droid-d-1","notification":{"type":"assistant_text_delta","textDelta":"ws reply"}}),
+                    );
+                    write_frame(&mut socket, &serde_json::Value::Object(note.clone())).await;
+                    note.insert(
+                        "params".into(),
+                        serde_json::json!({"sessionId":"droid-d-1","notification":{"type":"agent_turn_completed","turnId":"t-9"}}),
+                    );
+                    write_frame(&mut socket, &serde_json::Value::Object(note)).await;
+                }
+                "daemon.close_session" => {
+                    write_frame(&mut socket, &respond(id, serde_json::json!({}))).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let script = format!("echo '  WebSocket endpoint: ws://127.0.0.1:{port}'; exec sleep 60");
+    let mut spec = a4aa_factory::card()
+        .specs()
+        .into_iter()
+        .nth(3)
+        .expect("factory declares the daemon WebSocket alternate");
+    spec.command = sh(&script);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .secrets(std::sync::Arc::new(TestSecrets))
+        .open_session(session(), tx)
+        .await
+        .expect("open_session over websocket");
+    assert_eq!(session.session_id(), "droid-d-1");
+
+    let outcome = session.prompt(turn("hi over ws")).await.expect("prompt");
+    assert_eq!(outcome.stop_reason, "agent_turn_completed");
+    assert_eq!(outcome.text, "ws reply");
+    session.close().await.expect("close");
+    server.await.expect("ws server");
+
+    let seen = seen.lock().unwrap();
+    // Order: authenticate → initialize → add_user_message → close.
+    let methods: Vec<&str> = seen.iter().filter_map(|f| f["method"].as_str()).collect();
+    assert_eq!(
+        methods,
+        [
+            "daemon.authenticate",
+            "daemon.initialize_session",
+            "daemon.add_user_message",
+            "daemon.close_session"
+        ]
+    );
+    let auth = &seen[0]["params"];
+    assert_eq!(auth["apiKey"], "fk-test");
+    assert!(auth.get("token").is_none(), "unresolved secret must drop");
+    assert_eq!(seen[0]["type"], "request");
+    assert_eq!(seen[0]["factoryProtocolVersion"], "1.269.0");
+    let mut chunks = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentEvent::MessageChunk { text } = event {
+            chunks.push_str(&text);
+        }
+    }
+    assert_eq!(chunks, "ws reply");
+}
+
+/// Codex `exec` batch surface: `thread_id` binds the session,
+/// `item.completed` agent_message text is the reply, `turn.completed`
+/// carries usage. A resume request reorders argv to
+/// `exec resume <id>` — verified as argv, not just intent.
+#[tokio::test]
+async fn codex_exec_resume_reorders_argv() {
+    // The fixture is a real executable: `resume_spawn_args` replaces the
+    // command's own args (the `exec` spawn prefix), so a `sh -c` wrapper
+    // would lose its script. The file's argv then mirrors codex's exactly.
+    let script = "#!/bin/sh\n\
+printf '%s\\n' \"$@\" > \"$CODEX_ARGV_CAPTURE\"\n\
+printf '{\"type\":\"thread.started\",\"thread_id\":\"codex-t-1\"}\\n'\n\
+printf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"argv-ok\"}}\\n'\n\
+printf '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\\n'\n";
+    let dir = std::env::temp_dir();
+    let fixture = dir.join(format!("a4aa-codex-fixture-{}", std::process::id()));
+    let capture = dir.join(format!("a4aa-codex-argv-{}", std::process::id()));
+    std::fs::write(&fixture, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut spec = a4aa_codex::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("codex declares the exec alternate");
+    spec.command = CommandSpec {
+        program: fixture.display().to_string(),
+        args: vec!["exec".into()],
+        cwd: None,
+        env: EnvPolicy::Sanitized {
+            inherit: vec![],
+            set: std::collections::BTreeMap::from([(
+                "CODEX_ARGV_CAPTURE".to_owned(),
+                a4aa::EnvValue::Literal(capture.display().to_string()),
+            )]),
+        },
+    };
+
+    let mut request = session();
+    request.resume = Some("thread-resume-9".into());
+    let (session, _events) = open(spec, request).await;
+    let outcome = session.prompt(turn("say it")).await.expect("prompt");
+    assert_eq!(outcome.text, "argv-ok");
+    let argv = std::fs::read_to_string(&capture).expect("argv capture");
+    // `resume_spawn_args` replaced the `exec` prefix; lane args follow.
+    assert!(
+        argv.starts_with("exec\nresume\nthread-resume-9\n"),
+        "unexpected argv: {argv:?}"
+    );
+    assert!(argv.contains("say it"), "prompt must reach argv: {argv:?}");
+    assert!(argv.contains("--json\n"), "lane flags must reach argv");
+    let _ = std::fs::remove_file(&capture);
+    let _ = std::fs::remove_file(&fixture);
+    session.close().await.expect("close");
 }

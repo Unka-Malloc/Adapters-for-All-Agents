@@ -42,9 +42,9 @@ pub mod transport;
 
 pub use adapter::{Adapter, AgentSession, BeforeTurn, LaneSession, PermissionHandler, TurnRequest};
 pub use card::{
-    AgentCard, AgentSurface, AttachmentSupport, CliSurface, CompletionDecl, DetectSurface,
-    FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, RpcCallDecl,
-    RpcSurface, StoreKind, TranscriptUsage, UsageSurface,
+    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
+    DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog,
+    OsPath, RpcCallDecl, RpcSurface, StoreKind, TranscriptUsage, UsageSurface,
 };
 pub use dialect::{
     adapt, CommandSurface, Dialect, ExtensionKind, HookSurface, McpSurface, PermissionSurface,
@@ -60,8 +60,8 @@ pub use mechanisms::{
 pub use model::{
     AgentEvent, AgentInfo, AgentSpec, BindingReceiptShape, Capabilities, CliLaneSpec, CommandSpec,
     LaneKind, LaneSpec, PromptChannel, RpcCallSpec, RpcCompletionSpec, RpcEnvelopeSpec,
-    RpcLaneSpec, SelectorPhase, SelectorSupport, SelectorSupportSet, SessionConfig, SessionRequest,
-    SessionScope, StreamMode, TokenUsage, TurnOutcome,
+    RpcLaneSpec, RpcTransport, SelectorPhase, SelectorSupport, SelectorSupportSet, SessionConfig,
+    SessionRequest, SessionScope, StreamMode, TokenUsage, TurnOutcome,
 };
 pub use observe::{Direction, Observer, SharedObserver};
 pub use proto::acp::{PermissionDecision, PermissionPrompt, SessionDelegate};

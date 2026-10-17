@@ -77,10 +77,19 @@ pub struct CliLaneSpec {
     pub prompt_channel: PromptChannel,
     #[serde(default)]
     pub stream: StreamMode,
-    /// Arguments appended when the session request carries a resume
-    /// binding (`{sessionId}` substitutes it). Fresh-process resume.
+    /// When the session request carries a resume binding
+    /// (`{sessionId}` substitutes it): appended to `args` normally, or
+    /// the complete arg template when `resume_spawn_args` also reorders
+    /// argv — flags valid only at session creation do not reappear.
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// Replaces the command's spawn args (`command.args`) entirely when a
+    /// resume binding exists — for agents whose resume shape reorders argv,
+    /// like `codex exec resume <id>` versus `codex exec`. In that shape
+    /// `resume_args` replaces `args` wholesale. Empty: spawn args stay
+    /// constant across fresh and resumed turns.
+    #[serde(default)]
+    pub resume_spawn_args: Vec<String>,
     /// JSON payload written to stdin in place of the bare prompt when the
     /// prompt channel resolves to stdin. A string leaf that is exactly
     /// `{prompt}` receives the prompt as a JSON string; any other
@@ -223,6 +232,31 @@ pub struct RpcLaneSpec {
     /// Methods the consumer may call verbatim through the lane handle.
     #[serde(default)]
     pub passthrough: Vec<String>,
+    /// Byte transport the lane speaks the envelopes over. `Stdio` (the
+    /// default) is the agent process's own stdin/stdout; `WebSocket`
+    /// spawns the agent's first-party daemon, reads its announced
+    /// `ws://` endpoint on stdout, and carries the same frames over the
+    /// socket. `{port}` in the command's argv substitutes a free
+    /// loopback port the lane picks.
+    #[serde(default)]
+    pub transport: RpcTransport,
+}
+
+/// Where an rpc lane's bytes flow.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RpcTransport {
+    /// The agent process speaks the protocol on its own stdio.
+    #[default]
+    Stdio,
+    /// The command is a first-party server that announces
+    /// `<announce><ws-url>` on stdout; the lane connects and drives the
+    /// protocol over the WebSocket.
+    WebSocket {
+        /// Stdout prefix whose remainder is the `ws://` endpoint (for
+        /// example `WebSocket endpoint: `).
+        announce: String,
+    },
 }
 
 /// Whether the wire session id is agent-durable or scoped to one process.
@@ -278,6 +312,28 @@ pub struct RpcEnvelopeSpec {
     /// (`"command"`).
     #[serde(default)]
     pub command_field: Option<String>,
+    /// Field that classifies inbound frames by value (`"type"` carrying
+    /// `"request"`/`"response"`/`"notification"`); `response_method` is
+    /// compared against it. Absent: `method_field` doubles as the
+    /// classifier (flat envelopes where the command name occupies the
+    /// same slot).
+    #[serde(default)]
+    pub discriminant_field: Option<String>,
+    /// Discriminant value stamped on outbound requests — `"request"` on
+    /// factory-style envelopes. Only meaningful with `discriminant_field`.
+    #[serde(default)]
+    pub request_marker: Option<String>,
+    /// Discriminant value stamped on outbound notifications —
+    /// `"notification"` on factory-style envelopes. Only meaningful with
+    /// `discriminant_field`.
+    #[serde(default)]
+    pub notification_marker: Option<String>,
+    /// Constant members merged into every outbound frame — protocol
+    /// identity tags like `{"jsonrpc":"2.0",
+    /// "factoryApiVersion":"1.0.0"}`. Frame-kind tagging belongs to
+    /// `request_marker`/`notification_marker`, never to this set.
+    #[serde(default)]
+    pub const_fields: std::collections::BTreeMap<String, String>,
 }
 
 /// Async turn completion for agents whose `prompt` call only acknowledges
@@ -313,6 +369,7 @@ impl CliLaneSpec {
             streaming: true,
             cancellation: true,
             session_resume: !self.resume_args.is_empty()
+                || !self.resume_spawn_args.is_empty()
                 || self.args.iter().any(|arg| arg.contains("{sessionId}")),
             permission_prompts: false,
             detail: None,

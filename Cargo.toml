@@ -56,6 +56,7 @@ a4aa-codex = { path = "crates/a4aa-codex" }
 a4aa-claude = { path = "crates/a4aa-claude" }
 a4aa-cursor = { path = "crates/a4aa-cursor" }
 a4aa-antigravity = { path = "crates/a4aa-antigravity" }
+a4aa-factory = { path = "crates/a4aa-factory" }
 a4aa-pi = { path = "crates/a4aa-pi" }
 a4aa-dsh = { path = "crates/a4aa-dsh" }
 a4aa-opencode = { path = "crates/a4aa-opencode" }

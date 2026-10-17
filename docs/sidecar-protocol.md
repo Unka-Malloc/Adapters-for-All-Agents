@@ -32,7 +32,7 @@ silently applied.
 `AgentSpec` is the crate's canonical spec (serde, `camelCase` fields
 documented in `model.rs`): `id`, `clientName?`, `command{program,args,cwd?,
 env}`, `maxOutputBytes?`, plus the flattened lane — `"lane": "acp" | "rpc" |
-"cli"` with the lane's own fields.
+"cli" | "serve"` with the lane's own fields.
 
 Session options select the agent's model, reasoning effort, execution mode,
 and permission preset. A lane rejects unsupported selectors before starting

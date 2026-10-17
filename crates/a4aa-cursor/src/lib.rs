@@ -11,17 +11,16 @@
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
 use a4aa::card::{
-    AgentCard, AgentSurface, AttachmentSupport, CliSurface, DetectSurface, FeatureSurface,
-    HistoryRoot, InstructionChannel, ModelCatalog, OsPath, StoreKind, UsageSurface,
+    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, DetectSurface,
+    FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind,
+    UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
     Target,
 };
-use a4aa::{
-    AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet, PromptChannel,
-    StreamMode,
-};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{PromptChannel, StreamMode};
 
 /// The `cursor` dialect: Cursor flat hooks.json, .mdc rules, skills, commands, subagents, cli-config permissions, mcp.json.
 pub const DIALECT: Dialect = Dialect {
@@ -65,54 +64,64 @@ pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
 
-/// The `cursor` agent card: `cursor-agent` stream-json CLI over a PTY.
-///
-/// Protocol: a session opens with
-/// `cursor-agent create-chat` — the first non-empty stdout line is the
-/// binding — and every turn is one process
-/// `cursor-agent --print --output-format stream-json
-/// --stream-partial-output --workspace <dir> --resume <id>
-/// <prompt> [--model <m>] [--reasoning-effort <e>]`.
-/// The stream echoes the bound `session_id` on every record and carries
-/// the reply text on the terminal `{type:"result"}` record. Token
-/// accounting lives only in Cursor's hosted usage-events API; the local
-/// transcript stores carry no token counters.
+/// The `cursor` agent card. `cursor-agent acp` is a verified Agent Client
+/// Protocol endpoint (`@agentclientprotocol/sdk`): `initialize` reports
+/// `loadSession` and session list, `session/new` answers with modes
+/// (agent/plan/ask) and the model catalog, and prompts stream
+/// `agent_message_chunk` updates with a `stopReason` completion.
+/// `session/request_permission` is an inbound request the host answers
+/// through its permission handler. The `cursor_login` auth method is the
+/// terminal flow; a stored login serves sessions transparently, so no
+/// `auth_key` is declared. The stream-json CLI
+/// (`cursor-agent --print --output-format stream-json --resume <id>`)
+/// remains the host-authored alternate lane.
 pub const AGENT: AgentCard = AgentCard {
     id: "cursor",
     label: "Cursor",
     dialect: &DIALECT,
-    surface: AgentSurface::Cli(CliSurface {
-        args: &[
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--stream-partial-output",
-            "--workspace",
-            "{cwd}",
-            "--resume",
-            "{sessionId}",
-            "{prompt}",
-            "--model",
-            "{model}",
-            "--reasoning-effort",
-            "{effort}",
-        ],
-        prompt_channel: PromptChannel::ArgOnly,
-        stream: StreamMode::Pty,
-        // `--resume {sessionId}` rides the argv template itself: every
-        // cursor-agent turn is bound to a chat id.
-        resume_args: &[],
-        stdin_template: None,
-        json_lines: true,
-        session_id_path: Some("session_id"),
-        open_args: &["create-chat"],
-        binding_file_env: None,
-        binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
-        result_selector: Some("result"),
-        result_selector_field: None,
-        result_path: Some("result"),
-        spawn_args: &[],
-    }),
+    surface: AgentSurface::Acp {
+        prefer_load: true,
+        spawn_args: &["acp"],
+        auth_key: None,
+    },
+    alternates: &[AlternateLane {
+        // `cursor-agent --print --output-format stream-json`: the verified
+        // batch lane behind the `acp` primary. The chat id rides the argv
+        // template (`--resume`/`create-chat`), so every turn is bound.
+        surface: AgentSurface::Cli(CliSurface {
+            args: &[
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--stream-partial-output",
+                "--workspace",
+                "{cwd}",
+                "--resume",
+                "{sessionId}",
+                "{prompt}",
+                "--model",
+                "{model}",
+                "--reasoning-effort",
+                "{effort}",
+            ],
+            prompt_channel: PromptChannel::ArgOnly,
+            stream: StreamMode::Pty,
+            resume_spawn_args: &[],
+            resume_args: &[],
+            stdin_template: None,
+            json_lines: true,
+            session_id_path: Some("session_id"),
+            open_args: &["create-chat"],
+            binding_file_env: None,
+            binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
+            result_selector: Some("result"),
+            result_selector_field: None,
+            result_path: Some("result"),
+            usage_path: None,
+            spawn_args: &[],
+        }),
+        binary: None,
+    }],
     detect: DetectSurface {
         binaries: &["cursor-agent", "cursor"],
         processes: &["cursor-agent.exe", "cursor-agent", "cursor.exe", "cursor"],
@@ -162,10 +171,13 @@ pub const AGENT: AgentCard = AgentCard {
         models: ModelCatalog::None,
     },
     usage: UsageSurface {
-        live: None,
-        // Local chat stores carry no token counters (`tokenCount` bubbles
-        // are unused and `usageData` is empty); the hosted usage-events
-        // feed is the only accounting source.
+        // The ACP surface streams `usage_update` session updates; local
+        // chat stores carry no counters and the hosted usage-events feed
+        // remains the accounting ledger.
+        live: Some(LiveUsage {
+            event: "session/update",
+            path: "usage",
+        }),
         transcript: None,
         hosted: Some("https://cursor.com/api/dashboard/get-filtered-usage-events"),
     },
@@ -233,31 +245,18 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_create_chat_plus_resume_argv() {
+    fn spec_materializes_the_acp_lane() {
         let spec = spec();
         assert_eq!(spec.command.program, "cursor-agent");
-        let a4aa::LaneSpec::Cli(cli) = spec.lane else {
-            panic!("cursor drives the cli lane")
+        assert_eq!(spec.command.args, vec!["acp"]);
+        let a4aa::LaneSpec::Acp { prefer_load, .. } = spec.lane else {
+            panic!("cursor drives the acp lane")
         };
-        assert_eq!(cli.open_args, vec!["create-chat".to_string()]);
-        assert_eq!(cli.stream, StreamMode::Pty);
-        assert!(cli.json_lines);
-        assert_eq!(cli.session_id_path.as_deref(), Some("session_id"));
-        assert_eq!(cli.result_selector.as_deref(), Some("result"));
-        assert_eq!(cli.result_path.as_deref(), Some("result"));
-        // `--resume {sessionId}` lives inside the argv template — every
-        // cursor-agent turn is a bound turn.
-        let joined = cli.args.join(" ");
-        assert!(joined.contains("--resume {sessionId}"));
-        assert!(joined.contains("--stream-partial-output"));
-        assert!(joined.contains("{prompt}"));
-        assert!(cli.capabilities().session_resume);
-        assert!(cli.capabilities().cancellation);
+        assert!(prefer_load);
     }
 
     #[test]
     fn usage_points_at_the_hosted_ledger() {
-        assert!(AGENT.usage.live.is_none());
         assert!(AGENT.usage.transcript.is_none());
         assert_eq!(
             AGENT.usage.hosted,

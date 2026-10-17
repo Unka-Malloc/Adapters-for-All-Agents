@@ -24,6 +24,15 @@ both directions:
 The same rule binds the adapter crates under `crates/`: `a4aa-<agent>`
 depends on `a4aa` and on nothing else.
 
+## Lane completeness (hard rule)
+
+Every interaction form an agent natively offers gets its own adapter — serve,
+acp, rpc, cli and pty are all adapted wherever the agent supports them.
+Supporting one form never excuses dropping another: the adapter exists to
+cover all of them. A form that is only partially implemented is declared and
+reported as incomplete — never claimed supported, and never dropped by
+deciding "another lane is enough".
+
 ## Verify
 
 `scripts/verify.sh` — fmt + clippy + tests across the workspace.

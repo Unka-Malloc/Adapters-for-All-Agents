@@ -12,6 +12,7 @@ dependencies = [
  "a4aa-cursor",
  "a4aa-dialects",
  "a4aa-dsh",
+ "a4aa-factory",
  "a4aa-opencode",
  "a4aa-pi",
  "agent-client-protocol",

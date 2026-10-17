@@ -112,6 +112,7 @@ pub const AGENT: AgentCard = AgentCard {
         ],
         prompt_channel: PromptChannel::Stdin,
         stream: StreamMode::Stdio,
+        resume_spawn_args: &[],
         resume_args: &["--resume", "{sessionId}"],
         stdin_template: Some(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"{prompt}"}]}}"#,
@@ -125,8 +126,10 @@ pub const AGENT: AgentCard = AgentCard {
         result_selector: Some("result"),
         result_selector_field: None,
         result_path: Some("result"),
+        usage_path: None,
         spawn_args: &[],
     }),
+    alternates: &[],
     detect: DetectSurface {
         binaries: &["claude"],
         processes: &["claude.exe", "claude"],

@@ -29,7 +29,9 @@ use crate::model::{
 use crate::observe::SharedObserver;
 use crate::rpc::{CallFailure, JsonRpcPeer, PendingCall, RpcDelegate, RpcErrorObject};
 use crate::supervision::SupervisedChild;
-use crate::template::{contains_placeholder, extract_path, substitute, vars, VarSpec, Vars};
+use crate::template::{
+    contains_placeholder, extract_path, secret_names, substitute, vars, VarSpec, Vars,
+};
 use crate::transport::stdio;
 
 /// Host callbacks for an RPC session.
@@ -60,6 +62,7 @@ struct RpcState {
     peer: Arc<JsonRpcPeer>,
     child: Mutex<SupervisedChild>,
     spec: RpcLaneSpec,
+    secrets: Arc<dyn SecretResolver>,
     max_output_bytes: Option<usize>,
     delivery: Arc<TurnDelivery>,
     session_model: Option<String>,
@@ -450,20 +453,65 @@ impl RpcLane {
             ));
         }
         let env = crate::env::resolve(&self.command.env, &request.env, &*self.secrets).await?;
-        let mut command = SupervisedChild::command(&self.command, &env, request.cwd.as_deref());
-        let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
-        let (stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
-        if let Some(stderr) = stderr {
-            tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
-        }
+        type PeerIo = (
+            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        );
+        let (peer_io, child): (PeerIo, SupervisedChild) = match &self.spec.transport {
+            crate::model::RpcTransport::Stdio => {
+                let mut command =
+                    SupervisedChild::command(&self.command, &env, request.cwd.as_deref());
+                let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
+                let (stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
+                if let Some(stderr) = stderr {
+                    tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+                }
+                (
+                    (
+                        Box::new(stdout) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                        Box::new(stdin) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    ) as PeerIo,
+                    child,
+                )
+            }
+            crate::model::RpcTransport::WebSocket { announce } => {
+                // A first-party daemon: the lane picks the loopback port,
+                // the server announces its `ws://` endpoint on stdout.
+                let mut command_spec = self.command.clone();
+                let port = free_port()?;
+                for arg in &mut command_spec.args {
+                    *arg = arg.replace("{port}", &port.to_string());
+                }
+                let mut command =
+                    SupervisedChild::command(&command_spec, &env, request.cwd.as_deref());
+                let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
+                let (_stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
+                if let Some(stderr) = stderr {
+                    tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+                }
+                let url = announce_endpoint(stdout, announce).await?;
+                let ws = crate::transport::ws::connect(&url).await?;
+                // The daemon's stdin pipe stays open (the server never
+                // reads it) and stdout keeps carrying log output — drain
+                // both so a chatty server never blocks on a full pipe.
+                drop(_stdin);
+                (
+                    (
+                        Box::new(ws.reader) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                        Box::new(ws.writer) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    ) as PeerIo,
+                    child,
+                )
+            }
+        };
         let delivery = Arc::new(TurnDelivery::new(
             delegate,
             self.spec.clone(),
             self.max_output_bytes,
         ));
         let peer = JsonRpcPeer::spawn_with_envelope(
-            stdout,
-            stdin,
+            peer_io.0,
+            peer_io.1,
             delivery.clone(),
             self.observer.clone(),
             crate::framing::DEFAULT_MAX_MESSAGE_BYTES,
@@ -481,6 +529,7 @@ impl RpcLane {
             call(
                 &peer,
                 initialize,
+                &*self.secrets,
                 &vars(VarSpec {
                     cwd: &cwd,
                     model: request.config.model.as_deref(),
@@ -515,6 +564,7 @@ impl RpcLane {
             let result = call(
                 &peer,
                 open,
+                &*self.secrets,
                 &vars(VarSpec {
                     session_id: resume,
                     cwd: &cwd,
@@ -536,6 +586,7 @@ impl RpcLane {
                 peer,
                 child: Mutex::new(child),
                 spec: self.spec.clone(),
+                secrets: self.secrets.clone(),
                 max_output_bytes: self.max_output_bytes,
                 delivery,
                 session_model: request.config.model.clone(),
@@ -663,7 +714,7 @@ impl RpcState {
         // selection on flat-envelope agents). A call whose params template
         // resolved to an empty object is skipped — nothing was requested.
         for pre in &self.spec.pre_turn {
-            let params = substitute(&pre.params, &vars);
+            let params = substitute_resolved(&pre.params, &vars, &*self.secrets).await;
             let empty = params.as_object().is_some_and(|map| map.is_empty());
             let template_empty = pre.params.as_object().is_some_and(|map| map.is_empty());
             if empty && !template_empty {
@@ -687,7 +738,7 @@ impl RpcState {
         if self.spec.prompt.method.is_empty() {
             return Err(AdapterError::permanent("agent_method_unset", "rpc/call"));
         }
-        let params = substitute(&self.spec.prompt.params, &vars);
+        let params = substitute_resolved(&self.spec.prompt.params, &vars, &*self.secrets).await;
         let pending = {
             let mut control = self.control.lock().unwrap();
             if control.pending_cancel || control.killed {
@@ -818,7 +869,7 @@ impl RpcState {
                         std::mem::take(&mut control.pending_cancel)
                     };
                     acknowledged = true;
-                    if pending_cancel { self.send_cancel(turn_id.as_deref())?; }
+                    if pending_cancel { self.send_cancel(turn_id.as_deref()).await?; }
                 }
                 _ = &mut changed => {}
                 _ = self.peer.closed() => {
@@ -867,11 +918,11 @@ impl RpcState {
             self.child.lock().await.terminate().await?;
             Ok(())
         } else {
-            self.send_cancel(turn_id.as_deref())
+            self.send_cancel(turn_id.as_deref()).await
         }
     }
 
-    fn send_cancel(&self, turn_id: Option<&str>) -> Result<(), AdapterError> {
+    async fn send_cancel(&self, turn_id: Option<&str>) -> Result<(), AdapterError> {
         let cancel =
             self.spec.cancel.as_ref().ok_or_else(|| {
                 AdapterError::permanent("agent_cancel_unsupported", "session/cancel")
@@ -890,12 +941,11 @@ impl RpcState {
             turn_id,
             ..Default::default()
         });
-        self.peer
-            .notify(&cancel.method, substitute(&cancel.params, &vars))
-            .map_err(|error| {
-                AdapterError::uncertain("agent_cancel_failed", "session/cancel")
-                    .with_detail(format!("{error:?}"))
-            })
+        let params = substitute_resolved(&cancel.params, &vars, &*self.secrets).await;
+        self.peer.notify(&cancel.method, params).map_err(|error| {
+            AdapterError::uncertain("agent_cancel_failed", "session/cancel")
+                .with_detail(format!("{error:?}"))
+        })
     }
 
     /// Invoke a declared passthrough method verbatim.
@@ -935,7 +985,7 @@ impl RpcState {
                 cwd: &self.cwd,
                 ..Default::default()
             });
-            let params = substitute(&close.params, &vars);
+            let params = substitute_resolved(&close.params, &vars, &*self.secrets).await;
             let _ = self.peer.call(&close.method, params).await;
         }
         self.peer.close().await;
@@ -954,13 +1004,37 @@ fn send_initialized(peer: &JsonRpcPeer, method: &str) -> Result<(), AdapterError
         })
 }
 
-async fn call(peer: &JsonRpcPeer, spec: &RpcCallSpec, vars: &Vars) -> Result<Value, AdapterError> {
+async fn call(
+    peer: &JsonRpcPeer,
+    spec: &RpcCallSpec,
+    secrets: &dyn SecretResolver,
+    vars: &Vars,
+) -> Result<Value, AdapterError> {
     if spec.method.is_empty() {
         return Err(AdapterError::permanent("agent_method_unset", "rpc/call"));
     }
-    peer.call(&spec.method, substitute(&spec.params, vars))
-        .await
-        .map_err(call_failure)
+    let params = substitute_resolved(&spec.params, vars, secrets).await;
+    peer.call(&spec.method, params).await.map_err(call_failure)
+}
+
+/// Substitute a params template after resolving its `{secret:NAME}`
+/// placeholders through the host's [`SecretResolver`]. An unresolved name
+/// drops its leaf like an absent optional selector: the wire never carries
+/// a literal placeholder, and either/or credential pairs (for example a
+/// WorkOS token beside an API key) degrade to the credential present.
+async fn substitute_resolved(template: &Value, vars: &Vars, secrets: &dyn SecretResolver) -> Value {
+    let names = secret_names(template);
+    if names.is_empty() {
+        return substitute(template, vars);
+    }
+    let mut vars = vars.clone();
+    for name in names {
+        match secrets.resolve(&name).await {
+            Some(value) => vars.set_secret(&name, value),
+            None => vars.absent_secret(&name),
+        }
+    }
+    substitute(template, &vars)
 }
 
 /// Mint a process-scoped wire session id: the host's durable binding is a
@@ -992,6 +1066,58 @@ fn call_failure(failure: CallFailure) -> AdapterError {
 
 fn extract_text(result: &Value, path: Option<&str>) -> Option<String> {
     extract_path(result, path?)?.as_str().map(str::to_owned)
+}
+
+/// Bind port 0 on loopback and release it — the daemon then claims the same
+/// port itself. The freed port is a hint, not a reservation: a colliding
+/// listener between free and bind makes the daemon announce a different port
+/// (or fail), both of which surface through `announce_endpoint`.
+fn free_port() -> Result<u16, AdapterError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| {
+        AdapterError::uncertain("agent_transport_failed", "rpc/open")
+            .with_detail(format!("loopback probe failed: {error}"))
+    })?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|error| {
+            AdapterError::uncertain("agent_transport_failed", "rpc/open")
+                .with_detail(format!("loopback probe failed: {error}"))
+        })
+}
+
+/// Read the daemon's stdout until its announce prefix produces the `ws://`
+/// endpoint. Afterwards the stream keeps draining in the background — the
+/// daemon may keep logging on stdout, and a full pipe must never stall it.
+async fn announce_endpoint(
+    mut stdout: tokio::process::ChildStdout,
+    announce: &str,
+) -> Result<String, AdapterError> {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(&mut stdout);
+    let mut line = String::new();
+    let url = loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await.map_err(|error| {
+            AdapterError::uncertain("agent_transport_failed", "rpc/open")
+                .with_detail(format!("daemon endpoint unreadable: {error}"))
+        })?;
+        if read == 0 {
+            return Err(
+                AdapterError::uncertain("agent_transport_failed", "rpc/open")
+                    .with_detail("daemon exited before announcing its WebSocket endpoint"),
+            );
+        }
+        if let Some(rest) = line.trim().strip_prefix(announce) {
+            break rest.trim().to_owned();
+        }
+    };
+    drop(reader);
+    tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        let _ = tokio::io::copy(&mut stdout, &mut sink).await;
+    });
+    Ok(url)
 }
 
 /// Extract a session or turn binding from a call result: `sessionId`,

@@ -26,7 +26,7 @@ use crate::dialect::Dialect;
 use crate::env::{EnvPolicy, EnvSource};
 use crate::model::{
     AgentSpec, BindingReceiptShape, CliLaneSpec, CommandSpec, LaneSpec, PromptChannel, RpcCallSpec,
-    RpcCompletionSpec, RpcEnvelopeSpec, RpcLaneSpec, SessionScope, StreamMode,
+    RpcCompletionSpec, RpcEnvelopeSpec, RpcLaneSpec, RpcTransport, SessionScope, StreamMode,
 };
 
 /// The complete descriptor for one agent.
@@ -39,6 +39,11 @@ pub struct AgentCard {
     pub dialect: &'static Dialect,
     /// How to reach the agent.
     pub surface: AgentSurface,
+    /// Further native interaction forms, in preference order after the
+    /// primary `surface` — a verified ACP endpoint ahead of a stream-json
+    /// CLI, and so on. `AgentCard::specs` materializes primary first,
+    /// alternates in declaration order, for a host's lane fallback chain.
+    pub alternates: &'static [AlternateLane],
     /// Machine-discovery facts.
     pub detect: DetectSurface,
     /// Natively supported features.
@@ -59,7 +64,27 @@ impl AgentCard {
     /// `sessionResume`/`resumeArgs` surface — a spec that cannot express
     /// resume fails closed at open.
     pub fn spec(&self) -> AgentSpec {
-        let lane = match &self.surface {
+        self.spec_for(&self.surface, self.detect.binaries.first().copied())
+    }
+
+    /// The primary spec plus each declared alternate, in order — the
+    /// launch chain a host walks when the preferred native form cannot
+    /// establish or finish a turn.
+    pub fn specs(&self) -> Vec<AgentSpec> {
+        std::iter::once(self.spec())
+            .chain(self.alternates.iter().map(|alternate| {
+                self.spec_for(
+                    &alternate.surface,
+                    alternate
+                        .binary
+                        .or_else(|| self.detect.binaries.first().copied()),
+                )
+            }))
+            .collect()
+    }
+
+    fn spec_for(&self, surface: &AgentSurface, binary: Option<&'static str>) -> AgentSpec {
+        let lane = match surface {
             AgentSurface::Acp {
                 prefer_load,
                 auth_key,
@@ -78,12 +103,20 @@ impl AgentCard {
                     .iter()
                     .map(|arg| (*arg).to_owned())
                     .collect(),
+                resume_spawn_args: cli
+                    .resume_spawn_args
+                    .iter()
+                    .map(|arg| (*arg).to_owned())
+                    .collect(),
                 stdin_template: cli.stdin_template.map(|text| {
                     serde_json::from_str(text).expect("a4aa card stdin template is json")
                 }),
                 json_lines: cli.json_lines,
                 session_id_path: cli.session_id_path.map(str::to_owned),
-                usage_path: self.usage.live.as_ref().map(|usage| usage.path.to_owned()),
+                usage_path: cli
+                    .usage_path
+                    .map(str::to_owned)
+                    .or_else(|| self.usage.live.as_ref().map(|usage| usage.path.to_owned())),
                 open_args: cli.open_args.iter().map(|arg| (*arg).to_owned()).collect(),
                 binding_file_env: cli.binding_file_env.map(str::to_owned),
                 binding_receipt_shape: cli.binding_receipt_shape,
@@ -133,28 +166,38 @@ impl AgentCard {
                     error_field: envelope.error_field.map(str::to_owned),
                     success_field: envelope.success_field.map(str::to_owned),
                     command_field: envelope.command_field.map(str::to_owned),
+                    discriminant_field: envelope.discriminant_field.map(str::to_owned),
+                    request_marker: envelope.request_marker.map(str::to_owned),
+                    notification_marker: envelope.notification_marker.map(str::to_owned),
+                    const_fields: envelope
+                        .const_fields
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                        .collect(),
                 }),
                 passthrough: rpc
                     .passthrough
                     .iter()
                     .map(|method| (*method).to_owned())
                     .collect(),
+                transport: match rpc.transport {
+                    RpcTransportDecl::Stdio => RpcTransport::Stdio,
+                    RpcTransportDecl::WebSocket(announce) => RpcTransport::WebSocket {
+                        announce: announce.to_owned(),
+                    },
+                },
             })),
+            AgentSurface::Serve { .. } => LaneSpec::Serve {
+                mcp_servers: Vec::new(),
+            },
         };
         AgentSpec {
             id: self.id.to_owned(),
             client_name: None,
             lane,
             command: CommandSpec {
-                program: self
-                    .detect
-                    .binaries
-                    .first()
-                    .copied()
-                    .unwrap_or(self.id)
-                    .to_owned(),
-                args: self
-                    .spawn_args()
+                program: binary.unwrap_or(self.id).to_owned(),
+                args: Self::surface_spawn_args(surface)
                     .iter()
                     .map(|arg| (*arg).to_owned())
                     .collect(),
@@ -168,10 +211,11 @@ impl AgentCard {
     /// Process argv prefix before the lane's own arguments (`app-server`
     /// for a `codex app-server` launch). Empty for agents whose argv is the
     /// lane template itself.
-    fn spawn_args(&self) -> &'static [&'static str] {
-        match &self.surface {
+    fn surface_spawn_args(surface: &AgentSurface) -> &'static [&'static str] {
+        match surface {
             AgentSurface::Acp { spawn_args, .. }
-            | AgentSurface::Cli(CliSurface { spawn_args, .. }) => spawn_args,
+            | AgentSurface::Cli(CliSurface { spawn_args, .. })
+            | AgentSurface::Serve { spawn_args } => spawn_args,
             AgentSurface::Rpc(rpc) => rpc.spawn_args,
         }
     }
@@ -197,6 +241,20 @@ pub enum AgentSurface {
     /// Host-declared JSON-RPC methods over stdio. Cards are `const`, so the
     /// surface rides by reference — `Box` cannot be built in const context.
     Rpc(&'static RpcSurface),
+    /// The agent's own first-party HTTP server (its `serve` family
+    /// subcommand): spawned per session, discovered on stdout, driven over
+    /// loopback REST. Preferred transport where the agent offers one.
+    Serve { spawn_args: &'static [&'static str] },
+}
+
+/// One additional native form on a card — the surface plus the launch
+/// program when it differs from `detect.binaries[0]` (an ACP server bundle
+/// ahead of the general CLI binary, for example).
+pub struct AlternateLane {
+    /// The lane declaration for this form.
+    pub surface: AgentSurface,
+    /// Launch program override; `None` reuses the card's first binary.
+    pub binary: Option<&'static str>,
 }
 
 /// Const-declared `api_key` source for the acp `authenticate` retry;
@@ -233,6 +291,10 @@ pub struct CliSurface {
     /// argv appended when a session binding exists (`{sessionId}`
     /// substitutes it). Empty: the CLI has no persisted-session resume.
     pub resume_args: &'static [&'static str],
+    /// argv replacing `spawn_args` entirely when a session binding exists —
+    /// for CLIs whose resume shape reorders argv (`codex exec resume <id>`).
+    /// Empty: spawn args stay constant.
+    pub resume_spawn_args: &'static [&'static str],
     /// stdin payload template as static JSON text; replaces the bare prompt
     /// line when the prompt channel resolves to stdin. A leaf exactly
     /// `{prompt}` receives the prompt as a JSON string.
@@ -257,6 +319,11 @@ pub struct CliSurface {
     pub result_selector_field: Option<&'static str>,
     /// Dotted path to the final text inside the `result_selector` record.
     pub result_path: Option<&'static str>,
+    /// Dotted path to token counters on a stdout JSON line for this lane.
+    /// `None` inherits the card's `usage.live` path; set it when the
+    /// lane's stream records usage under a different shape (an ACP
+    /// primary reports `session/update`, a CLI alternate `result.usage`).
+    pub usage_path: Option<&'static str>,
     /// argv prefix before the lane args (for example a subcommand).
     pub spawn_args: &'static [&'static str],
 }
@@ -303,7 +370,24 @@ pub struct RpcSurface {
     /// Methods a consumer may invoke verbatim through the lane.
     pub passthrough: &'static [&'static str],
     /// argv prefix before the lane args (for example a subcommand).
+    /// A `WebSocket` transport substitutes `{port}` with a free loopback
+    /// port the lane picks (for example `daemon --port {port}`).
     pub spawn_args: &'static [&'static str],
+    /// Byte transport the protocol rides; `Stdio` is the process's own
+    /// stdin/stdout, `WebSocket` spawns a first-party daemon and connects
+    /// to its announced endpoint.
+    pub transport: RpcTransportDecl,
+}
+
+/// Card-level transport declaration — `&'static` friendly counterpart of
+/// [`crate::model::RpcTransport`].
+#[derive(Clone, Copy)]
+pub enum RpcTransportDecl {
+    /// The agent process speaks the protocol on its own stdio.
+    Stdio,
+    /// Spawn a first-party daemon; its stdout announces the `ws://`
+    /// endpoint after this prefix (for example `WebSocket endpoint: `).
+    WebSocket(&'static str),
 }
 
 /// Wire conventions for an rpc lane that is not stock JSON-RPC 2.0 — see
@@ -319,6 +403,18 @@ pub struct EnvelopeDecl {
     pub error_field: Option<&'static str>,
     pub success_field: Option<&'static str>,
     pub command_field: Option<&'static str>,
+    /// Field that classifies inbound frames by value; absent:
+    /// `method_field` doubles as the classifier.
+    pub discriminant_field: Option<&'static str>,
+    /// Discriminant value stamped on outbound requests (for example
+    /// `"request"`) — only with `discriminant_field`.
+    pub request_marker: Option<&'static str>,
+    /// Discriminant value stamped on outbound notifications (for example
+    /// `"notification"`) — only with `discriminant_field`.
+    pub notification_marker: Option<&'static str>,
+    /// Constant members merged into every outbound frame — protocol
+    /// identity tags only; frame-kind tagging uses the markers.
+    pub const_fields: &'static [(&'static str, &'static str)],
 }
 
 /// One declared call: method plus a static-JSON params template.

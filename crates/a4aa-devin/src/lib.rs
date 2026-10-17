@@ -12,13 +12,15 @@
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
 use a4aa::card::{
-    AcpAuthKey, AgentCard, AgentSurface, AttachmentSupport, DetectSurface, FeatureSurface,
-    HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind, UsageSurface,
+    AcpAuthKey, AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface,
+    DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog,
+    OsPath, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
     Target,
 };
+use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
 
 /// The `devin` dialect: Devin config.json hooks, AGENTS.md, skills,
@@ -106,6 +108,41 @@ pub const AGENT: AgentCard = AgentCard {
         // the host supplies the key (here: a `DEVIN_API_KEY` host env).
         auth_key: Some(AcpAuthKey::HostEnv("DEVIN_API_KEY")),
     },
+    alternates: &[AlternateLane {
+        // `devin -p` non-interactive print mode: text on stdout, one
+        // process per turn, `-r` resumes a host-known session id. Print
+        // mode emits no session record, so bindings come only from the
+        // host's own state; `--respect-workspace-trust false` is required
+        // because print cannot answer the interactive trust prompt.
+        surface: AgentSurface::Cli(CliSurface {
+            args: &[
+                "--print",
+                "{prompt}",
+                "--model",
+                "{model}",
+                "--permission-mode",
+                "{permission}",
+                "--respect-workspace-trust",
+                "false",
+            ],
+            prompt_channel: PromptChannel::ArgOnly,
+            stream: StreamMode::Stdio,
+            resume_spawn_args: &[],
+            resume_args: &["-r", "{sessionId}"],
+            stdin_template: None,
+            json_lines: false,
+            session_id_path: None,
+            open_args: &[],
+            binding_file_env: None,
+            binding_receipt_shape: BindingReceiptShape::SessionId,
+            result_selector: None,
+            result_selector_field: None,
+            result_path: None,
+            usage_path: None,
+            spawn_args: &[],
+        }),
+        binary: None,
+    }],
     detect: DetectSurface {
         binaries: &["devin"],
         processes: &["devin.exe", "devin", "Devin"],

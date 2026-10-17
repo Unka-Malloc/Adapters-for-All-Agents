@@ -260,7 +260,11 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn cursor_default_argv_preserves_native_approval_policy() {
-    let mut spec = a4aa_cursor::spec();
+    let mut spec = a4aa_cursor::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("cursor declares the cli alternate");
     spec.command.program = "sh".into();
     spec.command.args = vec![
         "-c".into(),

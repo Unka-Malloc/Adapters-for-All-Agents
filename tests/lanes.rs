@@ -8,8 +8,8 @@ use a4aa::rpc::JsonRpcPeer;
 use a4aa::{
     Adapter, AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvPolicy, EnvValue, LaneSpec,
     PermissionDecision, PermissionHandler, PermissionPrompt, PromptChannel, RpcCallSpec,
-    RpcLaneSpec, SelectorPhase, SelectorSupport, SessionConfig, SessionRequest, StreamMode,
-    TurnRequest,
+    RpcLaneSpec, RpcTransport, SelectorPhase, SelectorSupport, SessionConfig, SessionRequest,
+    StreamMode, TurnRequest,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,6 +47,7 @@ fn rpc_spec() -> AgentSpec {
         id: "fixture-rpc".into(),
         client_name: None,
         lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+            transport: RpcTransport::Stdio,
             initialize: None,
             initialized: None,
             session_open: Some(RpcCallSpec {
@@ -303,6 +304,7 @@ fn cli_spec(
             prompt_channel: channel,
             stream,
             resume_args: vec![],
+            resume_spawn_args: vec![],
             stdin_template: None,
             json_lines: false,
             session_id_path: None,
@@ -949,7 +951,8 @@ else:
                 "acp"=>LaneSpec::Acp {mcp_servers:vec![],prefer_load:false,auth_key:None},
                 "cli"|"pty"=>LaneSpec::Cli(Box::new(CliLaneSpec {args:vec!["{prompt}".into()],prompt_channel:PromptChannel::ArgOnly,
                     stream:if mode=="pty" {StreamMode::Pty}else{StreamMode::Stdio},..Default::default()})),
-                _=>LaneSpec::Rpc(Box::new(RpcLaneSpec {prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
+                _=>LaneSpec::Rpc(Box::new(RpcLaneSpec {
+            transport: RpcTransport::Stdio,prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
                     text_event_method:Some("ready".into()),text_path:Some("text".into()),..Default::default()})),
             };
             let spec=AgentSpec {id:mode.into(),client_name:None,max_output_bytes:Some(1024),lane,
@@ -1509,6 +1512,7 @@ time.sleep(3600)
                     auth_key: None,
                 },
                 _ => LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                    transport: RpcTransport::Stdio,
                     initialize: Some(RpcCallSpec {
                         method: "initialize".into(),
                         params: json!({}),
@@ -1673,6 +1677,7 @@ signal.pause()
             client_name: None,
             max_output_bytes: Some(1024),
             lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                transport: RpcTransport::Stdio,
                 initialize: Some(RpcCallSpec {
                     method: "initialize".into(),
                     params: json!({}),
@@ -1791,6 +1796,7 @@ signal.pause()
                 client_name: None,
                 max_output_bytes: Some(1024),
                 lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+                    transport: RpcTransport::Stdio,
                     initialize: Some(RpcCallSpec {
                         method: "initialize".into(),
                         params: json!({}),
@@ -1890,6 +1896,7 @@ for line in sys.stdin:
             client_name: None,
             max_output_bytes: Some(1024),
             lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
+            transport: RpcTransport::Stdio,
                 prompt: RpcCallSpec {
                     method: "prompt".into(),
                     params: json!({"text": "{prompt}"}),

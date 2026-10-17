@@ -755,3 +755,168 @@ async fn writer_failure_releases_queued_budget_and_settles_pending() {
     .await
     .expect("writer failure left the budget charged");
 }
+
+// ------------------ factory-style envelope ------------------
+
+/// The `droid exec --input-format stream-jsonrpc` wire: requests carry a
+/// constant protocol tag set (`type:"request"`, version members) plus a
+/// `method` slot; inbound frames are classified by `type`, not by the
+/// method slot. The session lifecycle runs `droid.initialize_session` →
+/// `droid.add_user_message` with results under `result`.
+#[tokio::test]
+async fn factory_envelope_const_fields_and_discriminant() {
+    use a4aa::framing::{read_frame, write_frame, DEFAULT_MAX_MESSAGE_BYTES};
+    use std::collections::BTreeMap;
+
+    struct Notices {
+        got: Mutex<Vec<(String, Value)>>,
+    }
+    #[async_trait::async_trait]
+    impl RpcDelegate for Notices {
+        async fn on_notification(&self, method: &str, params: Value) {
+            self.got.lock().await.push((method.to_owned(), params));
+        }
+    }
+
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let notices = Arc::new(Notices {
+            got: Mutex::new(Vec::new()),
+        });
+        let (host, agent) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(host);
+        let peer = JsonRpcPeer::spawn_with_envelope(
+            reader,
+            writer,
+            notices.clone(),
+            a4aa::observe::none(),
+            DEFAULT_MAX_MESSAGE_BYTES,
+            Some(a4aa::RpcEnvelopeSpec {
+                method_field: "method".into(),
+                discriminant_field: Some("type".into()),
+                request_marker: Some("request".into()),
+                notification_marker: Some("notification".into()),
+                string_ids: true,
+                response_method: Some("response".into()),
+                const_fields: BTreeMap::from([
+                    ("jsonrpc".to_owned(), "2.0".to_owned()),
+                    ("factoryApiVersion".to_owned(), "1.0.0".to_owned()),
+                    ("factoryProtocolVersion".to_owned(), "1.269.0".to_owned()),
+                ]),
+                ..Default::default()
+            }),
+        );
+        let (read, mut write) = tokio::io::split(agent);
+        let server = tokio::spawn(async move {
+            let mut read = tokio::io::BufReader::new(read);
+            let request = read_frame(&mut read, DEFAULT_MAX_MESSAGE_BYTES)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            // The request carries the full factory tag set: a constant
+            // `type:"request"` discriminant, version members, the method
+            // name in its own slot and params nested — nothing inlined.
+            assert_eq!(request["type"], "request");
+            assert_eq!(request["jsonrpc"], "2.0");
+            assert_eq!(request["factoryApiVersion"], "1.0.0");
+            assert_eq!(request["factoryProtocolVersion"], "1.269.0");
+            assert_eq!(request["method"], "droid.initialize_session");
+            assert_eq!(request["params"]["cwd"], "/tmp/work");
+            assert!(request["id"].is_string());
+            // The response is classified by `type`, not `method`.
+            write_frame(
+                &mut write,
+                &json!({
+                    "type": "response",
+                    "id": request["id"],
+                    "result": {"sessionId": "sess-1"},
+                }),
+            )
+            .await
+            .unwrap();
+            // A session notification rides `method` with a nested
+            // `notification` payload — it must reach the delegate, not be
+            // mistaken for a response.
+            write_frame(
+                &mut write,
+                &json!({
+                    "type": "notification",
+                    "method": "droid.session_notification",
+                    "params": {
+                        "sessionId": "sess-1",
+                        "notification": {
+                            "type": "assistant_text_delta",
+                            "textDelta": "hi",
+                        }
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let outcome = peer
+            .call(
+                "droid.initialize_session",
+                json!({"machineId": "a4aa", "cwd": "/tmp/work"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome["sessionId"], "sess-1");
+        server.await.unwrap();
+        // The ordered callback drains before close settles.
+        peer.close().await;
+        let got = notices.got.lock().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "droid.session_notification");
+        assert_eq!(got[0].1["notification"]["textDelta"], "hi");
+    })
+    .await
+    .expect("factory envelope roundtrip exceeded budget");
+}
+
+/// Constant members tag requests only — a notification must not inherit
+/// the `"request"` discriminant.
+#[tokio::test]
+async fn factory_envelope_notifications_stamp_their_own_marker() {
+    use a4aa::framing::{read_frame, DEFAULT_MAX_MESSAGE_BYTES};
+    use std::collections::BTreeMap;
+
+    tokio::time::timeout(test_settings::WAIT_BUDGET, async {
+        let (host, agent) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(host);
+        let peer = JsonRpcPeer::spawn_with_envelope(
+            reader,
+            writer,
+            Arc::new(Noop),
+            a4aa::observe::none(),
+            DEFAULT_MAX_MESSAGE_BYTES,
+            Some(a4aa::RpcEnvelopeSpec {
+                method_field: "method".into(),
+                discriminant_field: Some("type".into()),
+                request_marker: Some("request".into()),
+                notification_marker: Some("notification".into()),
+                response_method: Some("response".into()),
+                const_fields: BTreeMap::from([("jsonrpc".to_owned(), "2.0".to_owned())]),
+                ..Default::default()
+            }),
+        );
+        peer.notify("droid.session_notification", json!({}))
+            .unwrap();
+        let (read, _write) = tokio::io::split(agent);
+        let mut read = tokio::io::BufReader::new(read);
+        let frame = read_frame(&mut read, DEFAULT_MAX_MESSAGE_BYTES)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame["method"], "droid.session_notification");
+        // A notification has no id, stamps the discriminant with its own
+        // marker, and still carries protocol identity tags.
+        assert_eq!(frame["type"], "notification");
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert!(frame.get("id").is_none());
+        peer.close().await;
+    })
+    .await
+    .expect("notification frame");
+}
