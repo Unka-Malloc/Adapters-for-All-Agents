@@ -20,6 +20,7 @@ use crate::observe::SharedObserver;
 use crate::proto::acp::{AcpLane, AcpSession, PermissionDecision, SessionDelegate};
 use crate::proto::cli::CliLane;
 use crate::proto::rpc::{RpcLane, RpcSession, RpcSessionDelegate};
+use crate::proto::serve::{ServeLane, ServeSession};
 
 pub use crate::model::TurnRequest;
 
@@ -51,6 +52,7 @@ pub enum LaneSession {
     Acp(AcpSession),
     Rpc(Box<RpcSession>),
     Cli(CliSession),
+    Serve(ServeSession),
 }
 
 /// CLI session: one process per turn.
@@ -90,6 +92,7 @@ impl AgentSession {
             LaneSession::Acp(session) => session.session_id(),
             LaneSession::Rpc(session) => session.session_id().unwrap_or(""),
             LaneSession::Cli(session) => session.session_id(),
+            LaneSession::Serve(session) => session.session_id(),
         }
     }
 
@@ -103,6 +106,10 @@ impl AgentSession {
             LaneSession::Cli(session) => {
                 LaneSpec::Cli(Box::new(session.lane.lane.clone())).selector_support(phase)
             }
+            LaneSession::Serve(_) => LaneSpec::Serve {
+                mcp_servers: Vec::new(),
+            }
+            .selector_support(phase),
         }
     }
 
@@ -141,6 +148,7 @@ impl AgentSession {
                     )
                     .await
             }
+            LaneSession::Serve(session) => session.prompt(request).await,
             LaneSession::Cli(session) => {
                 // The session owns the dispatched turn: this future only
                 // awaits the outcome. Dropping it detaches the waiter — the
@@ -227,6 +235,7 @@ impl AgentSession {
                 session.lane.cancelled.send_replace(());
                 Ok(())
             }
+            LaneSession::Serve(session) => session.cancel().await,
         }
     }
 
@@ -244,6 +253,7 @@ impl AgentSession {
                     None => Ok(()),
                 }
             }
+            LaneSession::Serve(session) => session.close().await,
         }
     }
 }
@@ -409,6 +419,16 @@ impl Adapter {
             },
             LaneSpec::Rpc(spec) => spec.capabilities(),
             LaneSpec::Cli(spec) => spec.capabilities(),
+            // Request/response polling: turns are cancelable through the
+            // interrupt endpoint but stream no events, and a session store
+            // dies with its server process.
+            LaneSpec::Serve { .. } => Capabilities {
+                streaming: false,
+                cancellation: true,
+                session_resume: false,
+                permission_prompts: false,
+                detail: None,
+            },
         }
     }
 
@@ -506,6 +526,26 @@ impl Adapter {
                 let session = lane.open(request, Arc::new(Bridge { events })).await?;
                 Ok(AgentSession {
                     lane: LaneSession::Rpc(Box::new(session)),
+                    before_turn: self.before_turn.clone(),
+                    closed: AtomicBool::new(false),
+                })
+            }
+            LaneSpec::Serve { mcp_servers } => {
+                let lane = ServeLane {
+                    max_output_bytes: self.spec.max_output_bytes,
+                    command: self.spec.command.clone(),
+                    mcp_servers: mcp_servers.clone(),
+                    client_name: self
+                        .spec
+                        .client_name
+                        .clone()
+                        .unwrap_or_else(|| "a4aa".to_owned()),
+                    secrets: self.secrets.clone(),
+                    observer: self.observer.clone(),
+                };
+                let session = lane.open(request, events).await?;
+                Ok(AgentSession {
+                    lane: LaneSession::Serve(session),
                     before_turn: self.before_turn.clone(),
                     closed: AtomicBool::new(false),
                 })

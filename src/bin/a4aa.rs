@@ -330,7 +330,7 @@ impl SidecarDelegate {
             let capabilities = serde_json::to_value(match session.lane() {
                 a4aa::LaneSession::Acp(session) => session.capabilities().clone(),
                 a4aa::LaneSession::Rpc(session) => session.capabilities(),
-                a4aa::LaneSession::Cli(_) => adapter_capabilities,
+                a4aa::LaneSession::Cli(_) | a4aa::LaneSession::Serve(_) => adapter_capabilities,
             })
             .unwrap_or(Value::Null);
             let (agent_info, session_state) = match session.lane() {

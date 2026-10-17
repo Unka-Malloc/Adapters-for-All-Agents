@@ -23,6 +23,9 @@ pub enum LaneKind {
     /// Argv-driven CLI: prompt by argument template or stdin, output on
     /// stdout (pipe) or a pseudo-terminal (pty).
     Cli,
+    /// The agent's own first-party HTTP server, driven through its REST
+    /// surface with request/response polling.
+    Serve,
 }
 
 /// How a CLI lane carries the prompt.
@@ -351,6 +354,14 @@ pub enum LaneSpec {
     },
     Rpc(Box<RpcLaneSpec>),
     Cli(Box<CliLaneSpec>),
+    Serve {
+        /// MCP servers merged into the server's injected configuration
+        /// (`mcp.servers`) before spawn; the server connects them lazily
+        /// per session. ACP-style `{name, command, args, env}` entries are
+        /// translated to the server shape.
+        #[serde(default)]
+        mcp_servers: Vec<serde_json::Value>,
+    },
 }
 
 /// How to spawn the agent process.
@@ -450,6 +461,24 @@ impl LaneSpec {
                 }
             }
             Self::Rpc(spec) => rpc_selector_support(spec, phase, None),
+            Self::Serve { .. } => match phase {
+                // `model` is applied through the server's model endpoint;
+                // `permission` is negotiated against the configuration the
+                // spec injects at spawn — the lane verifies it denies
+                // mutation rather than trusting a requested preset.
+                SelectorPhase::Session => SelectorSupportSet {
+                    model: SelectorSupport::Applied,
+                    effort: SelectorSupport::Unsupported,
+                    mode: SelectorSupport::Unsupported,
+                    permission: SelectorSupport::Negotiated,
+                },
+                SelectorPhase::Turn => SelectorSupportSet {
+                    model: SelectorSupport::Applied,
+                    effort: SelectorSupport::Unsupported,
+                    mode: SelectorSupport::Unsupported,
+                    permission: SelectorSupport::Unsupported,
+                },
+            },
         }
     }
 }
