@@ -257,6 +257,24 @@ impl SidecarDelegate {
                 data: None,
             });
         }
+        // The ACP lane's auth_key is another client-named EnvSource — hold
+        // it to the same policy or it would bypass the spawn allowlist and
+        // read host variables into the child's `_meta.api_key`.
+        if let a4aa::model::LaneSpec::Acp {
+            auth_key: Some(source),
+            ..
+        } = &spec.lane
+        {
+            if !env_source_admitted_over_sidecar(source) {
+                return Err(RpcErrorObject {
+                    code: -32602,
+                    message: "lane auth_key not admitted over the sidecar: hostEnv \
+                              outside the allowlist and secret references are refused"
+                        .into(),
+                    data: None,
+                });
+            }
+        }
         let mut request = SessionRequest::default();
         if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
             request.cwd = Some(cwd.into());
@@ -1018,11 +1036,72 @@ fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy) -> bool {
             inherit.iter().all(|name| allowed(name))
                 && set.values().all(|value| match value {
                     a4aa::EnvValue::Literal(_) => true,
-                    a4aa::EnvValue::Source(a4aa::EnvSource::HostEnv { host_env }) => {
-                        allowed(host_env)
-                    }
-                    a4aa::EnvValue::Source(a4aa::EnvSource::Secret { .. }) => false,
+                    a4aa::EnvValue::Source(source) => env_source_admitted_over_sidecar(source),
                 })
         }
+    }
+}
+
+/// Whether a single `EnvSource` may cross the sidecar boundary — the same
+/// allowlist as spawn env: `hostEnv` must name an `INHERITED_ENV` member,
+/// secret references are refused.
+fn env_source_admitted_over_sidecar(source: &a4aa::EnvSource) -> bool {
+    match source {
+        a4aa::EnvSource::HostEnv { host_env } => {
+            a4aa::env::INHERITED_ENV.contains(&host_env.as_str())
+        }
+        a4aa::EnvSource::Secret { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(name: &str) -> a4aa::EnvSource {
+        a4aa::EnvSource::HostEnv {
+            host_env: name.into(),
+        }
+    }
+
+    #[test]
+    fn sidecar_env_sources_follow_the_spawn_allowlist() {
+        assert!(env_source_admitted_over_sidecar(&host("PATH")));
+        assert!(env_source_admitted_over_sidecar(&host("HOME")));
+        // Anything off the allowlist — credentials in particular — is refused.
+        for name in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "GH_TOKEN"] {
+            assert!(
+                !env_source_admitted_over_sidecar(&host(name)),
+                "{name} must not cross the sidecar boundary"
+            );
+        }
+        assert!(!env_source_admitted_over_sidecar(
+            &a4aa::EnvSource::Secret {
+                secret: "any".into()
+            }
+        ));
+    }
+
+    #[test]
+    fn sidecar_env_policy_matches_source_rules() {
+        use std::collections::BTreeMap;
+        let mut set = BTreeMap::new();
+        set.insert("SAFE".to_owned(), a4aa::EnvValue::Literal("1".into()));
+        set.insert("PATH".to_owned(), a4aa::EnvValue::Source(host("PATH")));
+        assert!(env_admitted_over_sidecar(&a4aa::EnvPolicy::Sanitized {
+            inherit: vec!["PATH".into()],
+            set: set.clone(),
+        }));
+        set.insert(
+            "LEAK".to_owned(),
+            a4aa::EnvValue::Source(host("OPENAI_API_KEY")),
+        );
+        assert!(!env_admitted_over_sidecar(&a4aa::EnvPolicy::Sanitized {
+            inherit: vec![],
+            set,
+        }));
+        assert!(!env_admitted_over_sidecar(&a4aa::EnvPolicy::InheritAll {
+            set: BTreeMap::new()
+        }));
     }
 }
