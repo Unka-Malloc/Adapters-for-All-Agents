@@ -5,6 +5,10 @@ application can embed this library in-process; hosts in other languages
 (Go, TypeScript, …) spawn the `a4aa serve` sidecar and get the identical
 adapter behavior over stdio JSON-RPC.
 
+Design premise: **the native agent is maximal** — A4AA translates what
+agents natively offer into a common language, bottom-up. See
+[docs/design-direction.md](docs/design-direction.md).
+
 ## What it provides
 
 | Layer | Module | Responsibility |
