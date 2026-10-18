@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a4aa"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa-antigravity",
  "a4aa-claude",
@@ -29,42 +29,42 @@ dependencies = [
 
 [[package]]
 name = "a4aa-antigravity"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-claude"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-codex"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-command-code"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-cursor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-devin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
  "tokio",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "a4aa-dialects"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
  "a4aa-antigravity",
@@ -95,35 +95,35 @@ dependencies = [
 
 [[package]]
 name = "a4aa-dsh"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-factory"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-grok"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-hermes"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-kilo-code"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
  "serde_json",
@@ -131,35 +131,35 @@ dependencies = [
 
 [[package]]
 name = "a4aa-kimi-code"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-kiro"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-open-claw"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-opencode"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]
 
 [[package]]
 name = "a4aa-pi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a4aa",
 ]

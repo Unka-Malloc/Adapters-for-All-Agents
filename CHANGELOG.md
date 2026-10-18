@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+Documentation and release-plumbing release; no behavior changes.
+
+- Add `docs/design-direction.md` stating A4AA's native-max design
+  direction: host capabilities are translated into a shared language, and
+  declared capability gaps are reported, never silently dropped.
+- Make the tag-triggered publish workflow treat an already-uploaded crate
+  as a successful skip instead of a retry failure.
+
 ## 0.2.0
 
 This release expands the public runtime descriptors and session configuration.
