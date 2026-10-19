@@ -144,10 +144,13 @@ impl SidecarDelegate {
 }
 
 /// Permission bridge: relay the ACP permission prompt to the sidecar's
-/// client and await its decision.
+/// client and await its decision. The host knows sessions by the id
+/// `session/open` returned, so the agent-native session id is translated
+/// to that sidecar id; the native one stays reachable under `raw`.
 struct RemotePermission {
     peer: Arc<std::sync::OnceLock<Arc<JsonRpcPeer>>>,
     peer_ready: Arc<tokio::sync::Notify>,
+    session_id: String,
 }
 
 #[async_trait::async_trait]
@@ -155,7 +158,7 @@ impl PermissionHandler for RemotePermission {
     async fn decide(&self, prompt: PermissionPrompt) -> PermissionDecision {
         let peer = wait_peer(&self.peer, &self.peer_ready).await;
         let params = json!({
-            "sessionId": prompt.session_id,
+            "sessionId": self.session_id,
             "toolCallId": prompt.tool_call_id,
             "title": prompt.title,
             "kind": prompt.kind,
@@ -322,6 +325,7 @@ impl SidecarDelegate {
         let adapter = Adapter::new(spec).permission(Arc::new(RemotePermission {
             peer: self.peer.clone(),
             peer_ready: self.peer_ready.clone(),
+            session_id: id.clone(),
         }));
         let adapter_capabilities = adapter.capabilities();
         // Establishment runs on its own task, which owns the session through
