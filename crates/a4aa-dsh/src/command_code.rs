@@ -77,6 +77,8 @@ impl std::error::Error for CommandCodeMountError {}
 /// The mounted route authenticates with the `COMMAND_CODE_API_KEY`
 /// reference, so its endpoint must be a public host: a loopback, private
 /// or link-local target would receive a credential it has no claim to.
+/// Userinfo is refused outright — a `user:pass@` authority would smuggle
+/// a second credential into the same URL.
 fn base_url_has_private_host(base_url: &str) -> bool {
     let authority = base_url["https://".len()..]
         // WHATWG HTTPS parsing treats a backslash as a path separator, so
@@ -84,10 +86,10 @@ fn base_url_has_private_host(base_url: &str) -> bool {
         // here too or the guard and the downstream parser disagree.
         .split(['/', '\\', '?', '#'])
         .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
         .unwrap_or_default();
+    if authority.contains('@') {
+        return true;
+    }
     let host = if let Some(rest) = authority.strip_prefix('[') {
         rest.split(']').next().unwrap_or_default()
     } else {
@@ -178,12 +180,27 @@ pub fn has_command_code_key(document: &str) -> bool {
         .any(|name| name == COMMAND_CODE_API_KEY_ENV)
 }
 
-/// Render the ACP-profile patch that mounts Command Code through pi-ai.
+/// Render the ACP-profile patch that mounts Command Code through pi-ai on
+/// the canonical gateway.
 ///
 /// The patch authenticates with `apiKeyEnv: COMMAND_CODE_API_KEY` — the
 /// reference name only. DSH resolves the secret from its credential store
 /// at request time.
 pub fn command_code_patch(
+    credentials_yaml: &str,
+    models: &[CommandCodeModel],
+) -> Result<String, CommandCodeMountError> {
+    command_code_patch_endpoint(credentials_yaml, COMMAND_CODE_BASE_URL, models)
+}
+
+/// Render the patch for an operator-declared custom gateway.
+///
+/// A custom endpoint is an explicit trusted-user setting: the caller owns
+/// `base_url` and must not forward values from untrusted workspace or
+/// third-party configuration — the public-host checks below validate the
+/// literal spelling only and cannot see which address a hostname resolves
+/// to when DSH later connects.
+pub fn command_code_patch_endpoint(
     credentials_yaml: &str,
     base_url: &str,
     models: &[CommandCodeModel],
@@ -383,15 +400,15 @@ mod tests {
             name: "GPT-5.4".into(),
         }];
         assert_eq!(
-            command_code_patch(CREDENTIALS_WITHOUT, COMMAND_CODE_BASE_URL, &models),
+            command_code_patch(CREDENTIALS_WITHOUT, &models),
             Err(CommandCodeMountError::MissingCredentialRef)
         );
         assert_eq!(
-            command_code_patch(CREDENTIALS, COMMAND_CODE_BASE_URL, &[]),
+            command_code_patch(CREDENTIALS, &[]),
             Err(CommandCodeMountError::EmptyModels)
         );
         assert_eq!(
-            command_code_patch(CREDENTIALS, "http://gateway.internal/v1", &models),
+            command_code_patch_endpoint(CREDENTIALS, "http://gateway.internal/v1", &models),
             Err(CommandCodeMountError::InsecureBaseUrl)
         );
         for url in [
@@ -411,14 +428,17 @@ mod tests {
             "https://[fe80::1%25eth0]/v1",
             "https://127.0.0.1\\@public.example/v1",
             "https://10.0.0.9\\@public.example/v1",
+            // Userinfo would smuggle a second credential into the route.
+            "https://user:pass@api.commandcode.ai/v1",
+            "https://user@10.0.0.9/v1",
         ] {
             assert_eq!(
-                command_code_patch(CREDENTIALS, url, &models),
+                command_code_patch_endpoint(CREDENTIALS, url, &models),
                 Err(CommandCodeMountError::PrivateBaseUrl),
                 "{url} must not receive the credential reference"
             );
         }
-        let patch = command_code_patch(CREDENTIALS, COMMAND_CODE_BASE_URL, &models).expect("mount");
+        let patch = command_code_patch(CREDENTIALS, &models).expect("mount");
         assert!(patch.contains(PI_AI_PLUGIN));
         assert!(patch.contains("apiKeyEnv: COMMAND_CODE_API_KEY"));
         assert!(patch.contains("command-code:"));
