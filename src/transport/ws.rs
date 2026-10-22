@@ -31,7 +31,7 @@ pub(crate) struct WsPeer {
 
 /// Connect `ws://host:port/path`, run the upgrade handshake, then split
 /// the socket into the peer-facing byte streams.
-pub(crate) async fn connect(url: &str) -> Result<WsPeer, AdapterError> {
+pub(crate) async fn connect(url: &str, max_message: usize) -> Result<WsPeer, AdapterError> {
     let (authority, path) = parse_ws_url(url)?;
     let mut socket = TcpStream::connect(authority)
         .await
@@ -40,7 +40,7 @@ pub(crate) async fn connect(url: &str) -> Result<WsPeer, AdapterError> {
     let (reader, mut to_peer) = tokio::io::duplex(64 * 1024);
     let (mut from_peer, writer) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
-        let _ = pump(&mut socket, &mut to_peer, &mut from_peer).await;
+        let _ = pump(&mut socket, &mut to_peer, &mut from_peer, max_message).await;
     });
     Ok(WsPeer { reader, writer })
 }
@@ -150,6 +150,7 @@ async fn pump<S>(
     socket: &mut S,
     to_peer: &mut DuplexStream,
     from_peer: &mut DuplexStream,
+    max_message: usize,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -167,13 +168,19 @@ where
                     Ok(_) => {}
                 }
                 loop {
-                    match take_frame(&mut inbound)? {
+                    match take_frame(&mut inbound, max_message)? {
                         None => break,
                         Some(Frame { opcode, fin, payload }) => {
                             match opcode {
                                 OP_TEXT | OP_BINARY | OP_CONT => {
                                     let message = if opcode == OP_CONT || fragmented.is_some() {
                                         let acc = fragmented.get_or_insert_with(Vec::new);
+                                        if acc.len() + payload.len() > max_message {
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "websocket message exceeds the lane limit",
+                                            ));
+                                        }
                                         acc.extend_from_slice(&payload);
                                         if fin { fragmented.take() } else { continue; }
                                     } else if fin {
@@ -247,8 +254,10 @@ struct Frame {
 }
 
 /// Pop one complete frame off `inbound` (leave partial bytes buffered).
-/// Server frames are unmasked; masked input is tolerated anyway.
-fn take_frame(inbound: &mut Vec<u8>) -> std::io::Result<Option<Frame>> {
+/// Server frames are unmasked; masked input is tolerated anyway. A frame
+/// declaring more than `max_message` payload bytes is refused up front so
+/// a hostile length field cannot grow the buffer without bound.
+fn take_frame(inbound: &mut Vec<u8>, max_message: usize) -> std::io::Result<Option<Frame>> {
     if inbound.len() < 2 {
         return Ok(None);
     }
@@ -281,6 +290,12 @@ fn take_frame(inbound: &mut Vec<u8>) -> std::io::Result<Option<Frame>> {
             "websocket frame length overflow",
         )
     })?;
+    if len > max_message as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket frame exceeds the lane limit",
+        ));
+    }
     if (inbound.len() as u64) < need {
         return Ok(None);
     }
@@ -365,7 +380,7 @@ mod tests {
         let mut wire = vec![0x81, 126];
         wire.extend_from_slice(&(300u16).to_be_bytes());
         wire.extend_from_slice(&payload);
-        let frame = take_frame(&mut wire).unwrap().unwrap();
+        let frame = take_frame(&mut wire, 1024).unwrap().unwrap();
         assert_eq!(frame.opcode, OP_TEXT);
         assert!(frame.fin);
         assert_eq!(frame.payload, payload);
@@ -373,16 +388,25 @@ mod tests {
         // masked roundtrip through encode_frame
         let encoded = encode_frame(OP_TEXT, b"hello", &mut serial);
         let mut wire = encoded;
-        let frame = take_frame(&mut wire).unwrap().unwrap();
+        let frame = take_frame(&mut wire, 1024).unwrap().unwrap();
         assert_eq!(frame.payload, b"hello");
     }
 
     #[test]
     fn take_frame_waits_for_partial_bytes() {
         let mut wire = vec![0x81];
-        assert!(take_frame(&mut wire).unwrap().is_none());
+        assert!(take_frame(&mut wire, 1024).unwrap().is_none());
         wire.extend_from_slice(&[0x80 | 5]); // masked, len 5
-        assert!(take_frame(&mut wire).unwrap().is_none());
+        assert!(take_frame(&mut wire, 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn take_frame_refuses_oversize_declared_length() {
+        let mut wire = vec![0x81, 126];
+        wire.extend_from_slice(&2048u16.to_be_bytes());
+        wire.extend_from_slice(&[0u8; 8]);
+        assert!(take_frame(&mut wire, 1024).is_err());
+        assert!(take_frame(&mut wire, 1024 * 1024).unwrap().is_none());
     }
 
     #[test]
@@ -391,7 +415,7 @@ mod tests {
         let mut wire = vec![0x81, 127];
         wire.extend_from_slice(&u64::MAX.to_be_bytes());
         wire.extend_from_slice(&[0u8; 4]);
-        assert!(take_frame(&mut wire).is_err());
+        assert!(take_frame(&mut wire, 1024).is_err());
     }
 
     #[tokio::test]
@@ -400,7 +424,9 @@ mod tests {
         let (reader, mut to_peer) = tokio::io::duplex(64 * 1024);
         let (mut from_peer, writer) = tokio::io::duplex(64 * 1024);
         let pump_task =
-            tokio::spawn(async move { pump(&mut socket_a, &mut to_peer, &mut from_peer).await });
+            tokio::spawn(
+                async move { pump(&mut socket_a, &mut to_peer, &mut from_peer, 1024).await },
+            );
         // socket side → peer: a server text frame arrives as one line.
         socket_b.write_all(&[0x81, 0x05]).await.unwrap();
         socket_b.write_all(b"hello").await.unwrap();
