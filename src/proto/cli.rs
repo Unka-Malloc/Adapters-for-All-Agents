@@ -10,6 +10,8 @@
 //! stream correctly on a terminal. PTY selection degrades to Stdio
 //! off-Unix.
 
+use std::io;
+
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -461,9 +463,9 @@ impl CliLane {
             },
         )?;
         let stderr_tail = bounds::StderrTail::default();
-        if let Some(stderr) = child.stderr() {
-            bounds::drain_stderr(stderr, self.observer.clone(), stderr_tail.clone());
-        }
+        let stderr_drain = child
+            .stderr()
+            .map(|stderr| bounds::drain_stderr(stderr, self.observer.clone(), stderr_tail.clone()));
         let stdin = child.stdin();
         let stdout = child
             .stdout()
@@ -497,6 +499,7 @@ impl CliLane {
             output_cancelled,
             write,
             stderr_tail,
+            stderr_drain,
         )
         .await
     }
@@ -511,9 +514,9 @@ impl CliLane {
     ) -> Result<TurnOutcome, AdapterError> {
         let (mut child, master) = crate::transport::pty::spawn(command)?;
         let stderr_tail = bounds::StderrTail::default();
-        if let Some(stderr) = child.stderr() {
-            bounds::drain_stderr(stderr, self.observer.clone(), stderr_tail.clone());
-        }
+        let stderr_drain = child
+            .stderr()
+            .map(|stderr| bounds::drain_stderr(stderr, self.observer.clone(), stderr_tail.clone()));
         let master = master.with_observer(self.observer.clone());
         let writer = master.writer();
         let output_cancelled = cancelled.clone();
@@ -537,6 +540,7 @@ impl CliLane {
             output_cancelled,
             write,
             stderr_tail,
+            stderr_drain,
         )
         .await
     }
@@ -555,6 +559,7 @@ impl CliLane {
         mut cancelled: watch::Receiver<()>,
         write: W,
         stderr_tail: bounds::StderrTail,
+        stderr_drain: Option<tokio::task::JoinHandle<io::Result<()>>>,
     ) -> Result<TurnOutcome, AdapterError> {
         // Turn accumulators: retained text (fallback), NDJSON carry,
         // last-seen usage, and the authoritative result-record text.
@@ -665,7 +670,12 @@ impl CliLane {
             // The child's own error text names quota, capacity and model
             // refusals a flattened "error" stop reason would lose: surface
             // them as a typed failure so custody can fail over to another
-            // candidate instead of retrying in place.
+            // candidate instead of retrying in place. Exit can race the
+            // drain task — join it first so the final refusal line is in
+            // the snapshot, not still in flight.
+            if let Some(drain) = stderr_drain {
+                let _ = drain.await;
+            }
             let tail = stderr_tail.text();
             let haystack = format!("{tail}\n{}", state.output);
             if crate::error::quota_or_capacity_refusal(&haystack) {
