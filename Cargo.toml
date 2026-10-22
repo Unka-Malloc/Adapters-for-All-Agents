@@ -1,7 +1,7 @@
 [package]
 name = "a4aa"
 description = "Adapter-For-All-Agents — unified agent client adapter: process supervision, stdio/PTY transports, JSON-RPC and ACP lanes, CLI drivers, and a stdio sidecar for hosts in other languages."
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"

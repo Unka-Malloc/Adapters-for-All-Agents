@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.2.2
+## 0.3.0
+
+A breaking update from 0.2.x: the lane rework adds required fields to
+constructible lane/surface types, and `command_code_patch` takes the
+gateway base URL as a parameter. Update dependent crates together.
 
 - Rework the acp/rpc/cli lane surfaces for lane independence, add the
   `max_frame_bytes` session bound, and tighten the sidecar session
@@ -12,10 +16,21 @@
   (`.github/release-train.py`, weekly train / manual / tag-push paths).
 - Mandate environment fidelity: specs declare how values resolve from
   the user's real environment; agents are never launched empty.
-- Surface quota, usage-limit and capacity refusals as retryable
-  `agent_quota_exhausted` so custody can fail over to the next candidate;
-  the refusal classification is shared across lanes from `error.rs`, and
-  unclassified non-zero exits keep the `error` stop reason.
+- Surface quota, usage-limit and capacity refusals as retryable, certain
+  `agent_quota_exhausted` on all lanes so custody can fail over to the
+  next candidate; the refusal classification is shared from `error.rs`,
+  and unclassified failures keep the `error` stop reason.
+- Restrict `InheritAll` over the sidecar wire to launches declaring
+  `--trust-host-env`; untrusted callers are confined to the inert
+  allowlist plus resolved literals, per the Environment Fidelity
+  contract's custody boundary.
+- Bound NDJSON frames at 1 MiB per lane by default with per-spec
+  `max_frame_bytes` opt-in (pi declares 64 MiB); the sidecar↔host link
+  carries its own documented 64 MiB bound.
+- Make `command_code_patch` take the gateway `base_url` explicitly and
+  require `https://`.
+- Fix `StderrTail` truncation to cut on UTF-8 boundaries so a long
+  multibyte stderr stream cannot panic and poison the tail lock.
 
 ## 0.2.1
 
