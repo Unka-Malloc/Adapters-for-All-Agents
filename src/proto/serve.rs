@@ -370,6 +370,25 @@ impl ServeLane {
     ) -> Result<ServeSession, AdapterError> {
         let mut env = crate::env::resolve(&self.command.env, &request.env, &*self.secrets).await?;
         merge_mcp_servers(&mut env, &self.mcp_servers);
+        // A requested permission preset has no per-session API on this
+        // lane; it is honoured only when the configuration the spec itself
+        // injects verifiably denies every mutating tool — the strictest
+        // possible reading of a read-only request. The proof runs on the
+        // fully merged document before the server is even spawned:
+        // anything else fails closed so the caller can fall back to a lane
+        // that can enforce it.
+        if let Some(permission) = request.config.permission.as_deref() {
+            let locked = env
+                .get("OPENCODE_CONFIG_CONTENT")
+                .and_then(|value| serde_json::from_str::<Value>(&value.to_string_lossy()).ok());
+            if permission != "read-only" || !locked.is_some_and(|doc| config_denies_mutation(&doc))
+            {
+                return Err(AdapterError::permanent(
+                    "agent_permission_unsupported",
+                    "session/configuration",
+                ));
+            }
+        }
         let mut command = SupervisedChild::command(&self.command, &env, request.cwd.as_deref());
         let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
         let (stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
@@ -410,24 +429,6 @@ impl ServeLane {
                     .with_detail("server returned no session id"),
             );
         }
-        // A requested permission preset has no per-session API on this
-        // lane; it is honoured only when the configuration the spec itself
-        // injects verifiably denies every mutating tool — the strictest
-        // possible reading of a read-only request. Anything else fails
-        // closed so the caller can fall back to a lane that can enforce it.
-        if let Some(permission) = request.config.permission.as_deref() {
-            let locked = env
-                .get("OPENCODE_CONFIG_CONTENT")
-                .and_then(|value| serde_json::from_str::<Value>(&value.to_string_lossy()).ok());
-            if permission != "read-only" || !locked.is_some_and(|doc| config_denies_mutation(&doc))
-            {
-                let _ = child.terminate().await;
-                return Err(AdapterError::permanent(
-                    "agent_permission_unsupported",
-                    "session/configuration",
-                ));
-            }
-        }
         let session = ServeSession {
             http,
             session_id: session_id.clone(),
@@ -444,8 +445,11 @@ impl ServeLane {
 }
 
 /// The injected server config denies mutation when its permission rules
-/// reject the editing actions and its tool table disables the mutation and
-/// shell surfaces — the audit posture expressed as a verifiable document.
+/// reject the editing actions, its tool table disables the mutation and
+/// shell surfaces, and no MCP server stays enabled — a live MCP entry is a
+/// mutation-capable surface the permission table cannot reach, so `enabled`
+/// absent counts as enabled and fails closed — the audit posture expressed
+/// as a verifiable document.
 fn config_denies_mutation(document: &Value) -> bool {
     let permissions = [
         "edit",
@@ -469,7 +473,12 @@ fn config_denies_mutation(document: &Value) -> bool {
     ]
     .iter()
     .all(|tool| document["tools"][tool].as_bool() == Some(false));
-    permissions && tools
+    let mcp = document["mcp"]["servers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .all(|(_, server)| server["enabled"].as_bool() == Some(false));
+    permissions && tools && mcp
 }
 
 /// One open session on a native server.
@@ -754,6 +763,33 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l == b"server password <redacted>"));
+    }
+
+    #[test]
+    fn read_only_proof_fails_closed_on_live_mcp_servers() {
+        let locked = json!({
+            "permission": {
+                "edit": "deny", "bash": "deny", "webfetch": "deny",
+                "doom_loop": "deny", "external_directory": "deny",
+            },
+            "tools": {
+                "write": false, "edit": false, "patch": false, "bash": false,
+                "webfetch": false, "websearch": false, "task": false,
+                "skill": false, "question": false,
+            },
+        });
+        assert!(config_denies_mutation(&locked));
+        // An enabled MCP entry is a mutation surface the tool table never
+        // reaches — explicit or defaulted, it voids the read-only proof.
+        let mut live = locked.clone();
+        live["mcp"] = json!({"servers": {"audit": {"enabled": true}}});
+        assert!(!config_denies_mutation(&live));
+        let mut defaulted = locked.clone();
+        defaulted["mcp"] = json!({"servers": {"audit": {"type": "local"}}});
+        assert!(!config_denies_mutation(&defaulted));
+        let mut off = locked.clone();
+        off["mcp"] = json!({"servers": {"audit": {"enabled": false}}});
+        assert!(config_denies_mutation(&off));
     }
 
     #[test]

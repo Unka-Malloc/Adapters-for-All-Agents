@@ -414,7 +414,9 @@ fn scope_relative(path: &str) -> bool {
     }
     let parsed = Path::new(path);
     !parsed.is_absolute()
-        && parsed.components().all(|c| matches!(c, Component::Normal(_)))
+        && parsed
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// What [`crate::dialect::adapt`] produces: artifacts to write plus the
@@ -493,7 +495,10 @@ mod scope_tests {
         );
         assert!(plan.artifacts.is_empty());
         assert_eq!(plan.report.len(), 3);
-        assert!(plan.report.iter().all(|e| e.support == Support::Unsupported));
+        assert!(plan
+            .report
+            .iter()
+            .all(|e| e.support == Support::Unsupported));
     }
 
     #[test]
