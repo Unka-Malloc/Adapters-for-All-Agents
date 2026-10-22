@@ -161,136 +161,37 @@ jobs:
           [ -f "$RUNNER_TEMP/version-bump.patch" ] &&
             cp "$RUNNER_TEMP/version-bump.patch" target/package/
 
+      # The release train (default branch) reads this data-only file to
+      # learn the candidate, the version decision and the kind of run; it
+      # lands for every trigger so the gate job can short-circuit cleanly
+      # on rehearsals and unqualified candidates.
+      - name: Record the release inputs
+        if: always()
+        run: |
+          mkdir -p target/release-inputs
+          cat > target/release-inputs/env <<EOF
+          sha=${{ steps.candidate.outputs.sha }}
+          branch=${{ steps.candidate.outputs.branch }}
+          release=${{ steps.version.outputs.release }}
+          kind=$RELEASE_KIND
+          next=${{ steps.version.outputs.next }}
+          needs_set=${{ steps.version.outputs.needs_set }}
+          excludes=${{ steps.version.outputs.excludes }}
+          EOF
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: release-inputs
+          path: Adapter-For-All-Agents/target/release-inputs/
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Hand the release set to the release job
         if: steps.version.outputs.release == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-set-${{ steps.candidate.outputs.sha }}
           path: Adapter-For-All-Agents/target/package/
-          retention-days: 1
+          retention-days: 5
           if-no-files-found: error
-
-  release:
-    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.rehearse) && needs.verify.result == 'success' && needs.verify.outputs.release == 'true' }}
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    permissions:
-      contents: write
-      pull-requests: read
-      id-token: write
-    env:
-      RELEASE_MODE: live
-      RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || github.event_name == 'push' && 'tag' || 'manual' }}
-      SIBLINGS: '[]'
-      CANDIDATE: ${{ needs.verify.outputs.sha }}
-      BRANCH: ${{ needs.verify.outputs.branch }}
-      NEXT: ${{ needs.verify.outputs.next }}
-      NEEDS_SET: ${{ needs.verify.outputs.needs_set }}
-      EXCLUDES: ${{ needs.verify.outputs.excludes }}
-    defaults:
-      run:
-        shell: bash
-        working-directory: Adapter-For-All-Agents
-    steps:
-      # Git refs move inside this job, so the candidate is checked out; no
-      # candidate-controlled code runs here — publishing replays the verified
-      # artifacts produced by the verify job.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          path: Adapter-For-All-Agents
-          ref: ${{ needs.verify.outputs.sha }}
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
-        with:
-          name: release-set-${{ needs.verify.outputs.sha }}
-          path: release-set
-
-      # The version bump was authored under the read-only token; here it is
-      # only a patch the release job replays onto the candidate tree.
-      - name: Commit the release version
-        if: env.RELEASE_KIND != 'tag' && env.NEEDS_SET == 'true'
-        run: |
-          git apply "$GITHUB_WORKSPACE/release-set/version-bump.patch"
-          git -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -qam "release: v$NEXT"
-
-      - name: Promote the candidate to stable
-        if: env.RELEASE_KIND != 'tag'
-        run: git push origin "$CANDIDATE:refs/heads/stable"
-
-      - name: Authenticate to crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      # The whole upload loop lives in this workflow — the only file the OIDC
-      # trust is bound to. Nothing from the candidate checkout executes here:
-      # the .crate payloads are data, tar extracts them, and `cargo publish
-      # --no-verify` packages files without compiling or running build scripts.
-      - name: Publish the verified release set to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          SET: ${{ github.workspace }}/release-set
-        run: |
-          index_path() {
-            case ${#1} in
-              1) echo "1/$1";;
-              2) echo "2/$1";;
-              3) echo "3/${1:0:1}/$1";;
-              *) echo "${1:0:2}/${1:2:2}/$1";;
-            esac
-          }
-          published() { curl -fsSL "https://index.crates.io/$(index_path "$1")" | grep -q "\"vers\":\"$2\""; }
-          while IFS=$'\t' read -r name vers; do
-            [ -n "$name" ] || continue
-            if published "$name" "$vers"; then
-              echo "$name $vers is already on crates.io"
-              continue
-            fi
-            dir="$(mktemp -d)"
-            tar -xzf "$SET/$name-$vers.crate" -C "$dir"
-            package="$(find "$dir" -mindepth 1 -maxdepth 1 -type d)"
-            rm -f "$package/Cargo.toml.orig"
-            # A packaged .cargo/config.toml could name a credential
-            # provider or redirect the registry: strip it and publish with
-            # an isolated CARGO_HOME so no package-controlled Cargo
-            # configuration executes beside the token.
-            rm -rf "$package/.cargo"
-            (cd "$package" && env "CARGO_HOME=$(mktemp -d)" cargo publish --no-verify --registry crates-io)
-            for _ in $(seq 1 60); do
-              published "$name" "$vers" && break
-              sleep 10
-            done
-            published "$name" "$vers" || { echo "::error::crates.io index still lacks $name $vers"; exit 1; }
-          done < "$SET/publish-order.txt"
-
-      - name: Tag the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "$RELEASE_KIND" != tag ]; then
-            git tag "v$NEXT"
-            git push origin "refs/tags/v$NEXT"
-          fi
-          if ! git push origin "HEAD:refs/heads/release"; then
-            # A hand-pushed tag may sit off the release line; the upload
-            # already happened, so only the branch pointer is left behind.
-            [ "$RELEASE_KIND" = tag ] || exit 1
-            echo "::warning::release branch not moved: v$NEXT is not a fast-forward of it"
-          fi
-          gh release view "v$NEXT" >/dev/null 2>&1 ||
-            gh release create "v$NEXT" --verify-tag --generate-notes --title "v$NEXT"
-
-      - name: Merge the release back into nightly
-        if: >-
-          env.RELEASE_KIND != 'tag' && env.BRANCH == 'nightly'
-        run: |
-          git fetch -q origin nightly
-          if git merge-base --is-ancestor HEAD origin/nightly; then exit 0; fi
-          git checkout -q -B nightly origin/nightly
-          git -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            merge --no-ff --no-edit "v$NEXT"
-          git push origin nightly
