@@ -134,6 +134,8 @@ jobs:
         run: |
           scripts/verify.sh
 
+      # The bump is applied here under the read-only token and shipped to the
+      # release job as a patch — the OIDC job only ever runs `git apply`.
       - name: Apply the release version
         if: steps.version.outputs.release == 'true' && steps.version.outputs.needs_set == 'true'
         env:
@@ -142,6 +144,7 @@ jobs:
           cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
           cargo set-version --workspace "$NEXT"
           cargo update --workspace
+          git diff > "$RUNNER_TEMP/version-bump.patch"
 
       # Everything publishable lands in target/package/ plus an ordered list the
       # release job replays; packaging collects files and never runs code.
@@ -155,6 +158,8 @@ jobs:
           cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
           cargo package --workspace --allow-dirty --no-verify "${args[@]}"
           python3 "$RUNNER_TEMP/train.py" order > target/package/publish-order.txt
+          [ -f "$RUNNER_TEMP/version-bump.patch" ] &&
+            cp "$RUNNER_TEMP/version-bump.patch" target/package/
 
       - name: Hand the release set to the release job
         if: steps.version.outputs.release == 'true'
@@ -197,12 +202,17 @@ jobs:
           ref: ${{ needs.verify.outputs.sha }}
           fetch-depth: 0
 
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: release-set-${{ needs.verify.outputs.sha }}
+          path: release-set
+
+      # The version bump was authored under the read-only token; here it is
+      # only a patch the release job replays onto the candidate tree.
       - name: Commit the release version
         if: env.RELEASE_KIND != 'tag' && env.NEEDS_SET == 'true'
         run: |
-          cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
-          cargo set-version --workspace "$NEXT"
-          cargo update --workspace
+          git apply "$GITHUB_WORKSPACE/release-set/version-bump.patch"
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -qam "release: v$NEXT"
@@ -210,11 +220,6 @@ jobs:
       - name: Promote the candidate to stable
         if: env.RELEASE_KIND != 'tag'
         run: git push origin "$CANDIDATE:refs/heads/stable"
-
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
-        with:
-          name: release-set-${{ needs.verify.outputs.sha }}
-          path: release-set
 
       - name: Authenticate to crates.io
         id: auth
@@ -248,7 +253,12 @@ jobs:
             tar -xzf "$SET/$name-$vers.crate" -C "$dir"
             package="$(find "$dir" -mindepth 1 -maxdepth 1 -type d)"
             rm -f "$package/Cargo.toml.orig"
-            (cd "$package" && cargo publish --no-verify --registry crates-io)
+            # A packaged .cargo/config.toml could name a credential
+            # provider or redirect the registry: strip it and publish with
+            # an isolated CARGO_HOME so no package-controlled Cargo
+            # configuration executes beside the token.
+            rm -rf "$package/.cargo"
+            (cd "$package" && env "CARGO_HOME=$(mktemp -d)" cargo publish --no-verify --registry crates-io)
             for _ in $(seq 1 60); do
               published "$name" "$vers" && break
               sleep 10
