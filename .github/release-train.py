@@ -451,62 +451,66 @@ def cmd_version(args: argparse.Namespace) -> int:
     )
     return 0
 
+def publishable_members() -> dict[str, dict]:
+    metadata = json.loads(subprocess.run(
+        ["cargo", "metadata", "--format-version", "1"],
+        capture_output=True, text=True, check=True,
+    ).stdout)
+    members = set(metadata["workspace_members"])
+    packages = {p["name"]: p for p in metadata["packages"] if p["id"] in members}
+    return {n: p for n, p in packages.items()
+            if p["publish"] is None or "crates-io" in p["publish"]}
 
-LAST_VERIFIED = re.compile(r'last_verified:\s*"(20\d{2}-\d{2}-\d{2})"')
+
+def cmd_order(args: argparse.Namespace) -> int:
+    packages = publishable_members()
+    excludes = set((os.environ.get("EXCLUDES") or "").split())
+    targets = sorted(set(packages) - excludes)
+    ordered, pending = [], dict.fromkeys(targets)
+    while pending:
+        ready = [n for n in pending
+                 if not any(d["name"] in pending
+                            for d in packages[n]["dependencies"] if d["kind"] != "dev")]
+        if not ready:
+            raise TrainError(f"dependency cycle among {', '.join(sorted(pending))}")
+        ordered.extend(sorted(ready))
+        for name in ready:
+            del pending[name]
+    for name in ordered:
+        p = packages[name]
+        print(f"{name}\t{p['version']}")
+    return 0
 
 
-def cmd_freshness(args: argparse.Namespace) -> int:
-    """Refuse a candidate whose native-capability tables are stale or missing."""
-    root = pathlib.Path.cwd()
-    adapters = sorted(
-        path
-        for path in (root / "crates").iterdir()
-        if path.is_dir() and path.name.startswith("a4aa-") and path.name != "a4aa-dialects"
-    )
-    if not adapters:
-        raise TrainError("no a4aa-<agent> crates under crates/")
-    today = dt.date.today()
-    window = dt.timedelta(days=args.window_days)
-    rows: list[tuple[str, str]] = []
-    missing: list[str] = []
-    stale: list[str] = []
-    invalid: list[str] = []
-    for crate in adapters:
-        table = crate / "src" / "native.rs"
-        if not table.is_file():
-            missing.append(crate.name)
+def cmd_upload(args: argparse.Namespace) -> int:
+    directory = pathlib.Path(args.dir)
+    order = [line.split("\t") for line in
+             (directory / "publish-order.txt").read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    skipped, uploaded = [], []
+    for name, vers in order:
+        known = {show(v) for v in published_versions(name)}
+        if vers in known:
+            skipped.append(f"{name} {vers}")
             continue
-        text = table.read_text(encoding="utf-8")
-        match = LAST_VERIFIED.search(text)
-        if match is None:
-            invalid.append(f"{crate.name} (no last_verified date)")
-            continue
-        verified = dt.date.fromisoformat(match.group(1))
-        rows.append((crate.name, verified.isoformat()))
-        if verified > today:
-            invalid.append(f"{crate.name} ({verified.isoformat()} is in the future)")
-        elif today - verified > window:
-            stale.append(f"{crate.name} ({verified.isoformat()})")
-    summary = [
-        "### Native-capability freshness",
-        "",
-        f"Window: {args.window_days} days ending {today.isoformat()}.",
-        "",
-        "| Crate | last_verified |",
-        "| --- | --- |",
-        *[f"| `{name}` | {date} |" for name, date in rows],
-    ]
-    report("\n".join(summary))
-    problems = []
-    if missing:
-        problems.append("missing `src/native.rs`: " + ", ".join(missing))
-    if invalid:
-        problems.append("unusable date: " + ", ".join(invalid))
-    if stale:
-        problems.append(f"older than {args.window_days} days: " + ", ".join(stale))
-    if problems:
-        raise TrainError("; ".join(problems))
-    emit(fresh="true", checked=str(len(rows)))
+        crate = directory / f"{name}-{vers}.crate"
+        with tempfile.TemporaryDirectory() as temp:
+            subprocess.run(["tar", "-xzf", crate, "-C", temp], check=True)
+            (package,) = (p for p in pathlib.Path(temp).iterdir() if p.is_dir())
+            (package / "Cargo.toml.orig").unlink(missing_ok=True)
+            subprocess.run(
+                ["cargo", "publish", "--no-verify", "--registry", "crates-io"],
+                cwd=package, check=True,
+            )
+        deadline = time.monotonic() + 600
+        while vers not in {show(v) for v in published_versions(name)}:
+            if time.monotonic() >= deadline:
+                raise TrainError(f"crates.io index still lacks {name} {vers} after the upload")
+            time.sleep(10)
+        uploaded.append(f"{name} {vers}")
+    lines = [f"- uploaded `{entry}`" for entry in uploaded]
+    lines += [f"- `{entry}` was already on crates.io" for entry in skipped]
+    report("### crates.io\n\n" + "\n".join(lines or ["- nothing to upload"]))
     return 0
 
 
@@ -527,9 +531,11 @@ def parser() -> argparse.ArgumentParser:
     version.add_argument("--candidate", required=True)
     version.add_argument("--branch", default="")
     version.set_defaults(run=cmd_version)
-    freshness = commands.add_parser("freshness")
-    freshness.add_argument("--window-days", type=int, default=14)
-    freshness.set_defaults(run=cmd_freshness)
+    order = commands.add_parser("order")
+    order.set_defaults(run=cmd_order)
+    upload = commands.add_parser("upload")
+    upload.add_argument("--dir", required=True)
+    upload.set_defaults(run=cmd_upload)
     return root
 
 

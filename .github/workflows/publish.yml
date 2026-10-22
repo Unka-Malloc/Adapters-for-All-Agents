@@ -18,11 +18,14 @@
 # step stops the run until a person reruns it; a rerun finishes a partly
 # uploaded version instead of skipping past it.
 #
-# Two jobs share the steps. `rehearse` holds a read-only token: it selects,
-# verifies, versions and packages, and never pushes, tags or uploads.
-# `release` additionally moves `stable` to the candidate, publishes to
-# crates.io, tags the release on `release` with a GitHub release, and merges
-# it back into `nightly`.
+# Two jobs split at the trust boundary. `verify` runs on every trigger with a
+# read-only token: it selects, waits on siblings, verifies, versions and
+# packages the candidate, then hands the `.crate` set over as an artifact.
+# `release` runs only when `verify` qualified a release; it holds the OIDC
+# token and replays those verified artifacts to crates.io — no
+# candidate-controlled code executes under the publishing identity — then
+# moves `stable`, tags the release on `release` with a GitHub release, and
+# merges it back into `nightly`.
 #
 # Credentials: crates.io Trusted Publishing; no stored secret.
 name: publish
@@ -59,168 +62,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  rehearse:
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearse) }}
+  verify:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      next: ${{ steps.version.outputs.next }}
+      needs_set: ${{ steps.version.outputs.needs_set }}
+      excludes: ${{ steps.version.outputs.excludes }}
+      sha: ${{ steps.candidate.outputs.sha }}
+      branch: ${{ steps.candidate.outputs.branch }}
     env:
       RELEASE_MODE: dry-run
-      RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || github.event_name == 'push' && 'tag' || 'manual' }}
-      INPUT_VERSION: ${{ inputs.version }}
-      INPUT_LEVEL: ${{ inputs.level }}
-      SIBLINGS: '[]'
-    defaults:
-      run:
-        shell: bash
-        working-directory: Adapter-For-All-Agents
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          path: Adapter-For-All-Agents
-          fetch-depth: 0
-
-      # Copied before the candidate checkout replaces the working tree, so the
-      # helper always matches this workflow.
-      - name: Stage the train helper
-        run: cp .github/release-train.py "$RUNNER_TEMP/train.py"
-
-      - name: Select the candidate
-        id: candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OVERRIDE: ${{ inputs.candidate }}
-        run: |
-          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
-          python3 "$RUNNER_TEMP/train.py" candidate --weekday=fri --time=23:59 \
-            --utc-offset=+08:00 --default-branch="$default_branch" --override="$OVERRIDE"
-
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install the pinned toolchain
-        run: |
-          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
-            rustup toolchain install
-          fi
-
-      - name: Wait for cross-repository dependencies
-        id: deps
-        run: python3 "$RUNNER_TEMP/train.py" deps --wait-minutes=0
-
-      - name: Compute the release version
-        id: version
-        if: steps.deps.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CANDIDATE: ${{ steps.candidate.outputs.sha }}
-          BRANCH: ${{ steps.candidate.outputs.branch }}
-        run: python3 "$RUNNER_TEMP/train.py" version --candidate="$CANDIDATE" --branch="$BRANCH"
-
-      - name: Verify
-        if: steps.version.outputs.release == 'true'
-        run: |
-          scripts/verify.sh
-
-      - name: Native-capability freshness
-        if: steps.version.outputs.release == 'true'
-        run: python3 "$RUNNER_TEMP/train.py" freshness --window-days=14
-
-      - name: Apply the release version
-        if: steps.version.outputs.release == 'true' && steps.version.outputs.needs_set == 'true'
-        env:
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
-          cargo set-version --workspace "$NEXT"
-          cargo update --workspace
-
-      - name: Package
-        if: steps.version.outputs.release == 'true'
-        env:
-          EXCLUDES: ${{ steps.version.outputs.excludes }}
-        run: |
-          args=()
-          for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
-          cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
-
-      - name: Promote the candidate to stable
-        if: >-
-          env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-          && env.RELEASE_KIND != 'tag'
-        env:
-          CANDIDATE: ${{ steps.candidate.outputs.sha }}
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          git push origin "$CANDIDATE:refs/heads/stable"
-          if ! git diff --quiet; then
-            git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -qam "release: v$NEXT"
-          fi
-
-      - name: Authenticate to crates.io
-        id: auth
-        if: env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Publish to crates.io
-        if: env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          EXCLUDES: ${{ steps.version.outputs.excludes }}
-        run: |
-          args=()
-          for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
-          cargo publish --workspace "${args[@]}"
-
-      - name: Tag the release
-        if: env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          if [ "$RELEASE_KIND" != tag ]; then
-            git tag "v$NEXT"
-            git push origin "refs/tags/v$NEXT"
-          fi
-          if ! git push origin "HEAD:refs/heads/release"; then
-            # A hand-pushed tag may sit off the release line; the upload
-            # already happened, so only the branch pointer is left behind.
-            [ "$RELEASE_KIND" = tag ] || exit 1
-            echo "::warning::release branch not moved: v$NEXT is not a fast-forward of it"
-          fi
-          gh release view "v$NEXT" >/dev/null 2>&1 ||
-            gh release create "v$NEXT" --verify-tag --generate-notes --title "v$NEXT"
-
-      - name: Merge the release back into nightly
-        if: >-
-          env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-          && env.RELEASE_KIND != 'tag' && steps.candidate.outputs.branch == 'nightly'
-        env:
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          git fetch -q origin nightly
-          if git merge-base --is-ancestor HEAD origin/nightly; then exit 0; fi
-          git checkout -q -B nightly origin/nightly
-          git -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            merge --no-ff --no-edit "v$NEXT"
-          git push origin nightly
-
-  release:
-    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.rehearse) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    permissions:
-      contents: write
-      pull-requests: read
-      id-token: write
-    env:
-      RELEASE_MODE: live
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || github.event_name == 'push' && 'tag' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_LEVEL: ${{ inputs.level }}
@@ -278,10 +134,6 @@ jobs:
         run: |
           scripts/verify.sh
 
-      - name: Native-capability freshness
-        if: steps.version.outputs.release == 'true'
-        run: python3 "$RUNNER_TEMP/train.py" freshness --window-days=14
-
       - name: Apply the release version
         if: steps.version.outputs.release == 'true' && steps.version.outputs.needs_set == 'true'
         env:
@@ -291,6 +143,8 @@ jobs:
           cargo set-version --workspace "$NEXT"
           cargo update --workspace
 
+      # Everything publishable lands in target/package/ plus an ordered list the
+      # release job replays; packaging collects files and never runs code.
       - name: Package
         if: steps.version.outputs.release == 'true'
         env:
@@ -299,42 +153,84 @@ jobs:
           args=()
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
           cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
+          cargo package --workspace --allow-dirty --no-verify "${args[@]}"
+          python3 "$RUNNER_TEMP/train.py" order > target/package/publish-order.txt
+
+      - name: Hand the release set to the release job
+        if: steps.version.outputs.release == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-set-${{ steps.candidate.outputs.sha }}
+          path: Adapter-For-All-Agents/target/package/
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.rehearse) && needs.verify.result == 'success' && needs.verify.outputs.release == 'true' }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    env:
+      RELEASE_MODE: live
+      RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || github.event_name == 'push' && 'tag' || 'manual' }}
+      SIBLINGS: '[]'
+      CANDIDATE: ${{ needs.verify.outputs.sha }}
+      BRANCH: ${{ needs.verify.outputs.branch }}
+      NEXT: ${{ needs.verify.outputs.next }}
+      NEEDS_SET: ${{ needs.verify.outputs.needs_set }}
+      EXCLUDES: ${{ needs.verify.outputs.excludes }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: Adapter-For-All-Agents
+    steps:
+      # Git refs move inside this job, so the candidate is checked out; no
+      # candidate-controlled code runs here — publishing replays the verified
+      # artifacts produced by the verify job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: Adapter-For-All-Agents
+          ref: ${{ needs.verify.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Stage the train helper
+        run: cp .github/release-train.py "$RUNNER_TEMP/train.py"
+
+      - name: Commit the release version
+        if: env.RELEASE_KIND != 'tag' && env.NEEDS_SET == 'true'
+        run: |
+          cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
+          cargo set-version --workspace "$NEXT"
+          cargo update --workspace
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qam "release: v$NEXT"
 
       - name: Promote the candidate to stable
-        if: >-
-          env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-          && env.RELEASE_KIND != 'tag'
-        env:
-          CANDIDATE: ${{ steps.candidate.outputs.sha }}
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          git push origin "$CANDIDATE:refs/heads/stable"
-          if ! git diff --quiet; then
-            git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -qam "release: v$NEXT"
-          fi
+        if: env.RELEASE_KIND != 'tag'
+        run: git push origin "$CANDIDATE:refs/heads/stable"
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: release-set-${{ needs.verify.outputs.sha }}
+          path: release-set
 
       - name: Authenticate to crates.io
         id: auth
-        if: env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
-      - name: Publish to crates.io
-        if: env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
+      - name: Publish the verified release set to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          EXCLUDES: ${{ steps.version.outputs.excludes }}
-        run: |
-          args=()
-          for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
-          cargo publish --workspace "${args[@]}"
+        run: python3 "$RUNNER_TEMP/train.py" upload --dir "$GITHUB_WORKSPACE/release-set"
 
       - name: Tag the release
-        if: env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          NEXT: ${{ steps.version.outputs.next }}
         run: |
           if [ "$RELEASE_KIND" != tag ]; then
             git tag "v$NEXT"
@@ -351,10 +247,7 @@ jobs:
 
       - name: Merge the release back into nightly
         if: >-
-          env.RELEASE_MODE == 'live' && steps.version.outputs.release == 'true'
-          && env.RELEASE_KIND != 'tag' && steps.candidate.outputs.branch == 'nightly'
-        env:
-          NEXT: ${{ steps.version.outputs.next }}
+          env.RELEASE_KIND != 'tag' && env.BRANCH == 'nightly'
         run: |
           git fetch -q origin nightly
           if git merge-base --is-ancestor HEAD origin/nightly; then exit 0; fi
