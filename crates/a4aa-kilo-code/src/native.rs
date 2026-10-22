@@ -2,8 +2,8 @@
 //!
 //! `kilo acp` is a native OpenCode-fork subcommand, not an external plugin.
 //! The `.config/kilo/plugin` hook artifact is the dialect's native plugin
-//! directory. `kilo serve` HTTP+SSE is a first-party serve surface LicoUp
-//! uses as primary and A4AA has not adapted yet — Serve should become
+//! directory. `kilo serve` HTTP+SSE is a first-party serve surface
+//! that A4AA has not adapted yet — Serve should become
 //! primary, ACP the ordered alternate.
 
 use a4aa::native::{
@@ -17,7 +17,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     surfaces: InteractionSurfaces {
         serve: cell(
             NativeStatus::Unadapted,
-            "kilo serve HTTP+SSE is native; LicoUp primary; a4aa still uses acp",
+            "kilo serve HTTP+SSE is native but unadapted; a4aa still uses acp",
         ),
         sdk: cell(
             NativeStatus::NotOffered,

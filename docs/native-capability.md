@@ -129,8 +129,8 @@ installed binaries named in those tables. Copilot has no crate here.
 | kiro | acp (`kiro-cli acp` → bundled `kiro-cli-chat`) | acp, cli (stream-json), pty | `kiro-cli-chat serve` WebSocket (unadapted); rpc cell also unadapted for that transport | none | keep acp until serve is adapted; evidence: `kiro-cli-chat serve` is a first-party WebSocket and is not on this card |
 | command-code | cli (`command-code --print --output-format json`) | cli, pty | no ACP/SDK/serve | none | keep |
 | factory | acp (`droid exec --output-format acp`) | serve (daemon WS), acp, rpc (stream-jsonrpc + daemon), cli, pty | none | none; `droid exec --output-format acp` is first-party, not a plugin | keep; daemon WS and stream-jsonrpc are declared alternates |
-| kilo-code | acp (`kilo acp`, OpenCode-fork stock) | acp, pty | `kilo serve` HTTP+SSE (unadapted; LicoUp already uses it as primary) | `.config/kilo/plugin` is the dialect's native plugin directory, not an external ACP adapter | promote serve to card primary, keep acp as the ordered alternate |
+| kilo-code | acp (`kilo acp`, OpenCode-fork stock) | acp, pty | `kilo serve` HTTP+SSE (native but unadapted) | `.config/kilo/plugin` is the dialect's native plugin directory, not an external ACP adapter | promote serve to card primary, keep acp as the ordered alternate |
 
-kilo-code serve-vs-acp: `kilo acp` is a native OpenCode-fork subcommand (not a plugin). `kilo serve` HTTP+SSE is also native and is already LicoUp's primary; A4AA still cards ACP. Serve should become primary.
+kilo-code serve-vs-acp: `kilo acp` is a native OpenCode-fork subcommand (not a plugin). `kilo serve` HTTP+SSE is also native; A4AA still cards ACP. Serve should become primary.
 
 kiro serve: `kiro-cli acp` delegates to bundled `kiro-cli-chat` ACP (native). `kiro-cli-chat serve` WebSocket is a separate first-party surface, recorded as unadapted serve (and unadapted rpc transport) — not yet a card lane.
