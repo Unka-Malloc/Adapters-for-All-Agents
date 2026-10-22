@@ -27,7 +27,7 @@ LEVELS = ("patch", "minor", "major")
 SAFE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 DEP_KEYS = ("dependencies", "dev-dependencies", "build-dependencies")
-POLL_SECONDS = 300
+POLL_SECONDS = int(os.environ.get("TRAIN_POLL_SECONDS", "300"))
 INDEX = "https://index.crates.io"
 
 
