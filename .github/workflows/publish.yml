@@ -42,7 +42,7 @@ jobs:
     permissions:
       actions: read
     outputs:
-      run_id: ${{ env.RUN_ID }}
+      run_id: ${{ github.event.workflow_run.id || inputs.run_id }}
       mode: ${{ steps.load.outputs.mode }}
       sha: ${{ steps.load.outputs.sha }}
       branch: ${{ steps.load.outputs.branch }}
@@ -66,13 +66,13 @@ jobs:
       - id: load
         run: cat release-inputs/env >> "$GITHUB_OUTPUT"
 
-      # A run is bound only when all three hold: the run executed this
-      # repository's real verify.yml file (a same-named workflow file
-      # elsewhere does not qualify), it succeeded, and its head sha matches
-      # the candidate sha the artifact declares. The source ref is bound
-      # separately below: a `verify` workflow modified on a side branch
-      # therefore cannot forge a release decision, whether it arrives by
-      # workflow_run or by a dispatched run_id.
+      # A run is bound only when it executed this repository's real
+      # verify.yml file (a same-named workflow file elsewhere does not
+      # qualify) and it succeeded. The source ref and the declared
+      # candidate are bound separately below: a `verify` workflow
+      # modified on a side branch therefore cannot forge a release
+      # decision, whether it arrives by workflow_run or by a dispatched
+      # run_id.
       - name: Bind the run to the verify train
         id: bind
         env:
@@ -87,47 +87,39 @@ jobs:
               f\"not verify.yml: {run['path']}\"
           assert run['conclusion'] == 'success', \
               f\"run did not succeed: {run['conclusion']}\"
-          assert run['head_sha'] == os.environ['DECLARED_SHA'], \
-              'artifact sha does not match the run head'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('ref=' + (run.get('head_branch') or '') + '\n')
+              out.write('head_sha=' + run['head_sha'] + '\n')
           "
 
-      # A non-default ref earns trust only as a real release tag: `v*`,
-      # resolvable under refs/tags/, peeled to the verified sha, and not
-      # shadowed by a heads/ ref of the same name — a `v*` branch is not a
-      # release tag and never produced publishable artifacts.
-      - name: Bind the source ref to a protected ref
+      # Release inputs come only from verify runs on the default branch:
+      # any other ref — a release tag included — runs an untrusted
+      # revision of the verify workflow, and a pushed tag is only as
+      # trustworthy as whoever pushed it. The declared candidate must be
+      # the run's head or an ancestor of it (releasing an older
+      # default-branch commit), never a diverged or foreign sha.
+      - name: Bind the source ref to the default branch
         env:
           GH_TOKEN: ${{ github.token }}
           DECLARED_SHA: ${{ steps.load.outputs.sha }}
           RUN_REF: ${{ steps.bind.outputs.ref }}
+          RUN_SHA: ${{ steps.bind.outputs.head_sha }}
         run: |
           default='${{ github.event.repository.default_branch }}'
-          if [ "$RUN_REF" = "$default" ]; then
-            echo "source ref is the default branch"
-            exit 0
-          fi
-          case "$RUN_REF" in
-            v*) ;;
-            *) echo "untrusted source ref: ${RUN_REF:-<none>}"; exit 1 ;;
-          esac
-          if gh api "repos/$GITHUB_REPOSITORY/git/refs/heads/$RUN_REF" >/dev/null 2>&1; then
-            echo "ref '$RUN_REF' is a branch, not a release tag"; exit 1
-          fi
-          tag=$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$RUN_REF" \
-            --jq '.object | {sha,type}' 2>/dev/null) || {
-            echo "ref '$RUN_REF' resolves to no release tag"; exit 1; }
-          sha=$(printf '%s' "$tag" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
-          type=$(printf '%s' "$tag" | python3 -c 'import json,sys; print(json.load(sys.stdin)["type"])')
-          if [ "$type" = "tag" ]; then
-            sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '.object.sha')
-          fi
-          if [ "$sha" != "$DECLARED_SHA" ]; then
-            echo "tag '$RUN_REF' points at $sha, not the verified sha $DECLARED_SHA"
+          if [ "$RUN_REF" != "$default" ]; then
+            echo "untrusted source ref: ${RUN_REF:-<none>} (expected $default)"
             exit 1
           fi
-          echo "source ref is release tag $RUN_REF"
+          status=$(gh api \
+            "repos/$GITHUB_REPOSITORY/compare/$DECLARED_SHA...$RUN_SHA" \
+            --jq '.status' 2>/dev/null) || {
+            echo "candidate $DECLARED_SHA is not in this repository"; exit 1; }
+          case "$status" in
+            identical|ahead) ;;
+            *) echo "candidate $DECLARED_SHA is '$status' of run head $RUN_SHA"
+               exit 1 ;;
+          esac
+          echo "source is $default; candidate is $status of the run head"
 
   release:
     if: >-
