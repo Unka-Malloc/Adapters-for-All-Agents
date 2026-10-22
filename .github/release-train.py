@@ -227,13 +227,7 @@ def cmd_candidate(args: argparse.Namespace) -> int:
         raise TrainError("a live train needs the `nightly` branch")
     branch = "nightly" if nightly else args.default_branch
     cutoff = ""
-    if kind == "tag":
-        tag = os.environ.get("GITHUB_REF_NAME", "")
-        if not parse_version(tag[1:]) or not tag.startswith("v"):
-            raise TrainError(f"tag {tag!r} is not v<major>.<minor>.<patch>")
-        sha = git("rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}")
-        branch, source = "", f"tag {tag}"
-    elif args.override:
+    if args.override:
         if not SAFE_REF.fullmatch(args.override):
             raise TrainError(f"refusing candidate {args.override!r}")
         remote = f"refs/remotes/origin/{args.override}"
