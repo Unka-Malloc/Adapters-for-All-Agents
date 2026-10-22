@@ -45,6 +45,8 @@ pub enum CommandCodeMountError {
     MissingCredentialRef,
     /// A hand-declared pi-ai route is unserviceable without models.
     EmptyModels,
+    /// The gateway endpoint must be an `https://` URL.
+    InsecureBaseUrl,
 }
 
 impl std::fmt::Display for CommandCodeMountError {
@@ -58,6 +60,7 @@ impl std::fmt::Display for CommandCodeMountError {
                 formatter,
                 "command-code route requires a non-empty models list"
             ),
+            Self::InsecureBaseUrl => write!(formatter, "command-code base URL must use https"),
         }
     }
 }
@@ -106,10 +109,14 @@ pub fn has_command_code_key(document: &str) -> bool {
 /// at request time.
 pub fn command_code_patch(
     credentials_yaml: &str,
+    base_url: &str,
     models: &[CommandCodeModel],
 ) -> Result<String, CommandCodeMountError> {
     if !has_command_code_key(credentials_yaml) {
         return Err(CommandCodeMountError::MissingCredentialRef);
+    }
+    if !base_url.starts_with("https://") {
+        return Err(CommandCodeMountError::InsecureBaseUrl);
     }
     if models.is_empty() {
         return Err(CommandCodeMountError::EmptyModels);
@@ -124,14 +131,15 @@ pub fn command_code_patch(
         displayName: Command Code
         apiKeyEnv: {COMMAND_CODE_API_KEY_ENV}
         api: openai-completions
-        baseURL: {COMMAND_CODE_BASE_URL}
+        baseURL: {base_url}
         compat:
           supportsStore: false
           supportsDeveloperRole: false
           supportsStrictMode: false
           maxTokensField: max_completion_tokens
         models:
-"
+",
+        base_url = yaml_plain(base_url)
     );
     for model in models {
         body.push_str(&format!(
@@ -296,14 +304,18 @@ mod tests {
             name: "GPT-5.4".into(),
         }];
         assert_eq!(
-            command_code_patch(CREDENTIALS_WITHOUT, &models),
+            command_code_patch(CREDENTIALS_WITHOUT, COMMAND_CODE_BASE_URL, &models),
             Err(CommandCodeMountError::MissingCredentialRef)
         );
         assert_eq!(
-            command_code_patch(CREDENTIALS, &[]),
+            command_code_patch(CREDENTIALS, COMMAND_CODE_BASE_URL, &[]),
             Err(CommandCodeMountError::EmptyModels)
         );
-        let patch = command_code_patch(CREDENTIALS, &models).expect("mount");
+        assert_eq!(
+            command_code_patch(CREDENTIALS, "http://gateway.internal/v1", &models),
+            Err(CommandCodeMountError::InsecureBaseUrl)
+        );
+        let patch = command_code_patch(CREDENTIALS, COMMAND_CODE_BASE_URL, &models).expect("mount");
         assert!(patch.contains(PI_AI_PLUGIN));
         assert!(patch.contains("apiKeyEnv: COMMAND_CODE_API_KEY"));
         assert!(patch.contains("command-code:"));
