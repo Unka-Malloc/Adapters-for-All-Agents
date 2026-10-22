@@ -54,6 +54,13 @@ maintained — a change to `a4aa-codex`'s descriptor never touches
 crates it needs — or `a4aa-dialects` for runtime name lookup; no mandatory
 registry stands between a host and a single agent adapter.
 
+Each adapter crate also publishes a dated native-capability table
+(`NATIVE` in `crates/a4aa-<agent>/src/native.rs`) covering interaction
+surfaces, MCP registration, config locations, and AwP primitives.
+[`docs/native-capability.md`](docs/native-capability.md) is the aggregated
+master table. `last_verified` is a release gate
+(`python3 .github/release-train.py freshness`).
+
 ## Invariants
 
 - **Zero-assumption output** — natural language is a valid turn result; no

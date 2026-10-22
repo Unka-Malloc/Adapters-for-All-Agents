@@ -2,7 +2,7 @@
 //! exercising the production descriptor crates. No network, no real agents.
 
 use a4aa::{
-    Adapter, AgentEvent, AgentSpec, CommandSpec, EnvPolicy, LaneSpec, SessionConfig,
+    Adapter, AgentEvent, AgentSpec, CommandSpec, EnvPolicy, LaneSession, LaneSpec, SessionConfig,
     SessionRequest, TurnRequest,
 };
 use std::time::Duration;
@@ -249,30 +249,20 @@ done
     spec
 }
 
-/// DeepSeek-Harness-shaped rpc surface: `initialize` handshake, a
-/// process-scoped wire session id (no session call), `session/prompt`
-/// acknowledged by `messageId`, `session.event` deltas, and the turn ends
-/// when `session.status` reports `idle`.
+/// DeepSeek-Harness ACP surface: the production `dsh acp` lane with the
+/// crate's deterministic `fixture-agent` in place of the `dsh` binary.
+/// `session/new` advertises `configOptions`; a turn streams
+/// `session/update` chunks and ends at `end_turn`. Resume uses
+/// `session/resume` (`prefer_load` is false — DSH does not implement
+/// `session/load`).
 fn dsh_like_spec() -> AgentSpec {
-    let script = r#"
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"deepseek-harness-sdk-runtime"}}}\n' "$id" ;;
-    *'"method":"session/prompt"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"m-1"}}\n' "$id"
-      printf '{"jsonrpc":"2.0","method":"session.event","params":{"event":{"data":{"message":{"content":"harness-"}}}}}\n'
-      printf '{"jsonrpc":"2.0","method":"session.event","params":{"event":{"data":{"message":{"content":"done"}}}}}\n'
-      printf '{"jsonrpc":"2.0","method":"session.status","params":{"status":"busy"}}\n'
-      printf '{"jsonrpc":"2.0","method":"session.status","params":{"status":"idle"}}\n' ;;
-    *'"method":"shutdown"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-  esac
-done
-"#;
     let mut spec = a4aa_dsh::spec();
-    spec.command = sh(script);
+    spec.command = CommandSpec {
+        program: env!("CARGO_BIN_EXE_a4aa").into(),
+        args: vec!["fixture-agent".into()],
+        cwd: None,
+        env: EnvPolicy::default(),
+    };
     spec
 }
 
@@ -294,13 +284,13 @@ printf '{"type":"init","session_id":"%s"}\n' "$sid"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]},"session_id":"%s"}\n' "$sid"
 printf '{"type":"result","result":"answer for %s","session_id":"%s"}\n' "$prev" "$sid"
 "#;
-    // The card's declared CLI alternate carries the stream-json template
+    // The card's declared primary carries the stream-json template
     // this fixture speaks.
     let mut spec = a4aa_cursor::card()
         .specs()
         .into_iter()
-        .nth(1)
-        .expect("cursor declares the cli alternate");
+        .next()
+        .expect("cursor declares the cli lane");
     spec.command = CommandSpec {
         program: "sh".into(),
         args: vec![
@@ -337,11 +327,7 @@ printf '{"event":"step_update","step_update":{"step_type":"agent_response","stat
 response="model=$model;effort=$effort;mode=$mode;resume=$resume"
 printf '{"event":"result","result":{"conversation_id":"%s","status":"SUCCESS","response":"%s","usage":{"input_tokens":10,"cache_read_tokens":2,"output_tokens":5,"total_tokens":17}}}\n' "$sid" "$response"
 "#;
-    let mut spec = a4aa_antigravity::card()
-        .specs()
-        .into_iter()
-        .nth(1)
-        .expect("antigravity declares the cli alternate");
+    let mut spec = a4aa_antigravity::spec();
     spec.command = sh(script);
     spec
 }
@@ -371,42 +357,50 @@ async fn pi_flat_envelope_turn() {
 #[tokio::test]
 async fn pi_resume_switches_session_path() {
     let mut request = session();
-    request.resume = Some("/home/u/.pi/agent/sessions/s-1.jsonl".into());
+    // Pi resumes by session-file path, not by opaque id. Keep the value
+    // synthetic so the contract test does not look like a host path.
+    request.resume = Some("session-store/s-1.jsonl".into());
     let (session, _events) = open(pi_like_spec(), request).await;
-    assert_eq!(session.session_id(), "/home/u/.pi/agent/sessions/s-1.jsonl");
+    assert_eq!(session.session_id(), "session-store/s-1.jsonl");
     session.close().await.expect("close");
 }
 
 #[tokio::test]
-async fn dsh_process_scoped_id_and_idle_completion() {
+async fn dsh_acp_session_new_prompt_and_catalog() {
     let (session, mut events) = open(dsh_like_spec(), session()).await;
-    // Process-scope minted a fresh wire id — never the bare durable name.
-    let wire = session.session_id().to_owned();
-    assert!(wire.starts_with("a4aa-"), "unexpected wire id: {wire}");
+    assert_eq!(session.session_id(), "fixture-session-1");
+    let LaneSession::Acp(acp) = session.lane() else {
+        panic!("dsh drives the acp lane")
+    };
+    let providers = a4aa_dsh::providers_from_config_options(&acp.session_state()["configOptions"]);
+    assert!(
+        providers.iter().any(|provider| !provider.models.is_empty()),
+        "session/new must advertise models via configOptions"
+    );
 
     let outcome = session.prompt(turn("go")).await.expect("prompt");
-    // `busy` did not end the turn; `idle` did, and it is the stop reason.
-    assert_eq!(outcome.stop_reason, "idle");
-    assert_eq!(outcome.text, "harness-done");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    // The ACP lane keeps TurnOutcome.text empty and delivers streamed
+    // text as AgentEvent::MessageChunk so consumers do not double the body.
+    assert_eq!(outcome.text, "");
     let mut chunks = String::new();
     while let Ok(event) = events.try_recv() {
         if let AgentEvent::MessageChunk { text } = event {
             chunks.push_str(&text);
         }
     }
-    assert_eq!(chunks, "harness-done");
+    assert_eq!(chunks, "echo: go");
     session.close().await.expect("close");
 }
 
 #[tokio::test]
-async fn dsh_resume_seeds_the_wire_id() {
+async fn dsh_acp_resume_reuses_the_binding() {
     let mut request = session();
     request.resume = Some("durable-42".into());
     let (session, _events) = open(dsh_like_spec(), request).await;
-    let wire = session.session_id().to_owned();
-    // The durable binding seeds but never IS the wire id.
-    assert!(wire.starts_with("durable-42-"), "unexpected: {wire}");
-    assert_ne!(wire, "durable-42");
+    // DSH ACP `session/resume` keeps the host binding; it does not mint a
+    // process-scoped wire id.
+    assert_eq!(session.session_id(), "durable-42");
     session.close().await.expect("close");
 }
 
@@ -504,11 +498,7 @@ async fn antigravity_cancel_terminates_the_streaming_process() {
 printf '{"event":"init","conversation_id":"agy-cancel"}\n'
 while :; do sleep 1; done
 "#;
-    let mut spec = a4aa_antigravity::card()
-        .specs()
-        .into_iter()
-        .nth(1)
-        .expect("antigravity declares the cli alternate");
+    let mut spec = a4aa_antigravity::spec();
     spec.command = sh(script);
     let (session, mut events) = open(spec, session()).await;
     let session = std::sync::Arc::new(session);
@@ -539,11 +529,7 @@ printf '{"event":"init","conversation_id":"agy-error"}\n'
 printf '{"event":"result","result":{"conversation_id":"agy-error","status":"ERROR","response":"","error":"fixture failure"}}\n'
 exit 1
 "#;
-    let mut spec = a4aa_antigravity::card()
-        .specs()
-        .into_iter()
-        .nth(1)
-        .expect("antigravity declares the cli alternate");
+    let mut spec = a4aa_antigravity::spec();
     spec.command = sh(script);
     let (session, _events) = open(spec, session()).await;
     let outcome = session.prompt(turn("fail")).await.expect("error outcome");
@@ -575,6 +561,48 @@ fn registry_exposes_all_five_second_batch_cards() {
             ..
         }
     ));
+    let dsh = a4aa_dialects::card("dsh").unwrap();
+    let spec = dsh.spec();
+    assert_eq!(spec.command.program, "dsh");
+    assert_eq!(spec.command.args, vec!["acp".to_string()]);
+    assert!(matches!(
+        spec.lane,
+        LaneSpec::Acp {
+            prefer_load: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        dsh.features.models,
+        a4aa::ModelCatalog::RpcMethod("session/new")
+    );
+    let dsh_specs = dsh.specs();
+    assert_eq!(dsh_specs.len(), 2);
+    assert_eq!(
+        dsh_specs[1].command.args,
+        vec!["--profile".to_string(), "sdk".to_string()]
+    );
+    assert!(matches!(dsh_specs[1].lane, LaneSpec::Rpc(_)));
+
+    let pi = a4aa_dialects::card("pi").unwrap();
+    let pi_specs = pi.specs();
+    assert_eq!(pi_specs.len(), 2);
+    assert!(matches!(pi_specs[0].lane, LaneSpec::Rpc(_)));
+    let LaneSpec::Cli(cli) = &pi_specs[1].lane else {
+        panic!("pi's alternate is the print cli")
+    };
+    assert!(cli.args.iter().any(|arg| arg == "--print"));
+    assert!(cli.args.iter().any(|arg| arg == "--thinking"));
+
+    let antigravity = a4aa_dialects::card("antigravity").unwrap();
+    let LaneSpec::Cli(cli) = antigravity.spec().lane else {
+        panic!("antigravity drives the cli lane")
+    };
+    assert!(cli.args.iter().any(|arg| arg == "--effort"));
+    assert_eq!(
+        cli.resume_args,
+        vec!["--conversation".to_string(), "{sessionId}".to_string()]
+    );
 }
 
 /// Factory-shaped stream-jsonrpc surface: factory-tagged envelopes,
@@ -694,8 +722,10 @@ async fn factory_daemon_websocket_lane() {
         socket.write_all(&out).await.unwrap();
     }
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let endpoint = listener.local_addr().unwrap();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     let seen_clone = seen.clone();
     let server = tokio::spawn(async move {
@@ -775,7 +805,7 @@ async fn factory_daemon_websocket_lane() {
         }
     });
 
-    let script = format!("echo '  WebSocket endpoint: ws://127.0.0.1:{port}'; exec sleep 60");
+    let script = format!("echo '  WebSocket endpoint: ws://{endpoint}'; exec sleep 60");
     let mut spec = a4aa_factory::card()
         .specs()
         .into_iter()

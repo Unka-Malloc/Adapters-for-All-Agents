@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, DetectSurface,
     FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind,
@@ -21,6 +23,8 @@ use a4aa::dialect::{
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `kimicode` dialect: kimicode rules file plus shared SKILL.md skills.
 pub const DIALECT: Dialect = Dialect {
@@ -95,6 +99,8 @@ pub const AGENT: AgentCard = AgentCard {
             result_path: None,
             usage_path: None,
             spawn_args: &[],
+
+            effort_model_suffixes: &[],
         }),
         binary: None,
     }],

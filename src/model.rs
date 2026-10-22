@@ -146,6 +146,16 @@ pub struct CliLaneSpec {
     /// means the lane cannot apply a requested permission preset.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permission_modes: Vec<String>,
+    /// Agents whose model ids carry reasoning effort as a `-<level>`
+    /// suffix (Cursor's `cursor-grok-4.6-high`, `gpt-5.4-xhigh` …): a
+    /// requested `effort` rewrites the tier segment of the effective
+    /// model value instead of travelling as its own argument, so the
+    /// `{model}` placeholder is the effort's carrier. Lists every level
+    /// that suffix vocabulary uses; empty means the lane has no such
+    /// encoding and `effort` needs its own placeholder. A trailing
+    /// `-fast` speed marker survives the rewrite.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_model_suffixes: Vec<String>,
 }
 
 /// One configured JSON-RPC call: method plus a params template. String
@@ -240,6 +250,21 @@ pub struct RpcLaneSpec {
     /// loopback port the lane picks.
     #[serde(default)]
     pub transport: RpcTransport,
+    /// Largest inbound frame the lane accepts. `None` uses the shared
+    /// default; a declared value is clamped so it can only widen, never
+    /// weaken, the bound. Agents whose terminal events embed payloads as
+    /// large as a full transcript (pi's `agent_end`) must declare room
+    /// for their real frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_bytes: Option<usize>,
+    /// Dotted path inside a notification's params to a token-usage object
+    /// (for example `message.usage` on pi's `turn_end`). Captured at
+    /// ingress so usage survives output-budget truncation; the last
+    /// observation lands on `TurnOutcome::usage`. Absent → the
+    /// conventional `params.usage` / `params.message.usage` carriers are
+    /// scanned instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_path: Option<String>,
 }
 
 /// Where an rpc lane's bytes flow.
@@ -501,7 +526,11 @@ impl LaneSpec {
                     })
                 };
                 let model = consumes(&["model", "modelProvider", "modelId"]);
-                let effort = consumes(&["effort"]);
+                // Effort folds into the model value wherever the lane
+                // encodes tiers inside the model id — it needs no
+                // placeholder of its own then.
+                let effort =
+                    consumes(&["effort"]) || (model && !spec.effort_model_suffixes.is_empty());
                 match phase {
                     SelectorPhase::Session => SelectorSupportSet {
                         model: selector_support(model),
@@ -712,6 +741,54 @@ pub struct TokenUsage {
     pub thought: Option<u64>,
     #[serde(default)]
     pub total: Option<u64>,
+}
+
+/// Extract token counters from a usage object. Field aliases cover the
+/// vendor spellings (`input_tokens`, `promptTokens`, `cache_read…`,
+/// pi's bare `input`/`cacheRead`); an absent counter stays absent —
+/// the adapter never invents a zero.
+pub(crate) fn token_usage(value: &serde_json::Value) -> Option<TokenUsage> {
+    let object = value.as_object()?;
+    let pick = |names: &[&str]| names.iter().find_map(|name| object.get(*name)?.as_u64());
+    let usage = TokenUsage {
+        input: pick(&[
+            "input",
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ]),
+        cached_input: pick(&[
+            "cacheRead",
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cache_read_tokens",
+        ]),
+        cached_write: pick(&[
+            "cacheWrite",
+            "cached_write_tokens",
+            "cachedWriteTokens",
+            "cache_write_tokens",
+        ]),
+        output: pick(&[
+            "output",
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ]),
+        thought: pick(&["thought_tokens", "thoughtTokens", "reasoning_tokens"]),
+        total: pick(&["total_tokens", "totalTokens"]),
+    };
+    (usage.input.is_some()
+        || usage.cached_input.is_some()
+        || usage.cached_write.is_some()
+        || usage.output.is_some()
+        || usage.thought.is_some()
+        || usage.total.is_some())
+    .then_some(usage)
 }
 
 /// Terminal state of one turn.

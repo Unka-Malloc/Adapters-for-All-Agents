@@ -1,0 +1,87 @@
+//! Native-capability table for `dsh`. Last verified 2026-10-21.
+//!
+//! Verdict vs LicoUp's `dsh --profile sdk`: ACP is the richer conversation
+//! surface (durable resume, cancel, live `session/update` streaming). SDK
+//! RPC is a first-party JSON-RPC stdio carrier with model/effort on
+//! `initialize` but no live deltas and no cancel. ACP stays primary; SDK
+//! is the ordered alternate. Neither profile is an external plugin.
+
+use a4aa::native::{
+    cell, AwpPrimitives, ConfigLocations, InteractionSurfaces, McpMechanism, McpRegistration,
+    NativeCapability, NativeStatus,
+};
+
+/// Native surfaces and AwP primitives for DeepSeek Harness.
+pub const NATIVE: NativeCapability = NativeCapability {
+    last_verified: "2026-10-21",
+    surfaces: InteractionSurfaces {
+        serve: cell(NativeStatus::NotOffered, "no first-party HTTP serve"),
+        sdk: cell(
+            NativeStatus::Native,
+            "dsh --profile sdk: official JSON-RPC stdio (@deepseek-ai/dsh-sdk-app)",
+        ),
+        acp: cell(
+            NativeStatus::Native,
+            "dsh acp: first-party ACP profile (@deepseek-ai/dsh-acp-app)",
+        ),
+        rpc: cell(
+            NativeStatus::Native,
+            "sdk profile is the rpc lane; same JSON-RPC stdio as LicoUp",
+        ),
+        cli: cell(
+            NativeStatus::NotOffered,
+            "interactive dsh is not a headless lane",
+        ),
+        pty: cell(
+            NativeStatus::Native,
+            "interactive TTY exists; not the headless card",
+        ),
+    },
+    mcp: McpRegistration {
+        mechanism: McpMechanism::Unsupported,
+        detail: "McpSurface::None",
+    },
+    config: ConfigLocations {
+        settings: "{home}/.dsh/.credentials.yaml",
+        hooks: "",
+        permissions: "",
+        model_catalog: "ACP session/new configOptions; SDK initialize provider/model",
+    },
+    primitives: AwpPrimitives {
+        model_selection: cell(
+            NativeStatus::Native,
+            "ACP configOptions; SDK initialize provider/model",
+        ),
+        effort: cell(
+            NativeStatus::Native,
+            "ACP reasoning_effort configOption; SDK initialize reasoningEffort",
+        ),
+        session_open: cell(
+            NativeStatus::Native,
+            "ACP session/new; SDK caller-created sessionId on session/prompt",
+        ),
+        session_resume: cell(
+            NativeStatus::Native,
+            "ACP session/resume durable; SDK process-scoped only",
+        ),
+        session_cancel: cell(
+            NativeStatus::Native,
+            "ACP session/cancel; SDK has no cancel (kill_on_cancel on the alternate)",
+        ),
+        streaming: cell(
+            NativeStatus::Native,
+            "ACP session/update; SDK completed assistant/message only",
+        ),
+        instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
+        permission_modes: cell(NativeStatus::NotOffered, "no permission selector"),
+        skills: cell(NativeStatus::Native, ".dsh/skills"),
+        hooks: cell(NativeStatus::NotOffered, "HookSurface::None"),
+        subagents: cell(NativeStatus::NotOffered, "SubagentSurface::None"),
+        plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
+    },
+};
+
+/// The table, for hosts that compose over `&'static NativeCapability`.
+pub const fn native() -> &'static NativeCapability {
+    &NATIVE
+}

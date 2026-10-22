@@ -125,6 +125,26 @@ impl AgentSession {
         }
         match &self.lane {
             LaneSession::Acp(session) => session.validate_turn_request(request),
+            LaneSession::Cli(session) => {
+                validate_turn_selectors(self.selector_support(SelectorPhase::Turn), request)?;
+                // Fold-mode lanes accept only their declared tier
+                // vocabulary — check it here, before BeforeTurn can
+                // reserve paid work.
+                let suffixes = &session.lane.lane.effort_model_suffixes;
+                if let Some(level) = request
+                    .effort
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    if !suffixes.is_empty() && !suffixes.iter().any(|tier| tier == level) {
+                        return Err(AdapterError::permanent(
+                            "agent_effort_unsupported",
+                            "turn/configuration",
+                        ));
+                    }
+                }
+                Ok(())
+            }
             _ => validate_turn_selectors(self.selector_support(SelectorPhase::Turn), request),
         }
     }
@@ -300,6 +320,11 @@ fn validate_session_config(spec: &AgentSpec, request: &SessionRequest) -> Result
     )?;
 
     if let LaneSpec::Cli(lane) = &spec.lane {
+        validate_cli_allowlist(
+            config.effort.as_deref(),
+            &lane.effort_model_suffixes,
+            "agent_effort_unsupported",
+        )?;
         validate_cli_allowlist(
             config.mode.as_deref(),
             &lane.execution_modes,

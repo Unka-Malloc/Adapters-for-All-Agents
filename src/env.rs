@@ -1,17 +1,19 @@
 //! Agent process environment policy.
 //!
-//! Agents run with a sanitized environment by default: an allowlist of
-//! inert host variables is inherited, `TERM`/`NO_COLOR` are pinned for
-//! non-interactive output, and every other host variable is dropped. Secrets
-//! are never inherited implicitly — a [`SecretResolver`] supplied by the host
-//! resolves explicit references at spawn time.
+//! Agents inherit the user's real environment by default ([`EnvPolicy::InheritAll`]):
+//! the user's machine is the source of truth, and explicit `set` entries layer
+//! resolved overrides (`Literal`, `HostEnv`, or host-resolved `Secret`) on top.
+//! [`EnvPolicy::Sanitized`] remains available when a caller explicitly asks for
+//! an allowlist-only environment, and [`INHERITED_ENV`] defines the inert host
+//! variable names an untrusted sidecar caller may reference by name over the wire.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 
-/// Default inert variables an agent may inherit: process essentials, locale,
-/// and temp locations — never credentials.
+/// Default inert variables a sidecar client may reference by name over the wire
+/// (or a [`EnvPolicy::Sanitized`] policy inherits by default): process
+/// essentials, locale, and temp locations — never credentials.
 pub const INHERITED_ENV: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -56,7 +58,7 @@ pub enum EnvSource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum EnvPolicy {
-    /// Sanitized (default): allowlist inheritance plus explicit `set` entries.
+    /// Explicit allowlist inheritance plus `set` entries.
     Sanitized {
         /// Additional host variables to inherit beyond [`INHERITED_ENV`].
         #[serde(default)]
@@ -65,9 +67,8 @@ pub enum EnvPolicy {
         #[serde(default)]
         set: BTreeMap<String, EnvValue>,
     },
-    /// Trusted agents only: inherit the entire host environment, then apply
-    /// `set`. Never the default — a child spawned this way can observe every
-    /// credential in the host process.
+    /// Default policy: inherit the user's real host environment, then apply
+    /// explicit `set` overrides resolved at spawn.
     InheritAll {
         #[serde(default)]
         set: BTreeMap<String, EnvValue>,
@@ -76,8 +77,7 @@ pub enum EnvPolicy {
 
 impl Default for EnvPolicy {
     fn default() -> Self {
-        Self::Sanitized {
-            inherit: Vec::new(),
+        Self::InheritAll {
             set: BTreeMap::new(),
         }
     }
@@ -174,9 +174,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_policy_inherits_user_environment() {
+        spec_env("A4AA_TEST_INHERIT_MARKER", "visible");
+        let resolved = resolve(&EnvPolicy::default(), &BTreeMap::new(), &NoSecrets)
+            .await
+            .unwrap();
+        assert_eq!(resolved.get("A4AA_TEST_INHERIT_MARKER").unwrap(), "visible");
+    }
+
+    #[tokio::test]
     async fn sanitized_never_inherits_unlisted_host_variables() {
         spec_env("A4AA_TEST_SECRET_MARKER", "leak-check");
-        let resolved = resolve(&EnvPolicy::default(), &BTreeMap::new(), &NoSecrets)
+        let policy = EnvPolicy::Sanitized {
+            inherit: Vec::new(),
+            set: BTreeMap::new(),
+        };
+        let resolved = resolve(&policy, &BTreeMap::new(), &NoSecrets)
             .await
             .unwrap();
         assert!(!resolved.contains_key("A4AA_TEST_SECRET_MARKER"));
@@ -218,17 +231,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.get("AGENT_TOKEN").unwrap(), "s3cr3t");
-    }
-
-    #[tokio::test]
-    async fn inherit_all_is_explicit_and_observable() {
-        spec_env("A4AA_TEST_INHERIT_MARKER", "visible");
-        let policy = EnvPolicy::InheritAll {
-            set: BTreeMap::new(),
-        };
-        let resolved = resolve(&policy, &BTreeMap::new(), &NoSecrets)
-            .await
-            .unwrap();
-        assert_eq!(resolved.get("A4AA_TEST_INHERIT_MARKER").unwrap(), "visible");
     }
 }

@@ -18,12 +18,15 @@ use crate::bounds;
 use crate::env::SecretResolver;
 use crate::error::AdapterError;
 use crate::model::{
-    AgentEvent, BindingReceiptShape, CliLaneSpec, CommandSpec, PromptChannel, SessionRequest,
-    StreamMode, TokenUsage, TurnOutcome,
+    token_usage, AgentEvent, BindingReceiptShape, CliLaneSpec, CommandSpec, PromptChannel,
+    SessionRequest, StreamMode, TokenUsage, TurnOutcome,
 };
 use crate::observe::{Direction, SharedObserver};
 use crate::supervision::{IoPlan, StdioKind, SupervisedChild};
-use crate::template::{extract_path, substitute, substitute_text, vars, VarSpec, Vars};
+use crate::template::{
+    contains_placeholder, contains_placeholder_text, extract_path, substitute, substitute_text,
+    vars, VarSpec, Vars,
+};
 
 pub struct CliLane {
     pub command: CommandSpec,
@@ -250,6 +253,48 @@ impl CliLane {
         }
         let model = model.or(request.config.model.as_deref());
         let effort = effort.or(request.config.effort.as_deref());
+        // Lanes that encode effort inside the model id rewrite the tier
+        // segment — `effort` has no argument of its own on that wire, so
+        // the folded value travels through `{model}` alone.
+        let effort_carrier = || {
+            self.lane
+                .args
+                .iter()
+                .any(|argument| contains_placeholder_text(argument, "effort"))
+                || self
+                    .lane
+                    .stdin_template
+                    .as_ref()
+                    .is_some_and(|template| contains_placeholder(template, "effort"))
+        };
+        let folded_model = match (model, effort) {
+            (Some(base), Some(level))
+                if !self.lane.effort_model_suffixes.is_empty() && !level.trim().is_empty() =>
+            {
+                Some(effort_suffixed_model(
+                    base,
+                    level,
+                    &self.lane.effort_model_suffixes,
+                ))
+            }
+            (None, Some(level))
+                if !self.lane.effort_model_suffixes.is_empty()
+                    && !level.trim().is_empty()
+                    && !effort_carrier() =>
+            {
+                // Without a model there is nothing the tier can rewrite,
+                // and this lane has no direct effort argument either.
+                return Err(AdapterError::permanent(
+                    "agent_effort_unsupported",
+                    "cli/args",
+                ));
+            }
+            _ => None,
+        };
+        let (model, effort) = match folded_model.as_deref() {
+            Some(folded) => (Some(folded), None),
+            None => (model, effort),
+        };
         let instructions = request.config.instructions.as_deref();
         let permission = request.config.permission.as_deref();
         let cwd = request
@@ -881,6 +926,33 @@ fn receipt_error(code: &'static str) -> AdapterError {
     error
 }
 
+/// A model id carrying effort as a `-<level>` suffix gets the requested
+/// level rewritten into that segment (`cursor-grok-4.6-high` + `low` →
+/// `cursor-grok-4.6-low`); a trailing `-fast` marker is preserved
+/// (`x-high-fast` → `x-low-fast`). Models with no known tier segment
+/// gain the level as a new suffix (`gpt-5.2` + `high` → `gpt-5.2-high`).
+fn effort_suffixed_model(model: &str, effort: &str, tiers: &[String]) -> String {
+    let (stem, fast) = match model.strip_suffix("-fast") {
+        Some(stem) => (stem, "-fast"),
+        None => (model, ""),
+    };
+    // Longest declared tier wins: `extra-high` must beat `high` so
+    // `gpt-5.5-extra-high` rewrites to `gpt-5.5-low`, never `gpt-5.5-extra-low`.
+    let mut matched = 0;
+    for tier in tiers {
+        if tier.len() > matched
+            && stem.len() > tier.len()
+            && stem.ends_with(tier.as_str())
+            && stem.as_bytes()[stem.len() - tier.len() - 1] == b'-'
+        {
+            matched = tier.len();
+        }
+    }
+    let strip = if matched == 0 { 0 } else { matched + 1 };
+    let family = &stem[..stem.len() - strip];
+    format!("{family}-{effort}{fast}")
+}
+
 /// Missing optional receipts are allowed. Existing but unreadable, oversized,
 /// malformed, or identity-free receipts are failures and remain on disk.
 fn read_receipt(
@@ -973,49 +1045,6 @@ fn read_receipt(
     Ok(Some(ReceiptMetadata { session_id, usage }))
 }
 
-/// Extract token counters from a usage object. Field aliases cover the
-/// vendor spellings (`input_tokens`, `promptTokens`, `cache_read…`); an
-/// absent counter stays absent — the adapter never invents a zero.
-fn token_usage(value: &Value) -> Option<TokenUsage> {
-    let object = value.as_object()?;
-    let pick = |names: &[&str]| names.iter().find_map(|name| object.get(*name)?.as_u64());
-    let usage = TokenUsage {
-        input: pick(&[
-            "input_tokens",
-            "inputTokens",
-            "prompt_tokens",
-            "promptTokens",
-        ]),
-        cached_input: pick(&[
-            "cached_input_tokens",
-            "cachedInputTokens",
-            "cache_read_input_tokens",
-            "cacheReadInputTokens",
-            "cache_read_tokens",
-        ]),
-        cached_write: pick(&[
-            "cached_write_tokens",
-            "cachedWriteTokens",
-            "cache_write_tokens",
-        ]),
-        output: pick(&[
-            "output_tokens",
-            "outputTokens",
-            "completion_tokens",
-            "completionTokens",
-        ]),
-        thought: pick(&["thought_tokens", "thoughtTokens", "reasoning_tokens"]),
-        total: pick(&["total_tokens", "totalTokens"]),
-    };
-    (usage.input.is_some()
-        || usage.cached_input.is_some()
-        || usage.cached_write.is_some()
-        || usage.output.is_some()
-        || usage.thought.is_some()
-        || usage.total.is_some())
-    .then_some(usage)
-}
-
 #[cfg(all(test, unix))]
 mod receipt_file_type_tests {
     use super::*;
@@ -1043,6 +1072,83 @@ mod receipt_file_type_tests {
         assert!(receive
             .recv_timeout(crate::test_settings::WAIT_BUDGET)
             .expect("receipt read blocked on a special file"));
+    }
+}
+
+#[cfg(test)]
+mod effort_suffix_tests {
+    use super::effort_suffixed_model;
+
+    fn tiers() -> Vec<String> {
+        [
+            "minimal",
+            "none",
+            "low",
+            "medium",
+            "high",
+            "extra-high",
+            "xhigh",
+            "max",
+        ]
+        .iter()
+        .map(|level| (*level).to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn rewrites_the_tier_segment() {
+        let tiers = tiers();
+        assert_eq!(
+            effort_suffixed_model("cursor-grok-4.6-high", "low", &tiers),
+            "cursor-grok-4.6-low"
+        );
+        assert_eq!(
+            effort_suffixed_model("claude-opus-5-thinking-high", "medium", &tiers),
+            "claude-opus-5-thinking-medium"
+        );
+        assert_eq!(
+            effort_suffixed_model("claude-4.6-opus-high", "max", &tiers),
+            "claude-4.6-opus-max"
+        );
+    }
+
+    #[test]
+    fn longest_tier_wins_over_nested_candidates() {
+        let tiers = tiers();
+        // `extra-high` must beat `high`: otherwise `gpt-5.5-extra-high`
+        // would rewrite to the nonexistent `gpt-5.5-extra-low`.
+        assert_eq!(
+            effort_suffixed_model("gpt-5.5-extra-high", "low", &tiers),
+            "gpt-5.5-low"
+        );
+    }
+
+    #[test]
+    fn fast_marker_survives_the_rewrite() {
+        let tiers = tiers();
+        assert_eq!(
+            effort_suffixed_model("cursor-grok-4.6-high-fast", "xhigh", &tiers),
+            "cursor-grok-4.6-xhigh-fast"
+        );
+        assert_eq!(
+            effort_suffixed_model("composer-2.5-fast", "high", &tiers),
+            "composer-2.5-high-fast"
+        );
+    }
+
+    #[test]
+    fn models_without_a_tier_gain_the_suffix() {
+        let tiers = tiers();
+        assert_eq!(
+            effort_suffixed_model("gpt-5.2", "high", &tiers),
+            "gpt-5.2-high"
+        );
+        // A hyphenated name whose last segment is not a tier is appended,
+        // never corrupted mid-name.
+        assert_eq!(
+            effort_suffixed_model("claude-4.5-sonnet-thinking", "high", &tiers),
+            "claude-4.5-sonnet-thinking-high"
+        );
     }
 }
 

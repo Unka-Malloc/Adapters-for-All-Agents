@@ -2,8 +2,9 @@
 //!
 //! One crate owns every agent-client adaptation path a host needs:
 //!
-//! - **supervision** — process-group spawn, sanitized environment, bounded
-//!   I/O, interrupt (SIGINT→grace→kill) and tree teardown;
+//! - **supervision** — process-group spawn, full user environment inheritance
+//!   with explicit overrides, bounded I/O, interrupt (SIGINT→grace→kill) and
+//!   tree teardown;
 //! - **transports** — piped stdio and Unix PTY (raw slave, streaming master);
 //! - **lanes** — [`proto::acp`] (official `agent-client-protocol` crate),
 //!   [`proto::rpc`] (host-declared JSON-RPC methods), [`proto::cli`]
@@ -33,6 +34,7 @@ pub mod error;
 pub mod framing;
 pub mod mechanisms;
 pub mod model;
+pub mod native;
 pub mod observe;
 pub mod proto;
 pub mod rpc;
@@ -62,6 +64,10 @@ pub use model::{
     LaneKind, LaneSpec, PromptChannel, RpcCallSpec, RpcCompletionSpec, RpcEnvelopeSpec,
     RpcLaneSpec, RpcTransport, SelectorPhase, SelectorSupport, SelectorSupportSet, SessionConfig,
     SessionRequest, SessionScope, StreamMode, TokenUsage, TurnOutcome,
+};
+pub use native::{
+    cell, parse_iso_date, AwpPrimitives, Cell, ConfigLocations, InteractionSurfaces, McpMechanism,
+    McpRegistration, NativeCapability, NativeStatus,
 };
 pub use observe::{Direction, Observer, SharedObserver};
 pub use proto::acp::{PermissionDecision, PermissionPrompt, SessionDelegate};

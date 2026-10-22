@@ -10,10 +10,11 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
-    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, DetectSurface,
-    FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind,
-    UsageSurface,
+    AgentCard, AgentSurface, AttachmentSupport, CliSurface, DetectSurface, FeatureSurface,
+    HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
@@ -21,6 +22,8 @@ use a4aa::dialect::{
 };
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
 use a4aa::{PromptChannel, StreamMode};
+
+pub use native::{native, NATIVE};
 
 /// The `cursor` dialect: Cursor flat hooks.json, .mdc rules, skills, commands, subagents, cli-config permissions, mcp.json.
 pub const DIALECT: Dialect = Dialect {
@@ -64,64 +67,58 @@ pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
 
-/// The `cursor` agent card. `cursor-agent acp` is a verified Agent Client
-/// Protocol endpoint (`@agentclientprotocol/sdk`): `initialize` reports
-/// `loadSession` and session list, `session/new` answers with modes
-/// (agent/plan/ask) and the model catalog, and prompts stream
-/// `agent_message_chunk` updates with a `stopReason` completion.
-/// `session/request_permission` is an inbound request the host answers
-/// through its permission handler. The `cursor_login` auth method is the
-/// terminal flow; a stored login serves sessions transparently, so no
-/// `auth_key` is declared. The stream-json CLI
-/// (`cursor-agent --print --output-format stream-json --resume <id>`)
-/// remains the host-authored alternate lane.
+/// The `cursor` agent card. `cursor-agent` does not expose an ACP subcommand;
+/// `cursor-agent --print --output-format stream-json` is the verified headless
+/// lane, streaming NDJSON events over stdout while `create-chat` initializes
+/// new sessions.
 pub const AGENT: AgentCard = AgentCard {
     id: "cursor",
     label: "Cursor",
     dialect: &DIALECT,
-    surface: AgentSurface::Acp {
-        prefer_load: true,
-        spawn_args: &["acp"],
-        auth_key: None,
-    },
-    alternates: &[AlternateLane {
-        // `cursor-agent --print --output-format stream-json`: the verified
-        // batch lane behind the `acp` primary. The chat id rides the argv
-        // template (`--resume`/`create-chat`), so every turn is bound.
-        surface: AgentSurface::Cli(CliSurface {
-            args: &[
-                "--print",
-                "--output-format",
-                "stream-json",
-                "--stream-partial-output",
-                "--workspace",
-                "{cwd}",
-                "--resume",
-                "{sessionId}",
-                "{prompt}",
-                "--model",
-                "{model}",
-                "--reasoning-effort",
-                "{effort}",
-            ],
-            prompt_channel: PromptChannel::ArgOnly,
-            stream: StreamMode::Pty,
-            resume_spawn_args: &[],
-            resume_args: &[],
-            stdin_template: None,
-            json_lines: true,
-            session_id_path: Some("session_id"),
-            open_args: &["create-chat"],
-            binding_file_env: None,
-            binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
-            result_selector: Some("result"),
-            result_selector_field: None,
-            result_path: Some("result"),
-            usage_path: None,
-            spawn_args: &[],
-        }),
-        binary: None,
-    }],
+    surface: AgentSurface::Cli(CliSurface {
+        spawn_args: &[],
+        args: &[
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--stream-partial-output",
+            "--trust",
+            "--workspace",
+            "{cwd}",
+            "--resume",
+            "{sessionId}",
+            "{prompt}",
+            "--model",
+            "{model}",
+        ],
+        prompt_channel: PromptChannel::ArgOnly,
+        stream: StreamMode::Pty,
+        resume_spawn_args: &[],
+        resume_args: &[],
+        stdin_template: None,
+        json_lines: true,
+        session_id_path: Some("session_id"),
+        usage_path: None,
+        open_args: &["create-chat"],
+        binding_file_env: None,
+        binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
+        result_selector: Some("result"),
+        result_selector_field: None,
+        result_path: Some("result"),
+        // Reasoning effort lives inside the model id (`cursor-grok-4.6-high`);
+        // `--model` is effort's carrier on this CLI.
+        effort_model_suffixes: &[
+            "minimal",
+            "none",
+            "low",
+            "medium",
+            "high",
+            "extra-high",
+            "xhigh",
+            "max",
+        ],
+    }),
+    alternates: &[],
     detect: DetectSurface {
         binaries: &["cursor-agent", "cursor"],
         processes: &["cursor-agent.exe", "cursor-agent", "cursor.exe", "cursor"],
@@ -245,14 +242,18 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_the_acp_lane() {
+    fn spec_materializes_the_stream_json_cli() {
         let spec = spec();
         assert_eq!(spec.command.program, "cursor-agent");
-        assert_eq!(spec.command.args, vec!["acp"]);
-        let a4aa::LaneSpec::Acp { prefer_load, .. } = spec.lane else {
-            panic!("cursor drives the acp lane")
+        let a4aa::LaneSpec::Cli(cli) = spec.lane else {
+            panic!("cursor drives the cli lane")
         };
-        assert!(prefer_load);
+        assert!(cli.args.iter().any(|arg| arg == "--print"));
+        assert_eq!(cli.open_args, vec!["create-chat"]);
+        assert!(cli.json_lines);
+        assert_eq!(cli.session_id_path.as_deref(), Some("session_id"));
+        assert!(cli.capabilities().session_resume);
+        assert!(cli.capabilities().cancellation);
     }
 
     #[test]

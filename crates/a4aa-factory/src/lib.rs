@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AcpAuthKey, AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface,
     CompletionDecl, DetectSurface, EnvelopeDecl, FeatureSurface, HistoryRoot, InstructionChannel,
@@ -21,6 +23,8 @@ use a4aa::dialect::{
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `factory` dialect: Factory Droid AGENTS.md, skills, commands, droid subagents, settings MCP.
 pub const DIALECT: Dialect = Dialect {
@@ -113,6 +117,8 @@ pub const AGENT: AgentCard = AgentCard {
                 result_path: Some("result"),
                 usage_path: None,
                 spawn_args: &["exec"],
+
+                effort_model_suffixes: &[],
             }),
             binary: None,
         },
@@ -203,6 +209,8 @@ pub const AGENT: AgentCard = AgentCard {
                     "stream-jsonrpc",
                 ],
                 transport: RpcTransportDecl::Stdio,
+                max_frame_bytes: None,
+                usage_path: None,
             }),
             binary: None,
         },
@@ -294,6 +302,8 @@ pub const AGENT: AgentCard = AgentCard {
                 ],
                 spawn_args: &["daemon", "--port", "{port}"],
                 transport: RpcTransportDecl::WebSocket("WebSocket endpoint: "),
+                max_frame_bytes: None,
+                usage_path: None,
             }),
             binary: None,
         },

@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
     DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, OsPath,
@@ -21,6 +23,8 @@ use a4aa::dialect::{
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `codex` dialect: Codex hooks.json (Claude store), AGENTS.md, TOML subagents, custom prompts, native profiles.
 pub const DIALECT: Dialect = Dialect {
@@ -65,7 +69,7 @@ pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
 
-/// The `codex` agent card: `codex app-server` stdio JSON-RPC.
+/// The `codex` agent card: `codex app-server --stdio` JSON-RPC.
 ///
 /// Protocol: `initialize`/`initialized`
 /// handshake, then `thread/start` (fresh) or `thread/resume` (bound). Turns
@@ -133,8 +137,10 @@ pub const AGENT: AgentCard = AgentCard {
             "thread/unarchive",
             "turn/steer",
         ],
-        spawn_args: &["app-server"],
+        spawn_args: &["app-server", "--stdio"],
         transport: RpcTransportDecl::Stdio,
+        max_frame_bytes: None,
+        usage_path: None,
     }),
     alternates: &[AlternateLane {
         // `codex exec --json` batch mode: NDJSON events on stdout —
@@ -177,6 +183,8 @@ pub const AGENT: AgentCard = AgentCard {
             result_path: Some("item.text"),
             usage_path: Some("usage"),
             spawn_args: &["exec"],
+
+            effort_model_suffixes: &[],
         }),
         binary: None,
     }],
@@ -305,7 +313,10 @@ mod tests {
     fn spec_materializes_the_app_server_lane() {
         let spec = spec();
         assert_eq!(spec.command.program, "codex");
-        assert_eq!(spec.command.args, vec!["app-server".to_string()]);
+        assert_eq!(
+            spec.command.args,
+            vec!["app-server".to_string(), "--stdio".to_string()]
+        );
         let a4aa::LaneSpec::Rpc(rpc) = spec.lane else {
             panic!("codex drives the rpc lane")
         };

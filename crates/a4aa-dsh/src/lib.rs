@@ -10,15 +10,27 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod command_code;
+mod native;
+
 use a4aa::card::{
-    AgentCard, AgentSurface, AttachmentSupport, CompletionDecl, DetectSurface, FeatureSurface,
-    HistoryRoot, InstructionChannel, ModelCatalog, RpcCallDecl, RpcSurface, RpcTransportDecl,
-    StoreKind, TranscriptUsage, UsageSurface,
+    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CompletionDecl, DetectSurface,
+    FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, RpcCallDecl,
+    RpcSurface, RpcTransportDecl, StoreKind, TranscriptUsage, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
 };
 use a4aa::{AdaptationPlan, AgentSpec, Dialect, MechanismSet, SessionScope};
+
+pub use command_code::{
+    ACP_PROFILE_PATCH, AdvertisedModel, AdvertisedProvider, COMMAND_CODE_API_KEY_ENV,
+    COMMAND_CODE_BASE_URL, COMMAND_CODE_PROVIDER, CommandCodeModel, CommandCodeMountError,
+    PI_AI_PATCH_ID, PI_AI_PLUGIN, command_code_patch, credential_ref_names,
+    has_command_code_key, providers_from_config_options,
+};
+
+pub use native::{native, NATIVE};
 
 /// The `dsh` dialect: DeepSeek Harness layered native profiles (cordis), skills.
 pub const DIALECT: Dialect = Dialect {
@@ -47,72 +59,104 @@ pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
 
-/// The `dsh` agent card: `dsh --profile sdk` JSON-RPC over stdio.
+/// Official SDK JSON-RPC stdio (`dsh --profile sdk` / `dsh sdk`).
 ///
-/// Protocol: the SDK profile runs a
-/// stock JSON-RPC handshake (`initialize` carries cwd/provider/model/
-/// reasoning effort; the server answers `deepseek-harness-sdk-runtime`).
-/// Sessions are process-scoped — the durable store rejects reusing an id
-/// across process lifetimes — so the wire id is `{binding}-<nonce>`; a
-/// turn is `session/prompt {sessionId, contentBlocks:[text]}` acknowledged
-/// by a `messageId`, streams `session.event` frames, and ends at
-/// `session.status` reporting `idle`. Cancellation is process teardown;
-/// `shutdown` is the teardown call.
+/// `initialize` carries cwd/provider/model and optional `reasoningEffort`.
+/// Turns are `session/prompt` with a caller-created `{sessionId}` — the
+/// SDK records session ids durably and refuses re-admission after a
+/// respawn, so the lane mints a process-scoped id. Completion is
+/// `session.status` `idle`; assistant text arrives on `session.event`
+/// `assistant/message` (no live deltas). There is no cancel method.
+static SDK_RPC: RpcSurface = RpcSurface {
+    initialize: Some(RpcCallDecl {
+        method: "initialize",
+        params: r#"{
+            "cwd": "{cwd}",
+            "provider": "{modelProvider}",
+            "model": "{modelId}",
+            "reasoningEffort": "{effort}"
+        }"#,
+    }),
+    initialized: None,
+    session_open: None,
+    session_resume: None,
+    prompt: RpcCallDecl {
+        method: "session/prompt",
+        params: r#"{
+            "sessionId": "{sessionId}",
+            "contentBlocks": [{"type": "text", "text": "{prompt}"}]
+        }"#,
+    },
+    cancel: None,
+    session_close: Some(RpcCallDecl {
+        method: "shutdown",
+        params: "{}",
+    }),
+    text_event_method: Some("session.event"),
+    text_path: Some("event.data.message.content"),
+    completion: Some(CompletionDecl {
+        method: "session.status",
+        turn_id_path: None,
+        status_path: Some("status"),
+        status_value: Some("idle"),
+    }),
+    result_text_path: None,
+    pre_turn: &[],
+    session_scope: SessionScope::Process,
+    kill_on_cancel: true,
+    envelope: None,
+    passthrough: &[],
+    spawn_args: &["--profile", "sdk"],
+    transport: RpcTransportDecl::Stdio,
+    max_frame_bytes: None,
+    usage_path: None,
+};
+
+/// The `dsh` agent card: `dsh acp` (Agent Client Protocol over stdio) is
+/// the primary lane — richer session lifecycle than the SDK RPC: durable
+/// `session/resume`, `session/cancel`, and `session/update` streaming.
+/// Both profiles are first-party DSH (`~/.dsh/profiles/acp` and
+/// `~/.dsh/profiles/sdk`); neither is an external plugin.
+///
+/// Protocol: `dsh <name>` abbreviates `dsh --profile <name>`, so `dsh acp`
+/// boots the shipped ACP profile — a headless, non-interactive stdio server
+/// that holds stdout for NDJSON JSON-RPC until disconnect. No extra flags:
+/// `--help` is the profile app's own help and would exit without serving.
+/// `initialize` advertises ACP v1 plus `session/list`, `session/resume`,
+/// `session/close`; `session/load` is unsupported, so resume uses
+/// `session/resume`. `session/new` returns the live catalog as grouped
+/// `configOptions` (provider/model choices plus `reasoning_effort` when the
+/// exact model declares one). Authentication is a no-op; DSH resolves
+/// credentials itself.
+///
+/// The SDK JSON-RPC alternate (`dsh --profile sdk`) is the official
+/// library-style stdio carrier LicoUp drives: model and reasoning effort
+/// on `initialize`, caller-created session ids on `session/prompt`, no
+/// live deltas and no cancel. Capability ordering ranks Serve, then
+/// SDK, then ACP or RPC, then CLI. That ranking would put the SDK
+/// class above ACP, but the ACP profile is the richer conversation
+/// surface, so ACP stays primary and SDK is the ordered alternate.
 pub const AGENT: AgentCard = AgentCard {
     id: "dsh",
     label: "DeepSeek Harness",
     dialect: &DIALECT,
-    surface: AgentSurface::Rpc(&RpcSurface {
-        initialize: Some(RpcCallDecl {
-            method: "initialize",
-            // The SDK requires cwd + provider + model at handshake.
-            params: r#"{
-                "cwd": "{cwd}",
-                "provider": "{provider}",
-                "model": "{model}",
-                "reasoningEffort": "{effort}"
-            }"#,
-        }),
-        initialized: None,
-        // No session call: the wire id is minted per process from the
-        // host's durable binding.
-        session_open: None,
-        session_resume: None,
-        prompt: RpcCallDecl {
-            method: "session/prompt",
-            params: r#"{
-                "sessionId": "{sessionId}",
-                "contentBlocks": [{"type": "text", "text": "{prompt}"}]
-            }"#,
-        },
-        cancel: None,
-        session_close: Some(RpcCallDecl {
-            method: "shutdown",
-            params: "{}",
-        }),
-        text_event_method: Some("session.event"),
-        text_path: Some("event.data.message.content"),
-        completion: Some(CompletionDecl {
-            method: "session.status",
-            turn_id_path: None,
-            status_path: Some("status"),
-            status_value: Some("idle"),
-        }),
-        result_text_path: None,
-        pre_turn: &[],
-        session_scope: SessionScope::Process,
-        kill_on_cancel: true,
-        envelope: None,
-        passthrough: &[],
-        spawn_args: &["--profile", "sdk"],
-        transport: RpcTransportDecl::Stdio,
-    }),
-    alternates: &[],
+    surface: AgentSurface::Acp {
+        prefer_load: false,
+        spawn_args: &["acp"],
+        auth_key: None,
+    },
+    alternates: &[AlternateLane {
+        surface: AgentSurface::Rpc(&SDK_RPC),
+        binary: None,
+    }],
     detect: DetectSurface {
         binaries: &["dsh"],
         processes: &["dsh.exe", "dsh"],
         binary_dirs: &[],
-        config: &[],
+        config: &[
+            "{home}/.dsh/.credentials.yaml",
+            "{home}/.dsh/profiles/acp/cordis.patch.yml",
+        ],
         detection: &["{home}/.dsh/sessions"],
         apps: &[],
     },
@@ -124,10 +168,16 @@ pub const AGENT: AgentCard = AgentCard {
         attachments: AttachmentSupport::None,
         effort: true,
         steer: false,
-        models: ModelCatalog::None,
+        // DSH ACP advertises the live LLM catalog as `configOptions` on
+        // `session/new` — grouped by registered provider, including a
+        // Command Code route mounted through `@deepseek-ai/dsh-llm-pi-ai`.
+        models: ModelCatalog::RpcMethod("session/new"),
     },
     usage: UsageSurface {
-        live: None,
+        live: Some(LiveUsage {
+            event: "session/update",
+            path: "usage",
+        }),
         // `~/.dsh/sessions` message samples carry disjoint counter
         // buckets; reasoning rides inside `outputTokens` and the prompt
         // side is `total - output` — the host derives, the card names.
@@ -184,28 +234,59 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_the_sdk_profile_lane() {
+    fn spec_materializes_the_acp_profile_lane() {
         let spec = spec();
         assert_eq!(spec.command.program, "dsh");
-        assert_eq!(
-            spec.command.args,
-            vec!["--profile".to_string(), "sdk".to_string()]
-        );
-        let a4aa::LaneSpec::Rpc(rpc) = spec.lane else {
-            panic!("dsh drives the rpc lane")
+        // `dsh acp` expands to `dsh --profile acp`: headless ACP stdio,
+        // no extra flags.
+        assert_eq!(spec.command.args, vec!["acp".to_string()]);
+        let a4aa::LaneSpec::Acp {
+            prefer_load,
+            auth_key,
+            ..
+        } = spec.lane
+        else {
+            panic!("dsh drives the acp lane")
         };
+        assert!(!prefer_load);
+        assert!(auth_key.is_none());
+        assert_eq!(
+            AGENT.features.models,
+            a4aa::ModelCatalog::RpcMethod("session/new")
+        );
+        assert_eq!(
+            AGENT.usage.live.as_ref().map(|usage| usage.event),
+            Some("session/update")
+        );
+    }
+
+    #[test]
+    fn native_table_records_acp_primary_and_sdk_rpc() {
+        assert_eq!(NATIVE.last_verified, "2026-10-21");
+        assert_eq!(NATIVE.surfaces.acp.status, a4aa::NativeStatus::Native);
+        assert_eq!(NATIVE.surfaces.sdk.status, a4aa::NativeStatus::Native);
+        assert_eq!(NATIVE.surfaces.rpc.status, a4aa::NativeStatus::Native);
+        assert_eq!(NATIVE.surfaces.serve.status, a4aa::NativeStatus::NotOffered);
+    }
+
+    #[test]
+    fn spec_materializes_the_sdk_rpc_alternate() {
+        let specs = AGENT.specs();
+        assert_eq!(specs.len(), 2);
+        let a4aa::LaneSpec::Rpc(rpc) = &specs[1].lane else {
+            panic!("dsh's alternate is the sdk rpc")
+        };
+        assert_eq!(specs[1].command.program, "dsh");
+        assert_eq!(
+            specs[1].command.args,
+            vec!["--profile".to_owned(), "sdk".to_owned()]
+        );
         assert_eq!(rpc.initialize.as_ref().unwrap().method, "initialize");
         assert_eq!(rpc.prompt.method, "session/prompt");
-        assert_eq!(rpc.session_scope, SessionScope::Process);
-        assert!(rpc.kill_on_cancel);
         assert_eq!(rpc.completion.as_ref().unwrap().method, "session.status");
-        assert_eq!(
-            rpc.completion.as_ref().unwrap().status_value.as_deref(),
-            Some("idle")
-        );
-        assert_eq!(rpc.text_path.as_deref(), Some("event.data.message.content"));
-        assert!(rpc.capabilities().session_resume);
-        assert!(rpc.capabilities().cancellation);
+        assert_eq!(rpc.session_scope, a4aa::SessionScope::Process);
+        assert!(rpc.kill_on_cancel);
+        assert!(rpc.cancel.is_none());
     }
 
     #[test]

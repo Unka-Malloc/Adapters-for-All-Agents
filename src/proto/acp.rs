@@ -36,10 +36,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::bounds;
 use crate::env::SecretResolver;
 use crate::error::AdapterError;
-use crate::model::TurnRequest;
 use crate::model::{
     AgentEvent, AgentInfo, Capabilities, CommandSpec, SelectorPhase, SelectorSupport,
-    SelectorSupportSet, SessionConfig, SessionRequest, TokenUsage, TurnOutcome,
+    SelectorSupportSet, SessionConfig, SessionRequest, TokenUsage, TurnOutcome, TurnRequest,
 };
 use crate::observe::SharedObserver;
 use crate::supervision::SupervisedChild;
@@ -312,6 +311,7 @@ impl OutputSink {
         receive.await.map_err(|_| output_failure())
     }
 }
+
 fn output_failure() -> AdapterError {
     AdapterError::uncertain("agent_event_delivery_failed", "acp/events")
 }
@@ -552,6 +552,7 @@ impl AcpLane {
                 config: request.config,
                 output,
                 auth_key: self.auth_key.clone(),
+                env,
                 secrets: self.secrets.clone(),
             },
             command_rx,
@@ -614,6 +615,7 @@ struct ServeContext {
     config: SessionConfig,
     output: OutputSink,
     auth_key: Option<crate::env::EnvSource>,
+    env: std::collections::BTreeMap<String, std::ffi::OsString>,
     secrets: Arc<dyn SecretResolver>,
 }
 
@@ -837,6 +839,7 @@ async fn open_session(
         &call,
         &auth_methods,
         context.auth_key.as_ref(),
+        &context.env,
         &*context.secrets,
     )
     .await?;
@@ -934,14 +937,21 @@ impl SessionCall {
     }
 }
 
-/// Resolve the declared credential through its source; an unavailable key
-/// resolves to `None` and the caller decides whether to still authenticate.
+/// Resolve the declared credential through the child's resolved environment
+/// or its source; an unavailable key resolves to `None` and the caller
+/// decides whether to still authenticate.
 async fn resolve_auth_key(
     auth_key: Option<&crate::env::EnvSource>,
+    env: &std::collections::BTreeMap<String, std::ffi::OsString>,
     secrets: &dyn SecretResolver,
 ) -> Option<String> {
     match auth_key {
-        Some(crate::env::EnvSource::HostEnv { host_env }) => std::env::var(host_env).ok(),
+        Some(crate::env::EnvSource::HostEnv { host_env }) => env
+            .get(host_env)
+            .and_then(|v| v.to_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .or_else(|| std::env::var(host_env).ok().filter(|v| !v.is_empty())),
         Some(crate::env::EnvSource::Secret { secret }) => secrets.resolve(secret).await,
         None => None,
     }
@@ -983,9 +993,10 @@ async fn call_with_auth_retry(
     call: &SessionCall,
     auth_methods: &[AuthMethodId],
     auth_key: Option<&crate::env::EnvSource>,
+    env: &std::collections::BTreeMap<String, std::ffi::OsString>,
     secrets: &dyn SecretResolver,
 ) -> Result<Value, AdapterError> {
-    let api_key = resolve_auth_key(auth_key, secrets).await;
+    let api_key = resolve_auth_key(auth_key, env, secrets).await;
     if api_key.is_some() && !auth_methods.is_empty() {
         authenticate(connection, auth_methods, api_key.as_deref()).await;
     }
@@ -1345,7 +1356,7 @@ fn model_value_available(state: &SessionSetup, requested: &str) -> bool {
 
 fn config_unavailable(slot: &str, requested: &str) -> AdapterError {
     AdapterError::permanent("agent_configuration_unavailable", "session/configuration").with_detail(
-        format!("{slot} value {requested:?} is not advertised by the agent"),
+        format!("{slot} value {requested:?} is not advertised by the agent",),
     )
 }
 
@@ -1424,7 +1435,41 @@ fn cancelled_prompt() -> TurnOutcome {
 }
 
 fn protocol_failure(stage: &'static str, error: agent_client_protocol::Error) -> AdapterError {
-    AdapterError::uncertain("agent_protocol_failed", stage).with_detail(error.to_string())
+    // An explicit auth refusal is a certain non-effect: the request was
+    // rejected before the agent served it, so another candidate may
+    // safely replay it. ACP reuses JSON-RPC -32000 (`AuthRequired`) for
+    // that case, but agents also emit -32000 for provider quota and
+    // capacity refusals. Those are not credential failures: they must
+    // stay `agent_protocol_failed` so a model chain can advance.
+    // Everything else stays uncertain — a dropped connection mid-turn
+    // could have already done billable work.
+    if error.code == agent_client_protocol::ErrorCode::AuthRequired
+        && !quota_or_capacity_refusal(&error)
+    {
+        AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
+    } else {
+        AdapterError::uncertain("agent_protocol_failed", stage).with_detail(error.to_string())
+    }
+}
+
+fn quota_or_capacity_refusal(error: &agent_client_protocol::Error) -> bool {
+    let text = error.to_string().to_lowercase();
+    [
+        "rate limit",
+        "ratelimit",
+        "too many requests",
+        "resource_exhausted",
+        "quota",
+        "insufficient_quota",
+        "overloaded",
+        "model unavailable",
+        "model not found",
+        "no such model",
+        "model does not exist",
+        "unsupported model",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn stop_reason(reason: &StopReason) -> &'static str {
@@ -1562,4 +1607,26 @@ fn map_update(update: &SessionUpdate) -> Option<AgentEvent> {
         },
     };
     Some(event)
+}
+
+#[cfg(test)]
+mod protocol_failure_tests {
+    use super::*;
+
+    #[test]
+    fn quota_rate_limit_is_protocol_failed_not_auth() {
+        let mut error = agent_client_protocol::Error::auth_required();
+        error.message = "AI.Error: Rate limit exceeded. Please try again later.".into();
+        let mapped = protocol_failure("session/prompt", error);
+        assert_eq!(mapped.code, "agent_protocol_failed");
+    }
+
+    #[test]
+    fn credential_auth_required_stays_auth() {
+        let mapped = protocol_failure(
+            "session/prompt",
+            agent_client_protocol::Error::auth_required(),
+        );
+        assert_eq!(mapped.code, "agent_auth_required");
+    }
 }

@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, DetectSurface,
     FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, StoreKind, UsageSurface,
@@ -20,6 +22,8 @@ use a4aa::dialect::{
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `openclaw` dialect: OpenClaw AGENTS.md, skills, agents.
 pub const DIALECT: Dialect = Dialect {
@@ -94,6 +98,8 @@ pub const AGENT: AgentCard = AgentCard {
         result_selector_field: Some("status"),
         result_path: Some("final"),
         usage_path: None,
+
+        effort_model_suffixes: &[],
     }),
     alternates: &[AlternateLane {
         // `openclaw acp` runs the agent's ACP bridge in front of the
