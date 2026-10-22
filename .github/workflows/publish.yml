@@ -138,7 +138,6 @@ jobs:
       id-token: write
     env:
       RELEASE_MODE: live
-      RELEASE_KIND: ${{ needs.gate.outputs.kind }}
       SIBLINGS: '[]'
       CANDIDATE: ${{ needs.gate.outputs.sha }}
       BRANCH: ${{ needs.gate.outputs.branch }}
@@ -169,7 +168,7 @@ jobs:
       # The version bump was authored under the read-only token; here it is
       # only a patch the release job replays onto the candidate tree.
       - name: Commit the release version
-        if: env.RELEASE_KIND != 'tag' && env.NEEDS_SET == 'true'
+        if: env.NEEDS_SET == 'true'
         run: |
           git apply "$GITHUB_WORKSPACE/release-set/version-bump.patch"
           git -c user.name="github-actions[bot]" \
@@ -180,7 +179,6 @@ jobs:
       # so promote HEAD — pushing $CANDIDATE would strand stable on the
       # pre-release commit.
       - name: Promote the candidate to stable
-        if: env.RELEASE_KIND != 'tag'
         run: git push origin "HEAD:refs/heads/stable"
 
       - name: Authenticate to crates.io
@@ -232,22 +230,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$RELEASE_KIND" != tag ]; then
-            git tag "v$NEXT"
-            git push origin "refs/tags/v$NEXT"
-          fi
+          git tag "v$NEXT"
+          git push origin "refs/tags/v$NEXT"
           if ! git push origin "HEAD:refs/heads/release"; then
-            # A hand-pushed tag may sit off the release line; the upload
-            # already happened, so only the branch pointer is left behind.
-            [ "$RELEASE_KIND" = tag ] || exit 1
-            echo "::warning::release branch not moved: v$NEXT is not a fast-forward of it"
+            echo "::error::release branch not moved: v$NEXT is not a fast-forward of it"
+            exit 1
           fi
           gh release view "v$NEXT" >/dev/null 2>&1 ||
             gh release create "v$NEXT" --verify-tag --generate-notes --title "v$NEXT"
 
       - name: Merge the release back into nightly
-        if: >-
-          env.RELEASE_KIND != 'tag' && env.BRANCH == 'nightly'
+        if: env.BRANCH == 'nightly'
         run: |
           git fetch -q origin nightly
           if git merge-base --is-ancestor HEAD origin/nightly; then exit 0; fi
