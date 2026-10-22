@@ -518,7 +518,8 @@ impl RpcLane {
                     self.spec
                         .max_frame_bytes
                         .unwrap_or(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
-                        .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES),
+                        .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
+                        .min(crate::framing::MAX_FRAME_BYTES_LIMIT),
                 )
                 .await?;
                 // The daemon's stdin pipe stays open (the server never
@@ -547,7 +548,8 @@ impl RpcLane {
             self.spec
                 .max_frame_bytes
                 .unwrap_or(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
-                .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES),
+                .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
+                .min(crate::framing::MAX_FRAME_BYTES_LIMIT),
             self.spec.envelope.clone(),
         );
 

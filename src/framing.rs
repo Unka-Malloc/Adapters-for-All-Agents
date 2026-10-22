@@ -19,6 +19,11 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// agent surface needs.
 pub const SIDECAR_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Absolute ceiling any lane may declare: `max_frame_bytes` can widen the
+/// default toward this limit but never past it — a wire-supplied spec
+/// cannot turn a frame bound into an allocation attack.
+pub const MAX_FRAME_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     #[error("frame exceeds {0} bytes")]
