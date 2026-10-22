@@ -943,19 +943,23 @@ impl SessionCall {
 
 /// Resolve the declared credential through the child's resolved environment
 /// or its source; an unavailable key resolves to `None` and the caller
-/// decides whether to still authenticate.
+/// decides whether to still authenticate. A name the resolved environment
+/// carries as empty counts as absent — the ambient host variable is only a
+/// fallback for trusted launches whose spec never delivered the key, and
+/// sidecar admission guarantees wire-supplied specs always carry theirs.
 async fn resolve_auth_key(
     auth_key: Option<&crate::env::EnvSource>,
     env: &std::collections::BTreeMap<String, std::ffi::OsString>,
     secrets: &dyn SecretResolver,
 ) -> Option<String> {
     match auth_key {
-        Some(crate::env::EnvSource::HostEnv { host_env }) => env
-            .get(host_env)
-            .and_then(|v| v.to_str())
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-            .or_else(|| std::env::var(host_env).ok().filter(|v| !v.is_empty())),
+        Some(crate::env::EnvSource::HostEnv { host_env }) => {
+            match env.get(host_env).and_then(|v| v.to_str()) {
+                Some(value) if !value.is_empty() => Some(value.to_owned()),
+                Some(_) => None,
+                None => std::env::var(host_env).ok().filter(|v| !v.is_empty()),
+            }
+        }
         Some(crate::env::EnvSource::Secret { secret }) => secrets.resolve(secret).await,
         None => None,
     }
@@ -1617,5 +1621,42 @@ mod protocol_failure_tests {
             agent_client_protocol::Error::auth_required(),
         );
         assert_eq!(mapped.code, "agent_auth_required");
+    }
+
+    #[tokio::test]
+    async fn an_empty_resolved_auth_key_never_refills_from_the_host() {
+        use std::ffi::OsString;
+        // PATH is populated in every ambient process environment: a resolved
+        // empty value must count as absent, not as an invitation to re-read
+        // the host.
+        let env = std::collections::BTreeMap::from([(
+            "PATH".to_owned(),
+            OsString::from(""),
+        )]);
+        let resolved = resolve_auth_key(
+            Some(&crate::env::EnvSource::HostEnv {
+                host_env: "PATH".to_owned(),
+            }),
+            &env,
+            &crate::env::NoSecrets,
+        )
+        .await;
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn an_absent_auth_key_still_resolves_from_the_host() {
+        // Trusted launches keep the ambient fallback: a name the resolved
+        // environment does not carry at all still reads the host variable.
+        let env = std::collections::BTreeMap::new();
+        let resolved = resolve_auth_key(
+            Some(&crate::env::EnvSource::HostEnv {
+                host_env: "PATH".to_owned(),
+            }),
+            &env,
+            &crate::env::NoSecrets,
+        )
+        .await;
+        assert_eq!(resolved, std::env::var("PATH").ok());
     }
 }
