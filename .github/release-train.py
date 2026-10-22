@@ -482,6 +482,39 @@ def cmd_order(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_freshness(args: argparse.Namespace) -> int:
+    """Every publishable crate's src/**/*.rs `last_verified: "YYYY-MM-DD"`
+    must sit inside the window — a stale native-capability table means the
+    card's claims were not re-checked against the shipped binary."""
+    window = dt.timedelta(days=args.window_days)
+    today = dt.datetime.now(dt.timezone.utc).date()
+    checked, stale = 0, []
+    for name, package in sorted(publishable_members().items()):
+        src = pathlib.Path(package["manifest_path"]).parent / "src"
+        dates = [
+            dt.date.fromisoformat(match.group(1))
+            for path in src.rglob("*.rs") if src.exists()
+            for match in [re.search(r'last_verified:\s*"(\d{4}-\d{2}-\d{2})"',
+                                    path.read_text())]
+            if match
+        ]
+        if not dates:
+            continue
+        checked += 1
+        oldest = min(dates)
+        if today - oldest > window:
+            stale.append(f"{name}: last_verified {oldest} "
+                         f"({(today - oldest).days}d > {args.window_days}d)")
+    if stale:
+        report("\n".join(f"- {entry}" for entry in stale))
+        raise TrainError(f"{len(stale)} native capability table(s) stale: "
+                         + "; ".join(stale))
+    emit(checked=str(checked))
+    report(f"{checked} native capability table(s) within "
+           f"{args.window_days}d.")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="train.py")
     commands = root.add_subparsers(dest="command", required=True)
@@ -501,6 +534,9 @@ def parser() -> argparse.ArgumentParser:
     version.set_defaults(run=cmd_version)
     order = commands.add_parser("order")
     order.set_defaults(run=cmd_order)
+    freshness = commands.add_parser("freshness")
+    freshness.add_argument("--window-days", type=int, default=14)
+    freshness.set_defaults(run=cmd_freshness)
     return root
 
 
