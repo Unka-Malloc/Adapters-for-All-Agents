@@ -114,6 +114,7 @@ pub const AGENT: AgentCard = AgentCard {
             "--append-system-prompt",
             "{instructions}",
         ],
+        trusted_workspace_args: &[],
         prompt_channel: PromptChannel::Stdin,
         stream: StreamMode::Stdio,
         resume_spawn_args: &[],

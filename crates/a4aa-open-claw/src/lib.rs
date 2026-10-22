@@ -82,6 +82,7 @@ pub const AGENT: AgentCard = AgentCard {
             "--cwd",
             "{cwd}",
         ],
+        trusted_workspace_args: &[],
         prompt_channel: PromptChannel::Stdin,
         stream: StreamMode::Stdio,
         // `agent exec` turns are ephemeral; durable sessions live behind

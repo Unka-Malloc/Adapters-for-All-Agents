@@ -82,7 +82,6 @@ pub const AGENT: AgentCard = AgentCard {
             "--output-format",
             "stream-json",
             "--stream-partial-output",
-            "--trust",
             "--workspace",
             "{cwd}",
             "--resume",
@@ -91,6 +90,11 @@ pub const AGENT: AgentCard = AgentCard {
             "--model",
             "{model}",
         ],
+        // cursor refuses an untrusted workspace, so `--trust` is not in
+        // the default argv: hosts opt in through
+        // `spec_trusting_workspace()` for the directory they dispatch
+        // (`--workspace {cwd}` binds the grant to that directory only).
+        trusted_workspace_args: &["--trust"],
         prompt_channel: PromptChannel::ArgOnly,
         stream: StreamMode::Pty,
         resume_spawn_args: &[],
