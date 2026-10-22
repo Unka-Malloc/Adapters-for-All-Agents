@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AttachmentSupport, CliSurface, DetectSurface, FeatureSurface,
     HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind, TranscriptUsage,
@@ -23,6 +25,8 @@ use a4aa::{
     AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet, PromptChannel,
     StreamMode,
 };
+
+pub use native::{native, NATIVE};
 
 /// The `claude` dialect: Claude Code settings.json hooks, CLAUDE.md, skills, commands, subagents, permissions, .mcp.json.
 pub const DIALECT: Dialect = Dialect {
@@ -128,6 +132,8 @@ pub const AGENT: AgentCard = AgentCard {
         result_path: Some("result"),
         usage_path: None,
         spawn_args: &[],
+
+        effort_model_suffixes: &[],
     }),
     alternates: &[],
     detect: DetectSurface {

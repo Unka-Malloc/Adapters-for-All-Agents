@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, DetectSurface, FeatureSurface,
     HistoryRoot, InstructionChannel, ModelCatalog, OsPath, StoreKind, UsageSurface,
@@ -19,6 +21,8 @@ use a4aa::dialect::{
     SubagentSurface, Target,
 };
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `opencode` dialect: OpenCode JS plugin hooks, AGENTS.md, skills, commands, subagents, opencode.json MCP.
 pub const DIALECT: Dialect = Dialect {

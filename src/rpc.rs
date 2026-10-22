@@ -25,11 +25,13 @@ use crate::model::RpcEnvelopeSpec;
 use crate::observe::{Direction, SharedObserver};
 
 /// Outbound backpressure budget: bytes queued for the writer but not yet
-/// written. Sized as four maximum frames plus line slack, so several
-/// full-size frames can be in flight while the queued backlog stays bounded.
-/// This is backpressure for admission ([`JsonRpcPeer::outbound_headroom`]) —
-/// never a quota that fails work or drops a frame.
-pub const DEFAULT_MAX_QUEUED_SEND_BYTES: usize = 4 * framing::DEFAULT_MAX_MESSAGE_BYTES + 1024;
+/// written. Sized as four default-size frames plus line slack, so several
+/// ordinary frames can be in flight while the queued backlog stays
+/// bounded; lanes that widen the inbound frame floor do not inflate the
+/// memory held hostage to a stalled writer. This is backpressure for
+/// admission ([`JsonRpcPeer::outbound_headroom`]) — never a quota that
+/// fails work or drops a frame.
+pub const DEFAULT_MAX_QUEUED_SEND_BYTES: usize = 4 * 1024 * 1024 + 1024;
 
 /// Wire error object for a failed request.
 #[derive(Clone, Debug)]

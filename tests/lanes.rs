@@ -48,6 +48,8 @@ fn rpc_spec() -> AgentSpec {
         client_name: None,
         lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
             transport: RpcTransport::Stdio,
+            max_frame_bytes: None,
+            usage_path: None,
             initialize: None,
             initialized: None,
             session_open: Some(RpcCallSpec {
@@ -287,6 +289,23 @@ async fn rpc_cancel_reaches_agent() {
     session.close().await.expect("close");
 }
 
+#[tokio::test]
+async fn rpc_usage_arrives_on_the_outcome_even_when_unstreamed() {
+    let adapter = Adapter::new(rpc_spec());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open");
+    let outcome = session.prompt(turn("usage-report")).await.expect("prompt");
+    let usage = outcome.usage.expect("usage captured at ingress");
+    assert_eq!(usage.input, Some(7));
+    assert_eq!(usage.output, Some(3));
+    assert_eq!(usage.cached_input, Some(5));
+    assert_eq!(usage.total, Some(10));
+    session.close().await.expect("close");
+}
+
 // ------------------------------- CLI --------------------------------
 
 fn cli_spec(
@@ -317,6 +336,7 @@ fn cli_spec(
             result_path: None,
             execution_modes: vec![],
             permission_modes: vec![],
+            effort_model_suffixes: vec![],
         })),
         command: CommandSpec {
             program: program.into(),
@@ -820,6 +840,86 @@ async fn cli_argv_placeholder_skips_stdin() {
     assert_eq!(outcome.text.trim(), "argv-prompt");
 }
 
+#[tokio::test]
+async fn cli_effort_folds_into_the_model_suffix() {
+    let mut spec = cli_spec(
+        "echo",
+        vec!["{prompt}".into(), "--model".into(), "{model}".into()],
+        PromptChannel::ArgOnly,
+        StreamMode::Stdio,
+        None,
+    );
+    let LaneSpec::Cli(cli) = &mut spec.lane else {
+        unreachable!()
+    };
+    cli.effort_model_suffixes = [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "extra-high",
+        "xhigh",
+        "max",
+    ]
+    .iter()
+    .map(|level| (*level).to_owned())
+    .collect();
+    // The effort selector is applied through `{model}` — no placeholder needed.
+    assert_eq!(
+        spec.selector_support(SelectorPhase::Session).effort,
+        SelectorSupport::Applied
+    );
+    assert_eq!(
+        spec.selector_support(SelectorPhase::Turn).effort,
+        SelectorSupport::Applied
+    );
+
+    let adapter = Adapter::new(spec);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut request = SessionRequest::default();
+    request.config.model = Some("cursor-grok-4.6-high".into());
+    request.config.effort = Some("low".into());
+    let session = adapter.open_session(request, tx).await.expect("open");
+    let outcome = session.prompt(turn("work")).await.expect("prompt");
+    assert_eq!(outcome.text.trim(), "work --model cursor-grok-4.6-low");
+
+    // A turn-level effort rewrites the session default too; `-fast` is preserved.
+    let outcome = session
+        .prompt(TurnRequest {
+            text: "again".into(),
+            model: Some("cursor-grok-4.6-high-fast".into()),
+            effort: Some("xhigh".into()),
+        })
+        .await
+        .expect("prompt");
+    assert_eq!(
+        outcome.text.trim(),
+        "again --model cursor-grok-4.6-xhigh-fast"
+    );
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn cli_effort_suffix_fold_requires_a_model_carrier() {
+    // Without a reachable `{model}` the suffix mechanism cannot express the
+    // selector — support stays fail-closed.
+    let mut spec = cli_spec(
+        "echo",
+        vec!["{prompt}".into()],
+        PromptChannel::ArgOnly,
+        StreamMode::Stdio,
+        None,
+    );
+    let LaneSpec::Cli(cli) = &mut spec.lane else {
+        unreachable!()
+    };
+    cli.effort_model_suffixes = vec!["high".into()];
+    assert_eq!(
+        spec.selector_support(SelectorPhase::Session).effort,
+        SelectorSupport::Unsupported
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cli_pty_stream_mode_works() {
@@ -952,7 +1052,9 @@ else:
                 "cli"|"pty"=>LaneSpec::Cli(Box::new(CliLaneSpec {args:vec!["{prompt}".into()],prompt_channel:PromptChannel::ArgOnly,
                     stream:if mode=="pty" {StreamMode::Pty}else{StreamMode::Stdio},..Default::default()})),
                 _=>LaneSpec::Rpc(Box::new(RpcLaneSpec {
-            transport: RpcTransport::Stdio,prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
+            transport: RpcTransport::Stdio,
+            max_frame_bytes: None,
+            usage_path: None,prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
                     text_event_method:Some("ready".into()),text_path:Some("text".into()),..Default::default()})),
             };
             let spec=AgentSpec {id:mode.into(),client_name:None,max_output_bytes:Some(1024),lane,
@@ -1513,6 +1615,8 @@ time.sleep(3600)
                 },
                 _ => LaneSpec::Rpc(Box::new(RpcLaneSpec {
                     transport: RpcTransport::Stdio,
+                    max_frame_bytes: None,
+                    usage_path: None,
                     initialize: Some(RpcCallSpec {
                         method: "initialize".into(),
                         params: json!({}),
@@ -1678,6 +1782,8 @@ signal.pause()
             max_output_bytes: Some(1024),
             lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
                 transport: RpcTransport::Stdio,
+                max_frame_bytes: None,
+                usage_path: None,
                 initialize: Some(RpcCallSpec {
                     method: "initialize".into(),
                     params: json!({}),
@@ -1797,6 +1903,8 @@ signal.pause()
                 max_output_bytes: Some(1024),
                 lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
                     transport: RpcTransport::Stdio,
+                    max_frame_bytes: None,
+                    usage_path: None,
                     initialize: Some(RpcCallSpec {
                         method: "initialize".into(),
                         params: json!({}),
@@ -1897,6 +2005,8 @@ for line in sys.stdin:
             max_output_bytes: Some(1024),
             lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
             transport: RpcTransport::Stdio,
+            max_frame_bytes: None,
+        usage_path: None,
                 prompt: RpcCallSpec {
                     method: "prompt".into(),
                     params: json!({"text": "{prompt}"}),

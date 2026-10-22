@@ -245,15 +245,16 @@ impl SidecarDelegate {
             message: format!("invalid spec: {error}"),
             data: None,
         })?;
-        // A remote sidecar client may not read host variables by name:
-        // InheritAll is a trusted-local-launcher option, and per-name
-        // inheritance or `hostEnv` indirections are confined to the spawn
-        // allowlist — otherwise any client could exfiltrate host
-        // credentials through the agent's environment.
+        // A remote sidecar client may not read arbitrary host variables by
+        // name: per-name `inherit` on a sanitized policy or `hostEnv`
+        // indirections are confined to the inert allowlist, and secret
+        // references must be resolved to literals at the custody boundary
+        // before crossing the wire. The child process itself inherits the
+        // user's real environment under `InheritAll` (the default).
         if !env_admitted_over_sidecar(&spec.command.env) {
             return Err(RpcErrorObject {
                 code: -32602,
-                message: "env policy not admitted over the sidecar: inheritAll, \
+                message: "env policy not admitted over the sidecar: \
                           non-allowlisted inherit names, hostEnv outside the allowlist, \
                           and secret references are refused"
                     .into(),
@@ -261,14 +262,14 @@ impl SidecarDelegate {
             });
         }
         // The ACP lane's auth_key is another client-named EnvSource — hold
-        // it to the same policy or it would bypass the spawn allowlist and
-        // read host variables into the child's `_meta.api_key`.
+        // it to the same policy unless its hostEnv variable is already
+        // supplied as a literal in the spec's own env set.
         if let a4aa::model::LaneSpec::Acp {
             auth_key: Some(source),
             ..
         } = &spec.lane
         {
-            if !env_source_admitted_over_sidecar(source) {
+            if !auth_key_admitted_over_sidecar(source, &spec.command.env) {
                 return Err(RpcErrorObject {
                     code: -32602,
                     message: "lane auth_key not admitted over the sidecar: hostEnv \
@@ -984,6 +985,31 @@ fn fixture_agent() -> i32 {
                     continue;
                 }
 
+                if prompt_text.contains("usage-report") {
+                    // A mid-turn usage record rides a notification, the
+                    // same carrier pi uses (`params.message.usage`).
+                    write(
+                        &stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "message": {"usage": {"input": 7, "output": 3,
+                                                      "cacheRead": 5, "totalTokens": 10}}
+                            }
+                        }),
+                    );
+                    finish_prompt(
+                        &stdout,
+                        id.unwrap_or(Value::Null),
+                        &session_id,
+                        &prompt_text,
+                        false,
+                    );
+                    continue;
+                }
+
                 if prompt_text.contains("wait-for-cancel") {
                     // Stream a burst of chunks, then defer the response until
                     // `session/cancel` arrives (handled above).
@@ -1029,21 +1055,45 @@ fn fixture_agent() -> i32 {
     0
 }
 
-/// Whether a spec's env policy may cross the sidecar boundary. The remote
-/// client is a same-uid peer we must not hand host state to: only the
-/// documented spawn allowlist may be inherited by name.
+/// Whether a spec's env policy may cross the sidecar boundary.
+///
+/// Under the Environment Fidelity contract, child processes inherit the
+/// user's host environment by default (`EnvPolicy::InheritAll`), while
+/// caller-supplied `set` mappings and `Sanitized.inherit` names are checked so
+/// a remote peer cannot remap an arbitrary host variable into a different env
+/// key or request an unresolved `secret` reference without supplying a literal.
 fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy) -> bool {
     let allowed = |name: &str| a4aa::env::INHERITED_ENV.contains(&name);
+    let set_admitted = |set: &std::collections::BTreeMap<String, a4aa::EnvValue>| {
+        set.values().all(|value| match value {
+            a4aa::EnvValue::Literal(_) => true,
+            a4aa::EnvValue::Source(source) => env_source_admitted_over_sidecar(source),
+        })
+    };
     match env {
-        a4aa::EnvPolicy::InheritAll { .. } => false,
+        a4aa::EnvPolicy::InheritAll { set } => set_admitted(set),
         a4aa::EnvPolicy::Sanitized { inherit, set } => {
-            inherit.iter().all(|name| allowed(name))
-                && set.values().all(|value| match value {
-                    a4aa::EnvValue::Literal(_) => true,
-                    a4aa::EnvValue::Source(source) => env_source_admitted_over_sidecar(source),
-                })
+            inherit.iter().all(|name| allowed(name)) && set_admitted(set)
         }
     }
+}
+
+/// Whether `acp.auth_key` may cross the sidecar boundary: either it is an
+/// allowlisted `EnvSource`, or it is a `HostEnv` whose key was already
+/// resolved to a `Literal` in the spec's `set` map by the caller.
+fn auth_key_admitted_over_sidecar(source: &a4aa::EnvSource, env: &a4aa::EnvPolicy) -> bool {
+    if env_source_admitted_over_sidecar(source) {
+        return true;
+    }
+    if let a4aa::EnvSource::HostEnv { host_env } = source {
+        let set = match env {
+            a4aa::EnvPolicy::InheritAll { set } | a4aa::EnvPolicy::Sanitized { set, .. } => set,
+        };
+        if matches!(set.get(host_env), Some(a4aa::EnvValue::Literal(_))) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a single `EnvSource` may cross the sidecar boundary — the same
@@ -1072,11 +1122,12 @@ mod tests {
     fn sidecar_env_sources_follow_the_spawn_allowlist() {
         assert!(env_source_admitted_over_sidecar(&host("PATH")));
         assert!(env_source_admitted_over_sidecar(&host("HOME")));
-        // Anything off the allowlist — credentials in particular — is refused.
+        // Anything off the allowlist — credentials in particular — is refused
+        // when requested as an unresolved HostEnv source.
         for name in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "GH_TOKEN"] {
             assert!(
                 !env_source_admitted_over_sidecar(&host(name)),
-                "{name} must not cross the sidecar boundary"
+                "{name} must not cross the sidecar boundary as an unresolved HostEnv"
             );
         }
         assert!(!env_source_admitted_over_sidecar(
@@ -1096,16 +1147,35 @@ mod tests {
             inherit: vec!["PATH".into()],
             set: set.clone(),
         }));
+        assert!(env_admitted_over_sidecar(&a4aa::EnvPolicy::InheritAll {
+            set: set.clone(),
+        }));
+        let auth_env = a4aa::EnvPolicy::InheritAll {
+            set: BTreeMap::from([(
+                "DEVIN_API_KEY".to_owned(),
+                a4aa::EnvValue::Literal("resolved-token".into()),
+            )]),
+        };
+        assert!(auth_key_admitted_over_sidecar(
+            &host("DEVIN_API_KEY"),
+            &auth_env
+        ));
+        assert!(!auth_key_admitted_over_sidecar(
+            &host("DEVIN_API_KEY"),
+            &a4aa::EnvPolicy::InheritAll {
+                set: BTreeMap::new()
+            }
+        ));
         set.insert(
             "LEAK".to_owned(),
             a4aa::EnvValue::Source(host("OPENAI_API_KEY")),
         );
         assert!(!env_admitted_over_sidecar(&a4aa::EnvPolicy::Sanitized {
             inherit: vec![],
-            set,
+            set: set.clone(),
         }));
         assert!(!env_admitted_over_sidecar(&a4aa::EnvPolicy::InheritAll {
-            set: BTreeMap::new()
+            set,
         }));
     }
 }

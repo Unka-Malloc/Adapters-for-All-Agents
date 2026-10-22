@@ -10,16 +10,21 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
-    AgentCard, AgentSurface, AttachmentSupport, CompletionDecl, DetectSurface, EnvelopeDecl,
-    FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, RpcCallDecl, RpcSurface,
-    RpcTransportDecl, StoreKind, UsageSurface,
+    AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
+    DetectSurface, EnvelopeDecl, FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog,
+    RpcCallDecl, RpcSurface, RpcTransportDecl, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
     SubagentSurface,
 };
+use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, Dialect, HookEvent, MechanismSet, SessionScope};
+
+pub use native::{native, NATIVE};
 
 /// The `pi` dialect: Pi TS extension hooks, skills, .ts extension plugins.
 pub const DIALECT: Dialect = Dialect {
@@ -146,8 +151,43 @@ pub const AGENT: AgentCard = AgentCard {
         // answers `get_state`.
         spawn_args: &["--mode", "rpc"],
         transport: RpcTransportDecl::Stdio,
+        // `agent_end` embeds the session's whole message list in one
+        // frame - a real audit transcript is megabytes, not kilobytes.
+        max_frame_bytes: Some(64 * 1024 * 1024),
+        usage_path: Some("message.usage"),
     }),
-    alternates: &[],
+    alternates: &[AlternateLane {
+        // `pi --print`: one-shot CLI. `--thinking` is the native effort
+        // flag (`off|minimal|low|medium|high|xhigh|max`); `--model` takes
+        // `provider/id`. `--session` resumes a host-known session file.
+        surface: AgentSurface::Cli(CliSurface {
+            args: &[
+                "--print",
+                "{prompt}",
+                "--model",
+                "{model}",
+                "--thinking",
+                "{effort}",
+            ],
+            prompt_channel: PromptChannel::ArgOnly,
+            stream: StreamMode::Stdio,
+            resume_spawn_args: &[],
+            resume_args: &["--session", "{sessionId}"],
+            stdin_template: None,
+            json_lines: false,
+            session_id_path: None,
+            open_args: &[],
+            binding_file_env: None,
+            binding_receipt_shape: BindingReceiptShape::SessionId,
+            result_selector: None,
+            result_selector_field: None,
+            result_path: None,
+            usage_path: None,
+            spawn_args: &[],
+            effort_model_suffixes: &[],
+        }),
+        binary: Some("pi"),
+    }],
     detect: DetectSurface {
         binaries: &["pi"],
         processes: &["pi.exe", "pi"],
@@ -248,5 +288,24 @@ mod card_tests {
         assert!(rpc.passthrough.iter().any(|m| m == "steer"));
         assert!(rpc.capabilities().session_resume);
         assert!(rpc.capabilities().cancellation);
+    }
+
+    #[test]
+    fn spec_materializes_print_cli_as_the_ordered_alternate() {
+        let specs = AGENT.specs();
+        assert_eq!(specs.len(), 2);
+        let a4aa::LaneSpec::Cli(cli) = &specs[1].lane else {
+            panic!("pi's alternate is the print cli")
+        };
+        assert_eq!(specs[1].command.program, "pi");
+        assert!(cli.args.iter().any(|arg| arg == "--print"));
+        assert!(cli.args.iter().any(|arg| arg == "--model"));
+        assert!(cli.args.iter().any(|arg| arg == "{model}"));
+        assert!(cli.args.iter().any(|arg| arg == "--thinking"));
+        assert!(cli.args.iter().any(|arg| arg == "{effort}"));
+        assert_eq!(
+            cli.resume_args,
+            vec!["--session".to_owned(), "{sessionId}".to_owned()]
+        );
     }
 }

@@ -263,8 +263,8 @@ async fn cursor_default_argv_preserves_native_approval_policy() {
     let mut spec = a4aa_cursor::card()
         .specs()
         .into_iter()
-        .nth(1)
-        .expect("cursor declares the cli alternate");
+        .next()
+        .expect("cursor declares the cli lane");
     spec.command.program = "sh".into();
     spec.command.args = vec![
         "-c".into(),
@@ -286,7 +286,11 @@ async fn cursor_default_argv_preserves_native_approval_policy() {
         .unwrap();
     let args: Vec<_> = output.text.lines().collect();
     assert!(args.contains(&"--print"));
-    for bypass in ["--trust", "--force", "--approve-mcps"] {
+    // --trust only admits the workspace directory the host dispatched —
+    // headless cursor cannot run untrusted — while the permission-bypass
+    // flags stay out of the default argv.
+    assert!(args.contains(&"--trust"));
+    for bypass in ["--force", "--approve-mcps", "--yolo"] {
         assert!(!args.contains(&bypass));
     }
 }
@@ -779,7 +783,7 @@ payload={'conversationId':'receipt-session','usage':{'input_tokens':12,'output_t
 if mode=='malformed': p.write_text('{broken')
 elif mode=='nested-bad': p.write_text(json.dumps({'hookPayload':'broken'}))
 elif mode=='unreadable': p.mkdir()
-elif mode=='oversized': p.write_bytes(b'x'*(2*1024*1024))
+elif mode=='oversized': p.write_bytes(b'x'*(65*1024*1024))
 elif mode=='no-id': p.write_text('{}')
 elif mode!='missing':
     if mode=='nested': payload={'hookPayload':json.dumps(payload)}

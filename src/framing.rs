@@ -8,8 +8,11 @@
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-/// ACP-sized default bound: 1 MiB message plus line terminator slack.
-pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Default bound per NDJSON frame. Agents such as pi emit completion
+/// frames embedding the whole session transcript — tens of megabytes on
+/// a long session — so the floor must absorb real agent traffic, not
+/// just request/response chatter.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {

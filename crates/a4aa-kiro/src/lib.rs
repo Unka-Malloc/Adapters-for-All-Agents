@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, DetectSurface,
     FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind,
@@ -21,6 +23,8 @@ use a4aa::dialect::{
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `kiro` dialect: Kiro steering rules, skills, JSON agents, mcp.json (IDE trigger hooks unmapped).
 pub const DIALECT: Dialect = Dialect {
@@ -104,6 +108,8 @@ pub const AGENT: AgentCard = AgentCard {
             result_path: None,
             usage_path: None,
             spawn_args: &["chat"],
+
+            effort_model_suffixes: &[],
         }),
         // `chat`/`acp` live on kiro-cli-chat behind the kiro-cli shim.
         binary: Some("kiro-cli-chat"),

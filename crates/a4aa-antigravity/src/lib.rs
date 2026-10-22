@@ -10,10 +10,11 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
-    AcpAuthKey, AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface,
-    DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog,
-    StoreKind, UsageSurface,
+    AgentCard, AgentSurface, AttachmentSupport, CliSurface, DetectSurface, FeatureSurface,
+    HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
@@ -21,6 +22,8 @@ use a4aa::dialect::{
 };
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
 use a4aa::{PromptChannel, StreamMode};
+
+pub use native::{native, NATIVE};
 
 /// The Antigravity CLI's managed customization surfaces.
 pub const DIALECT: Dialect = Dialect {
@@ -65,61 +68,49 @@ pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
 
-/// The Antigravity agent card. `agy_acp_server.par` is a verified Agent
-/// Client Protocol endpoint (agent `antigravity-acp`): `initialize`
-/// reports `loadSession`, session list/resume, image/audio/embedded-context
-/// prompts and MCP http/sse. Four auth methods are advertised —
-/// `oauth-personal`, `oauth-business`, `gemini-api-key` and
-/// `agent-platform`; the card declares the env-key route so a host
-/// holding `GEMINI_API_KEY` authenticates explicitly. The `agy --print`
-/// stream-json CLI remains the host-authored alternate lane.
+/// The Antigravity agent card. `agy --print --output-format stream-json`
+/// is the native headless lane: `--model`, `--effort`, `--mode` on argv,
+/// `--conversation {sessionId}` resumes, `conversation_id` binds the
+/// session, `result`/`result.usage` select the turn. The former
+/// `agy_acp_server.par` ACP bundle is an external plugin binary and is
+/// not a card surface.
 pub const AGENT: AgentCard = AgentCard {
     id: "antigravity",
     label: "Antigravity",
     dialect: &DIALECT,
-    surface: AgentSurface::Acp {
-        prefer_load: true,
-        // The .par bundle itself is the ACP server; the `~/.local/bin`
-        // wrapper enters `$AGY_ACP_ROOT` before exec.
+    surface: AgentSurface::Cli(CliSurface {
+        args: &[
+            "--print",
+            "{prompt}",
+            "--output-format",
+            "stream-json",
+            "--model",
+            "{model}",
+            "--effort",
+            "{effort}",
+            "--mode",
+            "{mode}",
+        ],
+        prompt_channel: PromptChannel::ArgOnly,
+        stream: StreamMode::Stdio,
+        resume_spawn_args: &[],
+        resume_args: &["--conversation", "{sessionId}"],
+        stdin_template: None,
+        json_lines: true,
+        session_id_path: Some("conversation_id"),
+        open_args: &[],
+        binding_file_env: None,
+        binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
+        result_selector: Some("result"),
+        result_selector_field: Some("event"),
+        result_path: Some("result.response"),
+        usage_path: Some("result.usage"),
         spawn_args: &[],
-        auth_key: Some(AcpAuthKey::HostEnv("GEMINI_API_KEY")),
-    },
-    alternates: &[AlternateLane {
-        // `agy --print --output-format stream-json`: the batch lane behind
-        // the `agy_acp_server.par` ACP primary.
-        surface: AgentSurface::Cli(CliSurface {
-            args: &[
-                "--print",
-                "{prompt}",
-                "--output-format",
-                "stream-json",
-                "--model",
-                "{model}",
-                "--effort",
-                "{effort}",
-                "--mode",
-                "{mode}",
-            ],
-            prompt_channel: PromptChannel::ArgOnly,
-            stream: StreamMode::Stdio,
-            resume_spawn_args: &[],
-            resume_args: &["--conversation", "{sessionId}"],
-            stdin_template: None,
-            json_lines: true,
-            session_id_path: Some("conversation_id"),
-            open_args: &[],
-            binding_file_env: None,
-            binding_receipt_shape: a4aa::BindingReceiptShape::SessionId,
-            result_selector: Some("result"),
-            result_selector_field: Some("event"),
-            result_path: Some("result.response"),
-            usage_path: Some("result.usage"),
-            spawn_args: &[],
-        }),
-        binary: Some("agy"),
-    }],
+        effort_model_suffixes: &[],
+    }),
+    alternates: &[],
     detect: DetectSurface {
-        binaries: &["agy_acp_server.par", "agy"],
+        binaries: &["agy"],
         processes: &["agy.exe", "agy"],
         binary_dirs: &[],
         config: &[
@@ -145,8 +136,8 @@ pub const AGENT: AgentCard = AgentCard {
     },
     usage: UsageSurface {
         live: Some(LiveUsage {
-            event: "session/update",
-            path: "usage",
+            event: "result",
+            path: "result.usage",
         }),
         transcript: None,
         hosted: None,
@@ -193,27 +184,23 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_the_acp_lane() {
+    fn spec_materializes_the_stream_json_cli() {
         let spec = spec();
-        // `binaries[0]` is the ACP server bundle; `agy` remains detected
-        // for hosts composing the CLI alternate.
-        assert_eq!(spec.command.program, "agy_acp_server.par");
-        let a4aa::LaneSpec::Acp {
-            prefer_load,
-            auth_key,
-            ..
-        } = spec.lane
-        else {
-            panic!("antigravity drives the acp lane")
+        assert_eq!(spec.command.program, "agy");
+        let a4aa::LaneSpec::Cli(cli) = spec.lane else {
+            panic!("antigravity drives the cli lane")
         };
-        assert!(prefer_load);
+        assert!(cli.args.iter().any(|arg| arg == "--print"));
+        assert!(cli.args.iter().any(|arg| arg == "stream-json"));
+        assert!(cli.args.iter().any(|arg| arg == "--effort"));
+        assert!(cli.args.iter().any(|arg| arg == "{effort}"));
         assert_eq!(
-            auth_key,
-            Some(a4aa::EnvSource::HostEnv {
-                host_env: "GEMINI_API_KEY".to_owned()
-            })
+            cli.resume_args,
+            vec!["--conversation".to_owned(), "{sessionId}".to_owned()]
         );
-        assert_eq!(AGENT.detect.binaries, &["agy_acp_server.par", "agy"]);
+        assert_eq!(cli.session_id_path.as_deref(), Some("conversation_id"));
+        assert_eq!(AGENT.detect.binaries, &["agy"]);
+        assert!(AGENT.alternates.is_empty());
     }
 
     #[test]
@@ -235,7 +222,7 @@ mod card_tests {
         assert!(AGENT.features.permission_modes.is_empty());
         assert_eq!(AGENT.features.permission_default, None);
         assert_eq!(AGENT.features.models, ModelCatalog::CliArgs(&["models"]));
-        assert_eq!(AGENT.detect.binaries, &["agy_acp_server.par", "agy"]);
+        assert_eq!(AGENT.detect.binaries, &["agy"]);
         assert!(AGENT
             .detect
             .config

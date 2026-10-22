@@ -23,8 +23,8 @@ use crate::env::SecretResolver;
 use crate::error::AdapterError;
 use crate::model::RpcCallSpec;
 use crate::model::{
-    AgentEvent, Capabilities, CommandSpec, LaneSpec, RpcLaneSpec, SelectorPhase,
-    SelectorSupportSet, SessionRequest, SessionScope, TurnOutcome,
+    token_usage, AgentEvent, Capabilities, CommandSpec, LaneSpec, RpcLaneSpec, SelectorPhase,
+    SelectorSupportSet, SessionRequest, SessionScope, TokenUsage, TurnOutcome,
 };
 use crate::observe::SharedObserver;
 use crate::rpc::{CallFailure, JsonRpcPeer, PendingCall, RpcDelegate, RpcErrorObject};
@@ -126,6 +126,10 @@ struct TurnProgress {
     text_truncated: bool,
     terminals: PendingTerminals,
     expected: Option<String>,
+    /// Last usage record captured at ingress. Kept out of the retained
+    /// queue so token accounting survives output-budget truncation the
+    /// same way terminal records do.
+    usage: Option<TokenUsage>,
 }
 struct DeliveryState {
     remaining: Option<usize>,
@@ -235,6 +239,7 @@ impl TurnDelivery {
                         text: String::new(),
                         text_truncated: false,
                         expected: None,
+                        usage: None,
                         terminals: PendingTerminals::new(
                             self.limit
                                 .map(|limit| limit.max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)),
@@ -283,6 +288,16 @@ impl TurnDelivery {
             .then(|| notification_text(&params, self.spec.text_path.as_deref()))
             .flatten();
         if let Some(progress) = &mut state.progress {
+            if let Some(usage) = self
+                .spec
+                .usage_path
+                .as_deref()
+                .and_then(|path| extract_path(&params, path))
+                .or_else(|| notification_usage(&params))
+                .and_then(token_usage)
+            {
+                progress.usage = Some(usage);
+            }
             if let Some(text) = &text {
                 if !progress.text_truncated {
                     let remaining = self.limit.map(|n| n.saturating_sub(progress.text.len()));
@@ -514,7 +529,10 @@ impl RpcLane {
             peer_io.1,
             delivery.clone(),
             self.observer.clone(),
-            crate::framing::DEFAULT_MAX_MESSAGE_BYTES,
+            self.spec
+                .max_frame_bytes
+                .unwrap_or(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
+                .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES),
             self.spec.envelope.clone(),
         );
 
@@ -771,6 +789,14 @@ impl RpcState {
         let retained = bounds::bounded_prefix(&text, self.max_output_bytes);
         let fence = self.delivery.snapshot().2;
         self.delivery.fence(fence).await?;
+        let usage = self
+            .delivery
+            .state
+            .lock()
+            .unwrap()
+            .progress
+            .as_ref()
+            .and_then(|progress| progress.usage.clone());
         if retained.len() < text.len() && !self.delivery.truncated() {
             self.delivery.state.lock().unwrap().truncated = true;
             self.delivery.delegate.on_event(AgentEvent::Truncated).await;
@@ -780,7 +806,7 @@ impl RpcState {
             text: retained.to_owned(),
             truncated: self.delivery.truncated(),
             exit_code: None,
-            usage: None,
+            usage,
         })
     }
 
@@ -821,7 +847,13 @@ impl RpcState {
                     None
                 };
                 let result = terminal.map(|(status, end)| {
-                    (status, progress.text[..end].to_owned(), truncated, issued)
+                    (
+                        status,
+                        progress.text[..end].to_owned(),
+                        truncated,
+                        issued,
+                        progress.usage.clone(),
+                    )
                 });
                 if result.is_none() && acknowledged && state.closed {
                     if self.control.lock().unwrap().killed {
@@ -837,14 +869,14 @@ impl RpcState {
                 }
                 result
             };
-            if let Some((status, text, truncated, fence)) = terminal {
+            if let Some((status, text, truncated, fence, usage)) = terminal {
                 self.delivery.fence(fence).await?;
                 return Ok(TurnOutcome {
                     stop_reason: status,
                     text,
                     truncated,
                     exit_code: None,
-                    usage: None,
+                    usage,
                 });
             }
             tokio::select! {
@@ -1066,6 +1098,15 @@ fn call_failure(failure: CallFailure) -> AdapterError {
 
 fn extract_text(result: &Value, path: Option<&str>) -> Option<String> {
     extract_path(result, path?)?.as_str().map(str::to_owned)
+}
+
+/// Conventional usage carriers on a notification: `params.usage` or a
+/// nested `params.message.usage` (pi's `turn_end`/`message_end` events).
+/// Applied when the spec declares no `usage_path`.
+fn notification_usage(params: &Value) -> Option<&Value> {
+    params
+        .get("usage")
+        .or_else(|| extract_path(params, "message.usage"))
 }
 
 /// Bind port 0 on loopback and release it — the daemon then claims the same

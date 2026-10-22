@@ -135,6 +135,11 @@ impl AgentCard {
                     .iter()
                     .map(|mode| (*mode).to_owned())
                     .collect(),
+                effort_model_suffixes: cli
+                    .effort_model_suffixes
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect(),
             })),
             AgentSurface::Rpc(rpc) => LaneSpec::Rpc(Box::new(RpcLaneSpec {
                 initialize: rpc.initialize.map(RpcCallDecl::call),
@@ -186,6 +191,8 @@ impl AgentCard {
                         announce: announce.to_owned(),
                     },
                 },
+                max_frame_bytes: rpc.max_frame_bytes,
+                usage_path: rpc.usage_path.map(str::to_owned),
             })),
             AgentSurface::Serve { .. } => LaneSpec::Serve {
                 mcp_servers: Vec::new(),
@@ -326,6 +333,12 @@ pub struct CliSurface {
     pub usage_path: Option<&'static str>,
     /// argv prefix before the lane args (for example a subcommand).
     pub spawn_args: &'static [&'static str],
+    /// Model ids encode reasoning effort as a `-<level>` suffix: a
+    /// requested `effort` rewrites that segment of the effective model
+    /// value (`cursor-grok-4.6` + `high` → `cursor-grok-4.6-high`). Lists
+    /// the vocabulary's levels; empty means effort needs its own
+    /// placeholder in `args`.
+    pub effort_model_suffixes: &'static [&'static str],
 }
 
 /// Declared JSON-RPC method surface over stdio.
@@ -377,6 +390,15 @@ pub struct RpcSurface {
     /// stdin/stdout, `WebSocket` spawns a first-party daemon and connects
     /// to its announced endpoint.
     pub transport: RpcTransportDecl,
+    /// Largest inbound frame the lane accepts; `None` uses the shared
+    /// default. Declare the agent's real frame size when its terminal
+    /// events embed large payloads.
+    pub max_frame_bytes: Option<usize>,
+    /// Dotted path inside a notification's params to a token-usage
+    /// object; each observation is retained and the last lands on
+    /// `TurnOutcome::usage`. `None` scans the conventional carriers
+    /// (`params.usage`, `params.message.usage`).
+    pub usage_path: Option<&'static str>,
 }
 
 /// Card-level transport declaration — `&'static` friendly counterpart of

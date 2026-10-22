@@ -8,6 +8,9 @@ coverage/
 .cache/
 *.log
 *.tmp
+.tmp-worker-write-check
+/ls
+/scripts/ls
 
 # Temporary reports and plans
 docs/plans/

@@ -10,6 +10,8 @@
 //!
 //! [`Dialect::adapt`]: a4aa::Dialect::adapt
 
+mod native;
+
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, DetectSurface,
     FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, StoreKind,
@@ -21,6 +23,8 @@ use a4aa::dialect::{
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+
+pub use native::{native, NATIVE};
 
 /// The `grok` dialect: Grok per-file hook bundles, AGENTS.md, skills, commands, subagents.
 pub const DIALECT: Dialect = Dialect {
@@ -114,6 +118,8 @@ pub const AGENT: AgentCard = AgentCard {
             result_path: None,
             usage_path: None,
             spawn_args: &[],
+
+            effort_model_suffixes: &[],
         }),
         binary: None,
     }],

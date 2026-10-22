@@ -98,6 +98,7 @@ name = "a4aa-dsh"
 version = "0.2.1"
 dependencies = [
  "a4aa",
+ "serde_json",
 ]
 
 [[package]]

@@ -11,8 +11,9 @@
 //! that keeps the dependency graph (and compile time) at exactly one
 //! descriptor. Nothing in `a4aa` core requires this registry.
 
-use a4aa::card::AgentCard;
 use a4aa::Dialect;
+use a4aa::card::AgentCard;
+use a4aa::native::NativeCapability;
 
 /// `(name, descriptor)` pairs for every adapter crate in the workspace.
 /// Names match each adapter's `Dialect::id`.
@@ -88,6 +89,36 @@ pub fn cards() -> impl Iterator<Item = (&'static str, &'static AgentCard)> {
     CARDS.iter().copied()
 }
 
+/// `(name, native-capability table)` for every adapter crate.
+static NATIVES: &[(&str, &NativeCapability)] = &[
+    ("antigravity", a4aa_antigravity::native()),
+    ("claude", a4aa_claude::native()),
+    ("codex", a4aa_codex::native()),
+    ("commandcode", a4aa_command_code::native()),
+    ("cursor", a4aa_cursor::native()),
+    ("devin", a4aa_devin::native()),
+    ("dsh", a4aa_dsh::native()),
+    ("factory", a4aa_factory::native()),
+    ("grok", a4aa_grok::native()),
+    ("hermes", a4aa_hermes::native()),
+    ("kilocode", a4aa_kilo_code::native()),
+    ("kimicode", a4aa_kimi_code::native()),
+    ("kiro", a4aa_kiro::native()),
+    ("openclaw", a4aa_open_claw::native()),
+    ("opencode", a4aa_opencode::native()),
+    ("pi", a4aa_pi::native()),
+];
+
+/// Look a dialect's native-capability table up by id.
+pub fn native(name: &str) -> Option<&'static NativeCapability> {
+    NATIVES.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
+}
+
+/// Every published `(name, native-capability table)` pair.
+pub fn natives() -> impl Iterator<Item = (&'static str, &'static NativeCapability)> {
+    NATIVES.iter().copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +173,67 @@ mod tests {
                 continue;
             }
             assert!(card(name).is_some(), "{name} has a dialect but no card");
+        }
+    }
+
+    #[test]
+    fn every_card_publishes_a_dated_native_capability_table() {
+        let mut names: Vec<_> = natives().map(|(n, _)| n).collect();
+        names.sort_unstable();
+        let mut cards: Vec<_> = cards().map(|(n, _)| n).collect();
+        cards.sort_unstable();
+        assert_eq!(
+            names, cards,
+            "native tables must cover every published card"
+        );
+        for (name, table) in natives() {
+            assert!(
+                table.date_is_iso(),
+                "{name} last_verified {:?} is not YYYY-MM-DD",
+                table.last_verified
+            );
+            assert_eq!(
+                native(name).map(|t| t.last_verified),
+                Some(table.last_verified)
+            );
+        }
+    }
+
+    #[test]
+    fn master_doc_covers_every_native_table() {
+        let doc = include_str!("../../../docs/native-capability.md");
+        for (name, table) in natives() {
+            let needle = format!("| {name} | {} |", table.last_verified);
+            assert!(
+                doc.contains(&needle),
+                "docs/native-capability.md must include {needle:?}"
+            );
+            let surfaces = format!(
+                "| {name} | {} | {} | {} | {} | {} | {} |",
+                table.last_verified,
+                status_cell(table.surfaces.serve.status),
+                status_cell(table.surfaces.sdk.status),
+                status_cell(table.surfaces.acp.status),
+                status_cell(table.surfaces.rpc.status),
+                status_cell(table.surfaces.cli.status),
+            );
+            assert!(
+                doc.contains(&surfaces),
+                "interaction-surface row missing or stale: {surfaces}"
+            );
+        }
+        assert!(
+            doc.contains("python3 .github/release-train.py freshness"),
+            "master table must name the release freshness command"
+        );
+    }
+
+    fn status_cell(status: a4aa::NativeStatus) -> &'static str {
+        match status {
+            a4aa::NativeStatus::Native => "native",
+            a4aa::NativeStatus::NotOffered => "not-offered",
+            a4aa::NativeStatus::Unadapted => "unadapted",
+            a4aa::NativeStatus::NonNative => "non-native",
         }
     }
 }

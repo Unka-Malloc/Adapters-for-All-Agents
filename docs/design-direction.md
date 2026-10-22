@@ -30,3 +30,9 @@ The complementary direction — a designed runtime language projecting a
 subset of itself onto whatever each host natively expresses — is a valid
 design for a different kind of system, but it is out of this
 repository's scope.
+
+Native support for each dialect is recorded in that crate's `NATIVE`
+table and aggregated in [native-capability.md](native-capability.md).
+A cell is `native`, `not-offered`, `unadapted`, or `non-native`
+(plugin/external adapter, flagged for removal). `last_verified` must be
+refreshed before a release.
