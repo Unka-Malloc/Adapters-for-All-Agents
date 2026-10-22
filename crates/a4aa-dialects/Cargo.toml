@@ -1,7 +1,7 @@
 [package]
 name = "a4aa-dialects"
 description = "Convenience registry over the a4aa-<agent> dialect crates: name lookup and full enumeration for multi-agent hosts. Single-agent hosts should depend on the individual a4aa-<agent> crate directly instead."
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -14,20 +14,20 @@ name = "a4aa_dialects"
 path = "src/lib.rs"
 
 [dependencies]
-a4aa = { path = "../..", version = "0.2.2" }
-a4aa-antigravity = { path = "../a4aa-antigravity", version = "0.2.2" }
-a4aa-claude = { path = "../a4aa-claude", version = "0.2.2" }
-a4aa-codex = { path = "../a4aa-codex", version = "0.2.2" }
-a4aa-command-code = { path = "../a4aa-command-code", version = "0.2.2" }
-a4aa-cursor = { path = "../a4aa-cursor", version = "0.2.2" }
-a4aa-devin = { path = "../a4aa-devin", version = "0.2.2" }
-a4aa-dsh = { path = "../a4aa-dsh", version = "0.2.2" }
-a4aa-factory = { path = "../a4aa-factory", version = "0.2.2" }
-a4aa-grok = { path = "../a4aa-grok", version = "0.2.2" }
-a4aa-hermes = { path = "../a4aa-hermes", version = "0.2.2" }
-a4aa-kilo-code = { path = "../a4aa-kilo-code", version = "0.2.2" }
-a4aa-kimi-code = { path = "../a4aa-kimi-code", version = "0.2.2" }
-a4aa-kiro = { path = "../a4aa-kiro", version = "0.2.2" }
-a4aa-open-claw = { path = "../a4aa-open-claw", version = "0.2.2" }
-a4aa-opencode = { path = "../a4aa-opencode", version = "0.2.2" }
-a4aa-pi = { path = "../a4aa-pi", version = "0.2.2" }
+a4aa = { path = "../..", version = "0.3.0" }
+a4aa-antigravity = { path = "../a4aa-antigravity", version = "0.3.0" }
+a4aa-claude = { path = "../a4aa-claude", version = "0.3.0" }
+a4aa-codex = { path = "../a4aa-codex", version = "0.3.0" }
+a4aa-command-code = { path = "../a4aa-command-code", version = "0.3.0" }
+a4aa-cursor = { path = "../a4aa-cursor", version = "0.3.0" }
+a4aa-devin = { path = "../a4aa-devin", version = "0.3.0" }
+a4aa-dsh = { path = "../a4aa-dsh", version = "0.3.0" }
+a4aa-factory = { path = "../a4aa-factory", version = "0.3.0" }
+a4aa-grok = { path = "../a4aa-grok", version = "0.3.0" }
+a4aa-hermes = { path = "../a4aa-hermes", version = "0.3.0" }
+a4aa-kilo-code = { path = "../a4aa-kilo-code", version = "0.3.0" }
+a4aa-kimi-code = { path = "../a4aa-kimi-code", version = "0.3.0" }
+a4aa-kiro = { path = "../a4aa-kiro", version = "0.3.0" }
+a4aa-open-claw = { path = "../a4aa-open-claw", version = "0.3.0" }
+a4aa-opencode = { path = "../a4aa-opencode", version = "0.3.0" }
+a4aa-pi = { path = "../a4aa-pi", version = "0.3.0" }

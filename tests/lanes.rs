@@ -1064,7 +1064,7 @@ async fn sidecar_shared_close_terminates_active_turns_and_eof_closes_remaining_s
     let mut cleanup = FixtureCleanup(Vec::new());
     let modes = ["acp", "rpc", "cli", "pty", "eof"];
     tokio::time::timeout(test_settings::WAIT_BUDGET * modes.len() as u32,async {
-        let mut child=tokio::process::Command::new(FIXTURE).arg("serve")
+        let mut child=tokio::process::Command::new(FIXTURE).arg("serve").arg("--trust-host-env")
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().unwrap();
         let (tx,mut rx)=mpsc::unbounded_channel();
@@ -1161,6 +1161,7 @@ impl a4aa::RpcDelegate for SidecarEvents {
 async fn sidecar_drives_fixture_end_to_end() {
     let mut child = tokio::process::Command::new(FIXTURE)
         .arg("serve")
+        .arg("--trust-host-env")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1548,6 +1549,7 @@ async fn acp_agent_info_and_session_state_are_exposed() {
 async fn sidecar_session_options_and_structured_errors() {
     let mut child = tokio::process::Command::new(FIXTURE)
         .arg("serve")
+        .arg("--trust-host-env")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1686,6 +1688,7 @@ time.sleep(3600)
             };
             let mut child = tokio::process::Command::new(FIXTURE)
                 .arg("serve")
+                .arg("--trust-host-env")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -1850,6 +1853,7 @@ signal.pause()
         };
         let mut child = tokio::process::Command::new(FIXTURE)
             .arg("serve")
+            .arg("--trust-host-env")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -1971,6 +1975,7 @@ signal.pause()
             };
             let mut child = tokio::process::Command::new(FIXTURE)
                 .arg("serve")
+                .arg("--trust-host-env")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -2077,7 +2082,7 @@ for line in sys.stdin:
             },
         };
         let mut child = tokio::process::Command::new(FIXTURE)
-            .arg("serve")
+            .arg("serve").arg("--trust-host-env")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
