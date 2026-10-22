@@ -129,6 +129,7 @@ pub const AGENT: AgentCard = AgentCard {
                 "--respect-workspace-trust",
                 "false",
             ],
+            trusted_workspace_args: &[],
             prompt_channel: PromptChannel::ArgOnly,
             stream: StreamMode::Stdio,
             resume_spawn_args: &[],

@@ -286,13 +286,20 @@ async fn cursor_default_argv_preserves_native_approval_policy() {
         .unwrap();
     let args: Vec<_> = output.text.lines().collect();
     assert!(args.contains(&"--print"));
-    // --trust only admits the workspace directory the host dispatched —
-    // headless cursor cannot run untrusted — while the permission-bypass
-    // flags stay out of the default argv.
-    assert!(args.contains(&"--trust"));
+    // The default card never grants workspace trust: --trust materializes
+    // only through spec_trusting_workspace() — the host's explicit opt-in
+    // for the directory it dispatches — and the permission-bypass flags
+    // stay out of every argv.
+    assert!(!args.contains(&"--trust"));
     for bypass in ["--force", "--approve-mcps", "--yolo"] {
         assert!(!args.contains(&bypass));
     }
+
+    let trusted: Vec<String> = match a4aa_cursor::card().spec_trusting_workspace().lane {
+        a4aa::LaneSpec::Cli(cli) => cli.args,
+        _ => panic!("cursor drives the cli lane"),
+    };
+    assert!(trusted.iter().any(|arg| arg == "--trust"));
 }
 
 #[tokio::test]

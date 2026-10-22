@@ -20,6 +20,8 @@
 //! surface, and no secret or user path is ever stored in one (`{home}` and
 //! `{sessionId}` are placeholders the consumer expands).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
@@ -64,7 +66,7 @@ impl AgentCard {
     /// `sessionResume`/`resumeArgs` surface — a spec that cannot express
     /// resume fails closed at open.
     pub fn spec(&self) -> AgentSpec {
-        self.spec_for(&self.surface, self.detect.binaries.first().copied())
+        self.spec_for(&self.surface, self.detect.binaries.first().copied(), false)
     }
 
     /// The primary spec plus each declared alternate, in order — the
@@ -78,12 +80,47 @@ impl AgentCard {
                     alternate
                         .binary
                         .or_else(|| self.detect.binaries.first().copied()),
+                    false,
                 )
             }))
             .collect()
     }
 
-    fn spec_for(&self, surface: &AgentSurface, binary: Option<&'static str>) -> AgentSpec {
+    /// The materialized spec plus the card's `trusted_workspace_args`.
+    /// Call only when the workspace this host will dispatch is one it is
+    /// willing to grant: those arguments mark the dispatched directory
+    /// trusted (for example cursor's `--trust`). `spec()` never includes
+    /// them — trusting a workspace is the host's explicit decision, not
+    /// the card's default.
+    pub fn spec_trusting_workspace(&self) -> AgentSpec {
+        self.spec_for(
+            &self.surface,
+            self.detect.binaries.first().copied(),
+            true,
+        )
+    }
+
+    /// `spec_trusting_workspace()` plus each alternate.
+    pub fn specs_trusting_workspace(&self) -> Vec<AgentSpec> {
+        std::iter::once(self.spec_trusting_workspace())
+            .chain(self.alternates.iter().map(|alternate| {
+                self.spec_for(
+                    &alternate.surface,
+                    alternate
+                        .binary
+                        .or_else(|| self.detect.binaries.first().copied()),
+                    true,
+                )
+            }))
+            .collect()
+    }
+
+    fn spec_for(
+        &self,
+        surface: &AgentSurface,
+        binary: Option<&'static str>,
+        trust_workspace: bool,
+    ) -> AgentSpec {
         let lane = match surface {
             AgentSurface::Acp {
                 prefer_load,
@@ -95,7 +132,18 @@ impl AgentCard {
                 auth_key: auth_key.map(AcpAuthKey::source),
             },
             AgentSurface::Cli(cli) => LaneSpec::Cli(Box::new(CliLaneSpec {
-                args: cli.args.iter().map(|arg| (*arg).to_owned()).collect(),
+                args: {
+                    let mut args: Vec<String> =
+                        cli.args.iter().map(|arg| (*arg).to_owned()).collect();
+                    if trust_workspace {
+                        args.extend(
+                            cli.trusted_workspace_args
+                                .iter()
+                                .map(|arg| (*arg).to_owned()),
+                        );
+                    }
+                    args
+                },
                 prompt_channel: cli.prompt_channel,
                 stream: cli.stream,
                 resume_args: cli
@@ -209,7 +257,9 @@ impl AgentCard {
                     .map(|arg| (*arg).to_owned())
                     .collect(),
                 cwd: None,
-                env: EnvPolicy::default(),
+                env: EnvPolicy::InheritAll {
+                    set: BTreeMap::new(),
+                },
             },
             max_output_bytes: None,
         }
@@ -293,6 +343,12 @@ pub struct CliSurface {
     /// Fixed argv template; `{prompt}`/`{model}`/`{effort}`/`{mode}`/
     /// `{permission}`/`{instructions}` placeholders substitute per turn.
     pub args: &'static [&'static str],
+    /// argv materialized only through `spec_trusting_workspace()` — flags
+    /// that grant the dispatched workspace elevated trust (cursor's
+    /// `--trust`). A card declares them separately so adopting the card
+    /// never silently grants workspace trust; the custody host opts in
+    /// for the workspace it dispatches.
+    pub trusted_workspace_args: &'static [&'static str],
     pub prompt_channel: PromptChannel,
     pub stream: StreamMode,
     /// argv appended when a session binding exists (`{sessionId}`
