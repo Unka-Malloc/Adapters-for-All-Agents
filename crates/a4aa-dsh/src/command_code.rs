@@ -91,6 +91,8 @@ fn base_url_has_private_host(base_url: &str) -> bool {
         authority.split(':').next().unwrap_or_default()
     }
     .to_ascii_lowercase();
+    // A trailing-dot FQDN names the same host as its bare form.
+    let host = host.trim_end_matches('.');
     if host.is_empty()
         || host == "localhost"
         || host.ends_with(".localhost")
@@ -112,7 +114,21 @@ fn base_url_has_private_host(base_url: &str) -> bool {
                 || (address.segments()[0] & 0xffc0) == 0xfe80
                 || (address.segments()[0] & 0xfe00) == 0xfc00
         }
-        Err(_) => false,
+        // Non-canonical IP spellings — 2130706433, 0x7f000001, 127.1,
+        // 0177.0.0.1 — fail IpAddr parsing but system resolvers still
+        // read them as loopback or private destinations, so reject any
+        // host spelled purely in numeric/dotted/hex form.
+        Err(_) => {
+            // A ':' or '%' only reaches here from bracketed IPv6 content
+            // that failed to parse — malformed or zone-scoped literals are
+            // never public hosts. Otherwise reject purely numeric/
+            // dotted/hex spellings (2130706433, 0x7f000001, 127.1).
+            host.contains([':', '%'])
+                || (host.bytes().any(|b| b.is_ascii_digit())
+                    && host
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() || matches!(b, b'.' | b'x' | b'X')))
+        }
     }
 }
 
@@ -384,6 +400,12 @@ mod tests {
             "https://[::ffff:127.0.0.1]/v1",
             "https://[::ffff:10.0.0.9]/v1",
             "https://[::ffff:169.254.169.254]/v1",
+            // Non-canonical spellings resolvers still read as loopback.
+            "https://2130706433/v1",
+            "https://0x7f000001/v1",
+            "https://127.1/v1",
+            "https://localhost./v1",
+            "https://[fe80::1%25eth0]/v1",
         ] {
             assert_eq!(
                 command_code_patch(CREDENTIALS, url, &models),

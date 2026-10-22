@@ -1,11 +1,13 @@
 //! Agent process environment policy.
 //!
-//! Agents inherit the user's real environment by default ([`EnvPolicy::InheritAll`]):
-//! the user's machine is the source of truth, and explicit `set` entries layer
-//! resolved overrides (`Literal`, `HostEnv`, or host-resolved `Secret`) on top.
-//! [`EnvPolicy::Sanitized`] remains available when a caller explicitly asks for
-//! an allowlist-only environment, and [`INHERITED_ENV`] defines the inert host
-//! variable names an untrusted sidecar caller may reference by name over the wire.
+//! [`EnvPolicy::Sanitized`] is the default: a spec materializes an
+//! allowlist-only environment and adopting it never exposes host
+//! credentials. [`EnvPolicy::InheritAll`] — the user's real environment as
+//! the source of truth — exists only through a host's explicit opt-in, and
+//! [`INHERITED_ENV`] defines the inert host variable names an untrusted
+//! sidecar caller may reference by name over the wire. Explicit `set`
+//! entries layer resolved overrides (`Literal`, `HostEnv`, or
+//! host-resolved `Secret`) on top of either base.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

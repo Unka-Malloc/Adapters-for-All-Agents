@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Verify-train run id to publish from
+        description: Completed `verify` run id to publish from; validated before use
         required: true
 
 permissions: {}
@@ -43,6 +43,7 @@ jobs:
       actions: read
     outputs:
       run_id: ${{ env.RUN_ID }}
+      mode: ${{ steps.load.outputs.mode }}
       sha: ${{ steps.load.outputs.sha }}
       branch: ${{ steps.load.outputs.branch }}
       release: ${{ steps.load.outputs.release }}
@@ -53,10 +54,27 @@ jobs:
     env:
       RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
     steps:
+      # A manual dispatch names the run to publish from; binding only holds
+      # if that run is this repository's `verify` train and it completed
+      # successfully. workflow_run ids are already bound by the trigger.
+      - name: Bind the run to the verify train
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json name,conclusion,headSha | python3 -c "
+          import json, sys
+          run = json.load(sys.stdin)
+          assert run['name'] == 'verify', f\"not a verify run: {run['name']}\"
+          assert run['conclusion'] == 'success', f\"run did not succeed: {run['conclusion']}\"
+          "
+
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           name: release-inputs
           run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
           path: release-inputs
 
       # The inputs file is KEY=VALUE pairs written by the verify job's own
@@ -69,6 +87,7 @@ jobs:
       github.ref_name == github.event.repository.default_branch &&
       (github.event_name == 'workflow_dispatch' ||
        github.event.workflow_run.conclusion == 'success') &&
+      needs.gate.outputs.mode == 'live' &&
       needs.gate.outputs.release == 'true'
     needs: gate
     runs-on: ubuntu-latest
@@ -76,6 +95,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+      actions: read
       id-token: write
     env:
       RELEASE_MODE: live
@@ -105,6 +125,7 @@ jobs:
           name: release-set-${{ needs.gate.outputs.sha }}
           path: release-set
           run-id: ${{ needs.gate.outputs.run_id }}
+          github-token: ${{ github.token }}
 
       # The version bump was authored under the read-only token; here it is
       # only a patch the release job replays onto the candidate tree.
