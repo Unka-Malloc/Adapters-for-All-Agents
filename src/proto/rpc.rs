@@ -513,7 +513,14 @@ impl RpcLane {
                     ));
                 }
                 let url = announce_endpoint(stdout, announce).await?;
-                let ws = crate::transport::ws::connect(&url).await?;
+                let ws = crate::transport::ws::connect(
+                    &url,
+                    self.spec
+                        .max_frame_bytes
+                        .unwrap_or(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)
+                        .max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES),
+                )
+                .await?;
                 // The daemon's stdin pipe stays open (the server never
                 // reads it) and stdout keeps carrying log output — drain
                 // both so a chatty server never blocks on a full pipe.
@@ -1150,7 +1157,12 @@ async fn announce_endpoint(
     announce: &str,
 ) -> Result<String, AdapterError> {
     use tokio::io::AsyncBufReadExt;
-    let mut reader = tokio::io::BufReader::new(&mut stdout);
+    use tokio::io::AsyncReadExt;
+    // An endpoint announcement is a few hundred bytes; cap the whole
+    // pre-announcement read so an unterminated line cannot grow the
+    // startup buffer without bound.
+    const MAX_ANNOUNCE_BYTES: u64 = 64 * 1024;
+    let mut reader = tokio::io::BufReader::new((&mut stdout).take(MAX_ANNOUNCE_BYTES));
     let mut line = String::new();
     let url = loop {
         line.clear();
@@ -1161,7 +1173,7 @@ async fn announce_endpoint(
         if read == 0 {
             return Err(
                 AdapterError::uncertain("agent_transport_failed", "rpc/open")
-                    .with_detail("daemon exited before announcing its WebSocket endpoint"),
+                    .with_detail("daemon produced no WebSocket endpoint announcement"),
             );
         }
         if let Some(rest) = line.trim().strip_prefix(announce) {
