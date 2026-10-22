@@ -276,7 +276,7 @@ where
 {
     let mut lines = BufReader::new(stdout).lines();
     let mut base = None;
-    let mut password = None;
+    let mut password: Option<String> = None;
     for _ in 0..DISCOVERY_LINES {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
@@ -289,10 +289,17 @@ where
                 ));
             }
         };
-        let observed: &[u8] = if line.starts_with("server password ") {
+        // Any line carrying the announcement's credential — the password
+        // line itself or a later echo — reaches observers only with the
+        // secret replaced.
+        let redacted = match &password {
+            Some(secret) => line.replace(secret.as_str(), "<redacted>"),
+            None => line.clone(),
+        };
+        let observed: &[u8] = if redacted.starts_with("server password ") {
             b"server password <redacted>"
         } else {
-            line.as_bytes()
+            redacted.as_bytes()
         };
         if let Some(observer) = observer.as_ref() {
             observer.record("stdout", Direction::Received, observed);
@@ -705,8 +712,8 @@ mod tests {
             }
         }
         let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
-        let feed =
-            "server listening on http://127.0.0.1:9000\nserver password s3cret-value\n".as_bytes();
+        let feed = "server password s3cret-value\nnote: s3cret-value echoed\nserver listening on http://127.0.0.1:9000\n"
+            .as_bytes();
         let endpoint = discover(feed, Some(seen.clone())).await.unwrap();
         assert_eq!(endpoint.auth, base64(b"opencode:s3cret-value"));
         for line in seen.0.lock().unwrap().iter() {
@@ -715,6 +722,12 @@ mod tests {
                 "observer received the raw password line"
             );
         }
+        assert!(seen
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == b"note: <redacted> echoed"));
         assert!(seen
             .0
             .lock()
