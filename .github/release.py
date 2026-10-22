@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generated release train helper; regenerate it instead of editing this copy.
+.github/release.lock records the source inputs that produced it.
 
 Every subcommand runs inside the repository checkout, writes step outputs to
 $GITHUB_OUTPUT and a readable report to $GITHUB_STEP_SUMMARY. RELEASE_KIND
@@ -514,7 +515,7 @@ def cmd_freshness(args: argparse.Namespace) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="train.py")
+    root = argparse.ArgumentParser(prog="release.py")
     commands = root.add_subparsers(dest="command", required=True)
     candidate = commands.add_parser("candidate")
     candidate.add_argument("--weekday", choices=WEEKDAYS, required=True)

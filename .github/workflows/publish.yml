@@ -1,6 +1,6 @@
 # Generated release train for Adapter-For-All-Agents.
-# Edit the release declaration and regenerate instead of changing this file
-# by hand.
+# Regenerate from the release declaration instead of editing this file by
+# hand; .github/release.lock records the source inputs that produced it.
 #
 # This file holds the only job trusted with the crates.io OIDC identity.
 # Registries bind trusted publishing to this filename, which is why the
@@ -180,10 +180,6 @@ jobs:
       NEXT: ${{ needs.gate.outputs.next }}
       NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
       EXCLUDES: ${{ needs.gate.outputs.excludes }}
-      # An isolated cargo home plus running cargo from outside the checkout
-      # keeps a candidate .cargo/config.toml — a credential provider is an
-      # executable — from ever loading under the OIDC token.
-      CARGO_HOME: ${{ runner.temp }}/cargo-home
     defaults:
       run:
         shell: bash
@@ -199,6 +195,13 @@ jobs:
           path: Adapter-For-All-Agents
           ref: ${{ needs.gate.outputs.sha }}
           fetch-depth: 0
+
+      # An isolated cargo home plus running cargo from outside the checkout
+      # keeps a candidate .cargo/config.toml — a credential provider is an
+      # executable — from ever loading under the OIDC token. The runner
+      # context is unavailable in job env, and this step must run after
+      # checkout has created the job's default working directory.
+      - run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 

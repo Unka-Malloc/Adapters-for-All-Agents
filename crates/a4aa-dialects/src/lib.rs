@@ -223,7 +223,7 @@ mod tests {
             );
         }
         assert!(
-            doc.contains("python3 .github/release-train.py freshness"),
+            doc.contains("python3 .github/release.py freshness"),
             "master table must name the release freshness command"
         );
     }

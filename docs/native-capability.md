@@ -11,7 +11,7 @@ binary and vendor docs before a release. The train refuses a candidate
 whose dates fall outside the freshness window:
 
 ```
-python3 .github/release-train.py freshness --window-days=14
+python3 .github/release.py freshness --window-days=14
 ```
 
 Cell vocabulary (matches `a4aa::NativeStatus` kebab-case):

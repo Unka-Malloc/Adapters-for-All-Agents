@@ -59,7 +59,7 @@ Each adapter crate also publishes a dated native-capability table
 surfaces, MCP registration, config locations, and AwP primitives.
 [`docs/native-capability.md`](docs/native-capability.md) is the aggregated
 master table. `last_verified` is a release gate
-(`python3 .github/release-train.py freshness`).
+(`python3 .github/release.py freshness`).
 
 ## Invariants
 
