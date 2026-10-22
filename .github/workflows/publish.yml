@@ -2,196 +2,194 @@
 # Edit the release declaration and regenerate instead of changing this file
 # by hand.
 #
-# Three ways to release, one pipeline:
+# This file holds the only job trusted with the crates.io OIDC identity.
+# Registries bind trusted publishing to this filename, which is why the
+# OIDC job lives here and not in the candidate-triggered `verify.yml`.
+# It never runs on a candidate ref: `workflow_run` executes the default
+# branch's copy of this file after the `verify` train completes, and a
+# manual dispatch is confined to the default branch by the job condition
+# below. The candidate supplies verified artifacts only — the workflow
+# definition itself is outside its reach.
 #
-# - Weekly train: every Fri through 23:59 UTC+08:00 (Asia/Shanghai). The candidate
-#   is the last commit merged into `nightly` (the default branch until the
-#   repository adopts `nightly`) before the cutoff. The bump is the highest
-#   `release:patch`, `release:minor` or `release:major` label among its pull
-#   requests, patch when none is set. The train runs as a rehearsal.
-# - Run workflow: releases the head of `nightly` (or the requested commit)
-#   now, at the version typed in or bumped by the chosen level.
-# - Tag push: pushing `v<version>` publishes that commit; its manifests must
-#   already carry that version.
-#
-# A candidate identical to the last published release is skipped. A failed
-# step stops the run until a person reruns it; a rerun finishes a partly
-# uploaded version instead of skipping past it.
-#
-# Two jobs split at the trust boundary. `verify` runs on every trigger with a
-# read-only token: it selects, waits on siblings, verifies, versions and
-# packages the candidate, then hands the `.crate` set over as an artifact.
-# `release` runs only when `verify` qualified a release; it holds the OIDC
-# token and replays those verified artifacts to crates.io — no
-# candidate-controlled code executes under the publishing identity — then
-# moves `stable`, tags the release on `release` with a GitHub release, and
-# merges it back into `nightly`.
+# `gate` downloads the verify run's `release-inputs` artifact and exposes
+# its fields as job outputs. `release` then replays the already-verified
+# `.crate` set: no candidate-controlled code executes under the publishing
+# identity.
 #
 # Credentials: crates.io Trusted Publishing; no stored secret.
 name: publish
 
 on:
-  schedule:
-    - cron: "0 16 * * 5"
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["verify"]
+    types: [completed]
   workflow_dispatch:
     inputs:
-      version:
-        description: Exact version to publish, such as 0.3.0; empty bumps by level
-        required: false
-        default: ""
-      level:
-        description: Bump level when no version is given
-        type: choice
-        options: [patch, minor, major]
-        default: patch
-      candidate:
-        description: Commit or branch to release; empty takes the head of nightly
-        required: false
-        default: ""
-      rehearse:
-        description: Rehearse only; nothing is pushed, tagged or uploaded
-        type: boolean
-        default: false
+      run_id:
+        description: Verify-train run id to publish from
+        required: true
 
 permissions: {}
 
 concurrency:
-  group: release-train
+  group: release-train-publish
   cancel-in-progress: false
 
 jobs:
-  verify:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    outputs:
+      run_id: ${{ env.RUN_ID }}
+      sha: ${{ steps.load.outputs.sha }}
+      branch: ${{ steps.load.outputs.branch }}
+      release: ${{ steps.load.outputs.release }}
+      kind: ${{ steps.load.outputs.kind }}
+      next: ${{ steps.load.outputs.next }}
+      needs_set: ${{ steps.load.outputs.needs_set }}
+      excludes: ${{ steps.load.outputs.excludes }}
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: release-inputs
+          run-id: ${{ env.RUN_ID }}
+          path: release-inputs
+
+      # The inputs file is KEY=VALUE pairs written by the verify job's own
+      # step outputs; it is data, never code, so sourcing it is safe.
+      - id: load
+        run: cat release-inputs/env >> "$GITHUB_OUTPUT"
+
+  release:
+    if: >-
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success') &&
+      needs.gate.outputs.release == 'true'
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
-      contents: read
+      contents: write
       pull-requests: read
-    outputs:
-      release: ${{ steps.version.outputs.release }}
-      next: ${{ steps.version.outputs.next }}
-      needs_set: ${{ steps.version.outputs.needs_set }}
-      excludes: ${{ steps.version.outputs.excludes }}
-      sha: ${{ steps.candidate.outputs.sha }}
-      branch: ${{ steps.candidate.outputs.branch }}
+      id-token: write
     env:
-      RELEASE_MODE: dry-run
-      RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || github.event_name == 'push' && 'tag' || 'manual' }}
-      INPUT_VERSION: ${{ inputs.version }}
-      INPUT_LEVEL: ${{ inputs.level }}
+      RELEASE_MODE: live
+      RELEASE_KIND: ${{ needs.gate.outputs.kind }}
       SIBLINGS: '[]'
+      CANDIDATE: ${{ needs.gate.outputs.sha }}
+      BRANCH: ${{ needs.gate.outputs.branch }}
+      NEXT: ${{ needs.gate.outputs.next }}
+      NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
+      EXCLUDES: ${{ needs.gate.outputs.excludes }}
     defaults:
       run:
         shell: bash
         working-directory: Adapter-For-All-Agents
     steps:
+      # Git refs move inside this job, so the candidate is checked out; no
+      # candidate-controlled code runs here — publishing replays the verified
+      # artifacts produced by the verify train.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: Adapter-For-All-Agents
+          ref: ${{ needs.gate.outputs.sha }}
           fetch-depth: 0
 
-      # Copied before the candidate checkout replaces the working tree, so the
-      # helper always matches this workflow.
-      - name: Stage the train helper
-        run: cp .github/release-train.py "$RUNNER_TEMP/train.py"
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: release-set-${{ needs.gate.outputs.sha }}
+          path: release-set
+          run-id: ${{ needs.gate.outputs.run_id }}
 
-      - name: Select the candidate
-        id: candidate
+      # The version bump was authored under the read-only token; here it is
+      # only a patch the release job replays onto the candidate tree.
+      - name: Commit the release version
+        if: env.RELEASE_KIND != 'tag' && env.NEEDS_SET == 'true'
+        run: |
+          git apply "$GITHUB_WORKSPACE/release-set/version-bump.patch"
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qam "release: v$NEXT"
+
+      - name: Promote the candidate to stable
+        if: env.RELEASE_KIND != 'tag'
+        run: git push origin "$CANDIDATE:refs/heads/stable"
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # The whole upload loop lives in this workflow — the only file the OIDC
+      # trust is bound to. Nothing from the candidate checkout executes here:
+      # the .crate payloads are data, tar extracts them, and `cargo publish
+      # --no-verify` packages files without compiling or running build scripts.
+      - name: Publish the verified release set to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          SET: ${{ github.workspace }}/release-set
+        run: |
+          index_path() {
+            case ${#1} in
+              1) echo "1/$1";;
+              2) echo "2/$1";;
+              3) echo "3/${1:0:1}/$1";;
+              *) echo "${1:0:2}/${1:2:2}/$1";;
+            esac
+          }
+          published() { curl -fsSL "https://index.crates.io/$(index_path "$1")" | grep -q "\"vers\":\"$2\""; }
+          while IFS=$'\t' read -r name vers; do
+            [ -n "$name" ] || continue
+            if published "$name" "$vers"; then
+              echo "$name $vers is already on crates.io"
+              continue
+            fi
+            dir="$(mktemp -d)"
+            tar -xzf "$SET/$name-$vers.crate" -C "$dir"
+            package="$(find "$dir" -mindepth 1 -maxdepth 1 -type d)"
+            rm -f "$package/Cargo.toml.orig"
+            # A packaged .cargo/config.toml could name a credential
+            # provider or redirect the registry: strip it and publish with
+            # an isolated CARGO_HOME so no package-controlled Cargo
+            # configuration executes beside the token.
+            rm -rf "$package/.cargo"
+            (cd "$package" && env "CARGO_HOME=$(mktemp -d)" cargo publish --no-verify --registry crates-io)
+            for _ in $(seq 1 60); do
+              published "$name" "$vers" && break
+              sleep 10
+            done
+            published "$name" "$vers" || { echo "::error::crates.io index still lacks $name $vers"; exit 1; }
+          done < "$SET/publish-order.txt"
+
+      - name: Tag the release
         env:
           GH_TOKEN: ${{ github.token }}
-          OVERRIDE: ${{ inputs.candidate }}
         run: |
-          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
-          python3 "$RUNNER_TEMP/train.py" candidate --weekday=fri --time=23:59 \
-            --utc-offset=+08:00 --default-branch="$default_branch" --override="$OVERRIDE"
-
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install the pinned toolchain
-        run: |
-          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
-            rustup toolchain install
+          if [ "$RELEASE_KIND" != tag ]; then
+            git tag "v$NEXT"
+            git push origin "refs/tags/v$NEXT"
           fi
+          if ! git push origin "HEAD:refs/heads/release"; then
+            # A hand-pushed tag may sit off the release line; the upload
+            # already happened, so only the branch pointer is left behind.
+            [ "$RELEASE_KIND" = tag ] || exit 1
+            echo "::warning::release branch not moved: v$NEXT is not a fast-forward of it"
+          fi
+          gh release view "v$NEXT" >/dev/null 2>&1 ||
+            gh release create "v$NEXT" --verify-tag --generate-notes --title "v$NEXT"
 
-      - name: Wait for cross-repository dependencies
-        id: deps
-        run: python3 "$RUNNER_TEMP/train.py" deps --wait-minutes=150
-
-      - name: Compute the release version
-        id: version
-        if: steps.deps.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CANDIDATE: ${{ steps.candidate.outputs.sha }}
-          BRANCH: ${{ steps.candidate.outputs.branch }}
-        run: python3 "$RUNNER_TEMP/train.py" version --candidate="$CANDIDATE" --branch="$BRANCH"
-
-      - name: Verify
-        if: steps.version.outputs.release == 'true'
+      - name: Merge the release back into nightly
+        if: >-
+          env.RELEASE_KIND != 'tag' && env.BRANCH == 'nightly'
         run: |
-          scripts/verify.sh
-
-      # The bump is applied here under the read-only token and shipped to the
-      # release job as a patch — the OIDC job only ever runs `git apply`.
-      - name: Apply the release version
-        if: steps.version.outputs.release == 'true' && steps.version.outputs.needs_set == 'true'
-        env:
-          NEXT: ${{ steps.version.outputs.next }}
-        run: |
-          cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
-          cargo set-version --workspace "$NEXT"
-          cargo update --workspace
-          git diff > "$RUNNER_TEMP/version-bump.patch"
-
-      # Everything publishable lands in target/package/ plus an ordered list the
-      # release job replays; packaging collects files and never runs code.
-      - name: Package
-        if: steps.version.outputs.release == 'true'
-        env:
-          EXCLUDES: ${{ steps.version.outputs.excludes }}
-        run: |
-          args=()
-          for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
-          cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
-          cargo package --workspace --allow-dirty --no-verify "${args[@]}"
-          python3 "$RUNNER_TEMP/train.py" order > target/package/publish-order.txt
-          [ -f "$RUNNER_TEMP/version-bump.patch" ] &&
-            cp "$RUNNER_TEMP/version-bump.patch" target/package/
-
-      # The release train (default branch) reads this data-only file to
-      # learn the candidate, the version decision and the kind of run; it
-      # lands for every trigger so the gate job can short-circuit cleanly
-      # on rehearsals and unqualified candidates.
-      - name: Record the release inputs
-        if: always()
-        run: |
-          mkdir -p target/release-inputs
-          cat > target/release-inputs/env <<EOF
-          sha=${{ steps.candidate.outputs.sha }}
-          branch=${{ steps.candidate.outputs.branch }}
-          release=${{ steps.version.outputs.release }}
-          kind=$RELEASE_KIND
-          next=${{ steps.version.outputs.next }}
-          needs_set=${{ steps.version.outputs.needs_set }}
-          excludes=${{ steps.version.outputs.excludes }}
-          EOF
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: release-inputs
-          path: Adapter-For-All-Agents/target/release-inputs/
-          retention-days: 7
-          if-no-files-found: error
-
-      - name: Hand the release set to the release job
-        if: steps.version.outputs.release == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-set-${{ steps.candidate.outputs.sha }}
-          path: Adapter-For-All-Agents/target/package/
-          retention-days: 5
-          if-no-files-found: error
+          git fetch -q origin nightly
+          if git merge-base --is-ancestor HEAD origin/nightly; then exit 0; fi
+          git checkout -q -B nightly origin/nightly
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            merge --no-ff --no-edit "v$NEXT"
+          git push origin nightly
