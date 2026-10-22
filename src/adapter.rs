@@ -218,9 +218,14 @@ impl AgentSession {
                     // The RPC lane's recovery contract: only an uncertain
                     // outcome poisons the next turn; a known outcome
                     // (success, failure, explicit cancel) leaves the
-                    // session usable.
+                    // session usable. An explicit quota refusal is an
+                    // answered exchange — its uncertain_effect flag guides
+                    // custody replay, not session health — so it never
+                    // poisons the session it arrived on.
                     recovery_required.store(
-                        outcome.as_ref().is_err_and(|error| error.uncertain_effect),
+                        outcome.as_ref().is_err_and(|error| {
+                            error.uncertain_effect && error.code != "agent_quota_exhausted"
+                        }),
                         Ordering::Release,
                     );
                     if let Err(error) = &outcome {

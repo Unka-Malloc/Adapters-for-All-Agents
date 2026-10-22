@@ -857,12 +857,13 @@ async fn cli_usage_limit_exit_is_quota_exhausted_not_error_outcome() {
         .open_session(SessionRequest::default(), tx)
         .await
         .expect("open");
-    // Quota text on a non-zero exit is a certain non-effect: custody may
-    // replay the turn on another candidate, so the failure is retryable.
+    // Quota text on a non-zero exit is failover-eligible, but text
+    // matching cannot prove the turn had no billable effect, so custody
+    // sees an uncertain-effect failure it may still replay.
     let error = session.prompt(turn("probe")).await.expect_err("prompt");
     assert_eq!(error.code, "agent_quota_exhausted");
     assert!(error.retryable);
-    assert!(!error.uncertain_effect);
+    assert!(error.uncertain_effect);
 }
 
 #[tokio::test]

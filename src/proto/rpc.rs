@@ -1103,11 +1103,12 @@ fn scoped_session_id(resume: Option<&str>) -> String {
 
 fn call_failure(failure: CallFailure) -> AdapterError {
     match failure {
-        // An explicit quota/capacity refusal settled before the call could
-        // take effect: report the certain, failover-eligible failure instead
-        // of a permanent remote error.
+        // An explicit quota/capacity refusal names the rejection, but the
+        // text cannot prove the turn had no billable effect: report the
+        // failover-eligible failure with its effect marked uncertain
+        // instead of a permanent remote error.
         CallFailure::Remote(error) if crate::error::quota_or_capacity_refusal(&error.message) => {
-            AdapterError::retryable("agent_quota_exhausted", "rpc/call")
+            AdapterError::uncertain("agent_quota_exhausted", "rpc/call")
                 .with_detail(format!("{} ({})", error.message, error.code))
         }
         CallFailure::Remote(error) => AdapterError::permanent("agent_remote_error", "rpc/call")
@@ -1274,7 +1275,7 @@ mod call_failure_tests {
     use crate::rpc::{CallFailure, RpcErrorObject};
 
     #[test]
-    fn explicit_quota_refusal_is_certain_failover_eligible_failure() {
+    fn explicit_quota_refusal_is_failover_eligible_failure() {
         let error = call_failure(CallFailure::Remote(RpcErrorObject {
             code: -32000,
             message: "resource_exhausted: quota exceeded for this model".into(),
@@ -1282,7 +1283,7 @@ mod call_failure_tests {
         }));
         assert_eq!(error.code, "agent_quota_exhausted");
         assert!(error.retryable);
-        assert!(!error.uncertain_effect);
+        assert!(error.uncertain_effect);
     }
 
     #[test]
