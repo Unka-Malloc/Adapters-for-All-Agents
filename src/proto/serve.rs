@@ -148,13 +148,22 @@ fn parse_response(raw: &[u8]) -> Result<Value, AdapterError> {
     };
     if !(200..300).contains(&status) {
         let text = String::from_utf8_lossy(&body);
+        let detail = format!(
+            "server answered HTTP {status}: {}",
+            bounds::bounded_prefix(&text, Some(4096))
+        );
+        // A 429/5xx body naming quota or capacity means the same thing a
+        // lane error does: custody may fail over, but the effect stays
+        // uncertain.
+        if crate::error::quota_or_capacity_refusal(&text) || status == 429 {
+            return Err(
+                AdapterError::uncertain("agent_quota_exhausted", "session/transport")
+                    .with_detail(detail),
+            );
+        }
         return Err(
-            AdapterError::permanent("agent_protocol_failed", "session/transport").with_detail(
-                format!(
-                    "server answered HTTP {status}: {}",
-                    bounds::bounded_prefix(&text, Some(4096))
-                ),
-            ),
+            AdapterError::permanent("agent_protocol_failed", "session/transport")
+                .with_detail(detail),
         );
     }
     if body.is_empty() {
@@ -554,9 +563,20 @@ impl ServeSession {
                     ));
                 }
                 Some(IdleRecord { error, .. }) => {
+                    let detail = error.unwrap_or_else(|| "turn failed".to_owned());
+                    // Same quota vocabulary as the other lanes: a served
+                    // agent's refusal text cannot prove no billable work
+                    // ran, so failover eligibility stays uncertain-effect.
+                    if crate::error::quota_or_capacity_refusal(&detail) {
+                        return Err(AdapterError::uncertain(
+                            "agent_quota_exhausted",
+                            "session/prompt",
+                        )
+                        .with_detail(detail));
+                    }
                     return Err(
                         AdapterError::permanent("agent_protocol_failed", "session/prompt")
-                            .with_detail(error.unwrap_or_else(|| "turn failed".to_owned())),
+                            .with_detail(detail),
                     );
                 }
                 None => {}
