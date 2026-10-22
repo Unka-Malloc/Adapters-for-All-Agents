@@ -95,7 +95,11 @@ impl CliLane {
             },
         )?;
         if let Some(stderr) = child.stderr() {
-            tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+            tokio::spawn(bounds::drain_stderr(
+                stderr,
+                self.observer.clone(),
+                bounds::StderrTail::default(),
+            ));
         }
         let Some(mut stdout) = child.stdout() else {
             let _ = child.terminate().await;
@@ -456,8 +460,9 @@ impl CliLane {
                 stderr: StdioKind::Preserve,
             },
         )?;
+        let stderr_tail = bounds::StderrTail::default();
         if let Some(stderr) = child.stderr() {
-            bounds::drain_stderr(stderr, self.observer.clone());
+            bounds::drain_stderr(stderr, self.observer.clone(), stderr_tail.clone());
         }
         let stdin = child.stdin();
         let stdout = child
@@ -485,8 +490,15 @@ impl CliLane {
         // The prompt write rides inside `collect`'s select so a write
         // failure keeps the child owned: the driver terminates and awaits
         // it explicitly instead of relying on `Drop`'s best effort.
-        self.collect(child, Box::new(stdout), events, output_cancelled, write)
-            .await
+        self.collect(
+            child,
+            Box::new(stdout),
+            events,
+            output_cancelled,
+            write,
+            stderr_tail,
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -498,8 +510,9 @@ impl CliLane {
         mut cancelled: watch::Receiver<()>,
     ) -> Result<TurnOutcome, AdapterError> {
         let (mut child, master) = crate::transport::pty::spawn(command)?;
+        let stderr_tail = bounds::StderrTail::default();
         if let Some(stderr) = child.stderr() {
-            bounds::drain_stderr(stderr, self.observer.clone());
+            bounds::drain_stderr(stderr, self.observer.clone(), stderr_tail.clone());
         }
         let master = master.with_observer(self.observer.clone());
         let writer = master.writer();
@@ -517,8 +530,15 @@ impl CliLane {
             Ok::<(), AdapterError>(())
         };
         // Same ownership as run_stdio: the write rides inside `collect`.
-        self.collect(child, Box::new(master), events, output_cancelled, write)
-            .await
+        self.collect(
+            child,
+            Box::new(master),
+            events,
+            output_cancelled,
+            write,
+            stderr_tail,
+        )
+        .await
     }
 
     /// Drain the output stream, emitting chunks, until EOF. There is no
@@ -534,6 +554,7 @@ impl CliLane {
         events: mpsc::UnboundedSender<AgentEvent>,
         mut cancelled: watch::Receiver<()>,
         write: W,
+        stderr_tail: bounds::StderrTail,
     ) -> Result<TurnOutcome, AdapterError> {
         // Turn accumulators: retained text (fallback), NDJSON carry,
         // last-seen usage, and the authoritative result-record text.
@@ -639,15 +660,29 @@ impl CliLane {
                 result.map_err(|e| AdapterError::io("agent_process_wait_failed", "process/wait", e))?
             }
         };
+        let succeeded = exit.is_some_and(|status| status.success());
+        if !succeeded {
+            // The child's own error text names quota, capacity and model
+            // refusals a flattened "error" stop reason would lose: surface
+            // them as a typed failure so custody can fail over to another
+            // candidate instead of retrying in place.
+            let tail = stderr_tail.text();
+            let haystack = format!("{tail}\n{}", state.output);
+            if crate::error::quota_or_capacity_refusal(&haystack) {
+                let detail = tail
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::trim)
+                    .unwrap_or("child exited non-zero");
+                return Err(AdapterError::retryable("agent_quota_exhausted", "cli/turn")
+                    .with_detail(detail.to_string()));
+            }
+        }
         Ok(TurnOutcome {
             // `ExitStatus::code()` is `None` when a signal killed the child;
             // success is judged by `success()`, never by a missing code.
-            stop_reason: if exit.is_some_and(|status| status.success()) {
-                "end_turn"
-            } else {
-                "error"
-            }
-            .to_owned(),
+            stop_reason: if succeeded { "end_turn" } else { "error" }.to_owned(),
             text: state.result_text.unwrap_or(state.output),
             truncated: state.truncated,
             exit_code: exit.and_then(|status| status.code()),

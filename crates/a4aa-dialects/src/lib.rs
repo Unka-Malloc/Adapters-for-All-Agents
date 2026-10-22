@@ -11,9 +11,9 @@
 //! that keeps the dependency graph (and compile time) at exactly one
 //! descriptor. Nothing in `a4aa` core requires this registry.
 
-use a4aa::Dialect;
 use a4aa::card::AgentCard;
 use a4aa::native::NativeCapability;
+use a4aa::Dialect;
 
 /// `(name, descriptor)` pairs for every adapter crate in the workspace.
 /// Names match each adapter's `Dialect::id`.
