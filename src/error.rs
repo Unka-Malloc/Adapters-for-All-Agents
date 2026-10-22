@@ -77,4 +77,32 @@ impl fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// Whether agent output or a protocol error names a quota, capacity or
+/// model-availability refusal. A refusal is a certain non-effect — the
+/// turn was rejected before it ran — so a different candidate may safely
+/// replay it. The needles match the refusal text vendors actually print
+/// (rate limits, usage and spend caps, missing or unavailable models).
+pub(crate) fn quota_or_capacity_refusal(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "rate limit",
+        "ratelimit",
+        "too many requests",
+        "resource_exhausted",
+        "quota",
+        "insufficient_quota",
+        "usage limit",
+        "usage_limit",
+        "spend limit",
+        "overloaded",
+        "model unavailable",
+        "model not found",
+        "no such model",
+        "model does not exist",
+        "unsupported model",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 pub type Result<T> = std::result::Result<T, AdapterError>;

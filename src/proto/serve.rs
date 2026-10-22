@@ -354,7 +354,11 @@ impl ServeLane {
         let (stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
         drop(stdin);
         if let Some(stderr) = stderr {
-            tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+            tokio::spawn(bounds::drain_stderr(
+                stderr,
+                self.observer.clone(),
+                bounds::StderrTail::default(),
+            ));
         }
         let endpoint = match discover(stdout, self.observer.clone()).await {
             Ok(endpoint) => endpoint,

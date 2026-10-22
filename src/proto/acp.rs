@@ -516,7 +516,11 @@ impl AcpLane {
         let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
         let (child_stdin, child_stdout, child_stderr) = stdio::protocol_halves(&mut child)?;
         if let Some(stderr) = child_stderr {
-            tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+            tokio::spawn(bounds::drain_stderr(
+                stderr,
+                self.observer.clone(),
+                bounds::StderrTail::default(),
+            ));
         }
 
         let client_name = self.client_name.clone();
@@ -1444,32 +1448,12 @@ fn protocol_failure(stage: &'static str, error: agent_client_protocol::Error) ->
     // Everything else stays uncertain — a dropped connection mid-turn
     // could have already done billable work.
     if error.code == agent_client_protocol::ErrorCode::AuthRequired
-        && !quota_or_capacity_refusal(&error)
+        && !crate::error::quota_or_capacity_refusal(&error.to_string())
     {
         AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
     } else {
         AdapterError::uncertain("agent_protocol_failed", stage).with_detail(error.to_string())
     }
-}
-
-fn quota_or_capacity_refusal(error: &agent_client_protocol::Error) -> bool {
-    let text = error.to_string().to_lowercase();
-    [
-        "rate limit",
-        "ratelimit",
-        "too many requests",
-        "resource_exhausted",
-        "quota",
-        "insufficient_quota",
-        "overloaded",
-        "model unavailable",
-        "model not found",
-        "no such model",
-        "model does not exist",
-        "unsupported model",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
 }
 
 fn stop_reason(reason: &StopReason) -> &'static str {

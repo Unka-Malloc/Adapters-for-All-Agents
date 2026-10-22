@@ -841,6 +841,50 @@ async fn cli_argv_placeholder_skips_stdin() {
 }
 
 #[tokio::test]
+async fn cli_usage_limit_exit_is_quota_exhausted_not_error_outcome() {
+    let adapter = Adapter::new(cli_spec(
+        "sh",
+        vec![
+            "-c".into(),
+            "echo 'ActionRequiredError: You have hit your usage limit' >&2; exit 1".into(),
+        ],
+        PromptChannel::Stdin,
+        StreamMode::Stdio,
+        None,
+    ));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open");
+    // Quota text on a non-zero exit is a certain non-effect: custody may
+    // replay the turn on another candidate, so the failure is retryable.
+    let error = session.prompt(turn("probe")).await.expect_err("prompt");
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert!(error.retryable);
+    assert!(!error.uncertain_effect);
+}
+
+#[tokio::test]
+async fn cli_unclassified_nonzero_exit_stays_error_outcome() {
+    let adapter = Adapter::new(cli_spec(
+        "sh",
+        vec!["-c".into(), "echo boom >&2; exit 1".into()],
+        PromptChannel::Stdin,
+        StreamMode::Stdio,
+        None,
+    ));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open");
+    let outcome = session.prompt(turn("probe")).await.expect("prompt");
+    assert_eq!(outcome.stop_reason, "error");
+    assert_eq!(outcome.exit_code, Some(1));
+}
+
+#[tokio::test]
 async fn cli_effort_folds_into_the_model_suffix() {
     let mut spec = cli_spec(
         "echo",

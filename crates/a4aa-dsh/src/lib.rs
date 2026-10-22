@@ -24,10 +24,10 @@ use a4aa::dialect::{
 use a4aa::{AdaptationPlan, AgentSpec, Dialect, MechanismSet, SessionScope};
 
 pub use command_code::{
-    ACP_PROFILE_PATCH, AdvertisedModel, AdvertisedProvider, COMMAND_CODE_API_KEY_ENV,
-    COMMAND_CODE_BASE_URL, COMMAND_CODE_PROVIDER, CommandCodeModel, CommandCodeMountError,
-    PI_AI_PATCH_ID, PI_AI_PLUGIN, command_code_patch, credential_ref_names,
-    has_command_code_key, providers_from_config_options,
+    command_code_patch, credential_ref_names, has_command_code_key, providers_from_config_options,
+    AdvertisedModel, AdvertisedProvider, CommandCodeModel, CommandCodeMountError,
+    ACP_PROFILE_PATCH, COMMAND_CODE_API_KEY_ENV, COMMAND_CODE_BASE_URL, COMMAND_CODE_PROVIDER,
+    PI_AI_PATCH_ID, PI_AI_PLUGIN,
 };
 
 pub use native::{native, NATIVE};

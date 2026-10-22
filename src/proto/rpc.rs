@@ -479,7 +479,11 @@ impl RpcLane {
                 let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
                 let (stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
                 if let Some(stderr) = stderr {
-                    tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+                    tokio::spawn(bounds::drain_stderr(
+                        stderr,
+                        self.observer.clone(),
+                        bounds::StderrTail::default(),
+                    ));
                 }
                 (
                     (
@@ -502,7 +506,11 @@ impl RpcLane {
                 let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
                 let (_stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
                 if let Some(stderr) = stderr {
-                    tokio::spawn(bounds::drain_stderr(stderr, self.observer.clone()));
+                    tokio::spawn(bounds::drain_stderr(
+                        stderr,
+                        self.observer.clone(),
+                        bounds::StderrTail::default(),
+                    ));
                 }
                 let url = announce_endpoint(stdout, announce).await?;
                 let ws = crate::transport::ws::connect(&url).await?;
