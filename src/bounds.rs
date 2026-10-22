@@ -41,9 +41,13 @@ impl StderrTail {
     fn record(&self, bytes: &[u8]) {
         let mut tail = self.0.lock().unwrap();
         tail.push_str(&String::from_utf8_lossy(bytes));
-        let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+        let len = tail.len();
+        let mut excess = len.saturating_sub(STDERR_TAIL_BYTES);
+        while excess < len && !tail.is_char_boundary(excess) {
+            excess += 1;
+        }
         if excess > 0 {
-            tail.drain(..excess);
+            tail.drain(..excess.min(len));
         }
     }
 }
@@ -70,4 +74,25 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod stderr_tail_tests {
+    use super::*;
+
+    #[test]
+    fn multibyte_truncation_stays_on_char_boundaries() {
+        let tail = StderrTail::default();
+        // >16 KiB of multibyte text in awkward chunk sizes: the cut must
+        // never land inside a character (a byte-counted drain panics).
+        let chunk = "界面 interface 数据 ".repeat(97);
+        for _ in 0..24 {
+            tail.record(chunk.as_bytes());
+        }
+        let text = tail.text();
+        assert!(text.len() <= STDERR_TAIL_BYTES);
+        // Recording again must not observe a poisoned lock or panic.
+        tail.record("tail".as_bytes());
+        assert!(tail.text().ends_with("tail"));
+    }
 }
