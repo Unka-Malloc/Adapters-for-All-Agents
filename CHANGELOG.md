@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.2
+
+- Rework the acp/rpc/cli lane surfaces for lane independence, add the
+  `max_frame_bytes` session bound, and tighten the sidecar session
+  contract; permission/request now reports the host-facing session id,
+  with the agent-native id retained under `raw`.
+- Add per-agent `NATIVE` capability tables aggregated by
+  `a4aa_dialects::natives()` into `docs/native-capability.md`; table
+  freshness is enforced as a release gate by the generated release train
+  (`.github/release-train.py`, weekly train / manual / tag-push paths).
+- Mandate environment fidelity: specs declare how values resolve from
+  the user's real environment; agents are never launched empty.
+- Surface quota, usage-limit and capacity refusals as retryable
+  `agent_quota_exhausted` so custody can fail over to the next candidate;
+  the refusal classification is shared across lanes from `error.rs`, and
+  unclassified non-zero exits keep the `error` stop reason.
+
 ## 0.2.1
 
 Documentation and release-plumbing release; no behavior changes.
