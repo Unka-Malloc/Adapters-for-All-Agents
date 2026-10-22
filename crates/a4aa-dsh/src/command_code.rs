@@ -47,6 +47,10 @@ pub enum CommandCodeMountError {
     EmptyModels,
     /// The gateway endpoint must be an `https://` URL.
     InsecureBaseUrl,
+    /// The route carries the `COMMAND_CODE_API_KEY` reference, so its
+    /// endpoint must be a public host — loopback, private and link-local
+    /// targets would receive a credential they have no claim to.
+    PrivateBaseUrl,
 }
 
 impl std::fmt::Display for CommandCodeMountError {
@@ -61,11 +65,57 @@ impl std::fmt::Display for CommandCodeMountError {
                 "command-code route requires a non-empty models list"
             ),
             Self::InsecureBaseUrl => write!(formatter, "command-code base URL must use https"),
+            Self::PrivateBaseUrl => {
+                write!(formatter, "command-code base URL must name a public host")
+            }
         }
     }
 }
 
 impl std::error::Error for CommandCodeMountError {}
+
+/// The mounted route authenticates with the `COMMAND_CODE_API_KEY`
+/// reference, so its endpoint must be a public host: a loopback, private
+/// or link-local target would receive a credential it has no claim to.
+fn base_url_has_private_host(base_url: &str) -> bool {
+    let authority = base_url["https://".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    }
+    .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => {
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+        }
+        Ok(std::net::IpAddr::V6(address)) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || (address.segments()[0] & 0xffc0) == 0xfe80
+                || (address.segments()[0] & 0xfe00) == 0xfc00
+        }
+        Err(_) => false,
+    }
+}
 
 /// Names present under `refs:` in a DSH credentials YAML document.
 ///
@@ -117,6 +167,9 @@ pub fn command_code_patch(
     }
     if !base_url.starts_with("https://") {
         return Err(CommandCodeMountError::InsecureBaseUrl);
+    }
+    if base_url_has_private_host(base_url) {
+        return Err(CommandCodeMountError::PrivateBaseUrl);
     }
     if models.is_empty() {
         return Err(CommandCodeMountError::EmptyModels);
@@ -315,6 +368,19 @@ mod tests {
             command_code_patch(CREDENTIALS, "http://gateway.internal/v1", &models),
             Err(CommandCodeMountError::InsecureBaseUrl)
         );
+        for url in [
+            "https://localhost:8443/v1",
+            "https://10.0.0.9/v1",
+            "https://192.168.1.10/v1",
+            "https://169.254.169.254/latest",
+            "https://[fd00::1]/v1",
+        ] {
+            assert_eq!(
+                command_code_patch(CREDENTIALS, url, &models),
+                Err(CommandCodeMountError::PrivateBaseUrl),
+                "{url} must not receive the credential reference"
+            );
+        }
         let patch = command_code_patch(CREDENTIALS, COMMAND_CODE_BASE_URL, &models).expect("mount");
         assert!(patch.contains(PI_AI_PLUGIN));
         assert!(patch.contains("apiKeyEnv: COMMAND_CODE_API_KEY"));
