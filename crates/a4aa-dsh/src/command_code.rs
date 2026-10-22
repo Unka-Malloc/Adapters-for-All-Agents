@@ -100,14 +100,13 @@ fn base_url_has_private_host(base_url: &str) -> bool {
         return true;
     }
     match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(address)) => {
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-        }
+        Ok(std::net::IpAddr::V4(address)) => is_private_v4(&address),
         Ok(std::net::IpAddr::V6(address)) => {
+            // An IPv4-mapped/compatible IPv6 literal like ::ffff:127.0.0.1
+            // names the same private destination as the IPv4 form.
+            if let Some(v4) = address.to_ipv4() {
+                return is_private_v4(&v4);
+            }
             address.is_loopback()
                 || address.is_unspecified()
                 || (address.segments()[0] & 0xffc0) == 0xfe80
@@ -115,6 +114,14 @@ fn base_url_has_private_host(base_url: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn is_private_v4(address: &std::net::Ipv4Addr) -> bool {
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
 }
 
 /// Names present under `refs:` in a DSH credentials YAML document.
@@ -374,6 +381,9 @@ mod tests {
             "https://192.168.1.10/v1",
             "https://169.254.169.254/latest",
             "https://[fd00::1]/v1",
+            "https://[::ffff:127.0.0.1]/v1",
+            "https://[::ffff:10.0.0.9]/v1",
+            "https://[::ffff:169.254.169.254]/v1",
         ] {
             assert_eq!(
                 command_code_patch(CREDENTIALS, url, &models),
