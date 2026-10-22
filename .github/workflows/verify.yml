@@ -76,7 +76,9 @@ jobs:
       sha: ${{ steps.candidate.outputs.sha }}
       branch: ${{ steps.candidate.outputs.branch }}
     env:
-      RELEASE_MODE: dry-run
+      # The train's declared mode governs scheduled runs only; a manual or
+      # tag event releases live unless the dispatch opted into a rehearsal.
+      RELEASE_MODE: ${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || github.event_name == 'push' && 'tag' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_LEVEL: ${{ inputs.level }}
@@ -136,7 +138,7 @@ jobs:
 
       - name: Check surface-freshness
         if: steps.version.outputs.release == 'true'
-        run: python3 .github/release-train.py freshness --window-days=14
+        run: python3 $RUNNER_TEMP/train.py freshness --window-days=14
       # The bump is applied here under the read-only token and shipped to the
       # release job as a patch — the OIDC job only ever runs `git apply`.
       - name: Apply the release version
@@ -147,7 +149,11 @@ jobs:
           cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
           cargo set-version --workspace "$NEXT"
           cargo update --workspace
-          git diff > "$RUNNER_TEMP/version-bump.patch"
+          # The patch must carry only the bump: scope the diff to manifests
+          # so anything else verify left in the tree cannot ride into the
+          # release job's `git apply`.
+          git diff -- ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock' \
+            > "$RUNNER_TEMP/version-bump.patch"
 
       # Everything publishable lands in target/package/ plus an ordered list the
       # release job replays; packaging collects files and never runs code.
@@ -177,6 +183,7 @@ jobs:
           branch=${{ steps.candidate.outputs.branch }}
           release=${{ steps.version.outputs.release }}
           kind=$RELEASE_KIND
+          mode=$RELEASE_MODE
           next=${{ steps.version.outputs.next }}
           needs_set=${{ steps.version.outputs.needs_set }}
           excludes=${{ steps.version.outputs.excludes }}
