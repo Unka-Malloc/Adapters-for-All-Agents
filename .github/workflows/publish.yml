@@ -108,15 +108,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DECLARED_SHA: ${{ steps.load.outputs.sha }}
+          DECLARED_MODE: ${{ steps.load.outputs.mode }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-            --jq '{path,conclusion,head_sha,head_branch}' | python3 -c "
+            --jq '{path,conclusion,head_sha,head_branch,event}' | python3 -c "
           import json, os, sys
           run = json.load(sys.stdin)
           assert run['path'] == '.github/workflows/verify.yml', \
               f\"not verify.yml: {run['path']}\"
           assert run['conclusion'] == 'success', \
               f\"run did not succeed: {run['conclusion']}\"
+          # The artifact's mode is candidate-produced data; the run's event
+          # is trusted metadata. A scheduled rehearsal can never carry the
+          # live mode, so a forged mode=live dies here.
+          if run['event'] == 'schedule':
+              assert os.environ['DECLARED_MODE'] == 'dry-run', \
+                  'scheduled verify run cannot be published live'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('ref=' + (run.get('head_branch') or '') + '\n')
               out.write('head_sha=' + run['head_sha'] + '\n')

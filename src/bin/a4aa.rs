@@ -1113,22 +1113,32 @@ fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy, trusted: bool) -> bool {
     }
 }
 
-/// Whether `acp.auth_key` may cross the sidecar boundary: either it is an
-/// allowlisted `EnvSource`, or it is a `HostEnv` whose key was already
-/// resolved to a `Literal` in the spec's `set` map by the caller.
+/// Whether `acp.auth_key` may cross the sidecar boundary. The admitted
+/// spec must carry its own usable value in the resolved environment —
+/// either a non-empty caller literal, or an allowlisted name the env
+/// policy itself inherits — so the resolver never has to fall back on the
+/// ambient host variable for a wire-supplied spec. A present-but-empty
+/// literal is not proof of possession: it only shadows the host value
+/// while leaving the fallback to refill it.
 fn auth_key_admitted_over_sidecar(source: &a4aa::EnvSource, env: &a4aa::EnvPolicy) -> bool {
-    if env_source_admitted_over_sidecar(source) {
-        return true;
+    let a4aa::EnvSource::HostEnv { host_env } = source else {
+        return env_source_admitted_over_sidecar(source);
+    };
+    let (inherit, set) = match env {
+        a4aa::EnvPolicy::InheritAll { set } => (None, set),
+        a4aa::EnvPolicy::Sanitized { inherit, set } => (Some(inherit), set),
+    };
+    match set.get(host_env) {
+        Some(a4aa::EnvValue::Literal(value)) => !value.is_empty(),
+        Some(a4aa::EnvValue::Source(_)) => false,
+        None => match env {
+            a4aa::EnvPolicy::InheritAll { .. } => true,
+            a4aa::EnvPolicy::Sanitized { .. } => {
+                env_source_admitted_over_sidecar(source)
+                    && inherit.is_some_and(|names| names.iter().any(|n| n == host_env))
+            }
+        },
     }
-    if let a4aa::EnvSource::HostEnv { host_env } = source {
-        let set = match env {
-            a4aa::EnvPolicy::InheritAll { set } | a4aa::EnvPolicy::Sanitized { set, .. } => set,
-        };
-        if matches!(set.get(host_env), Some(a4aa::EnvValue::Literal(_))) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Whether a single `EnvSource` may cross the sidecar boundary — the same
@@ -1212,10 +1222,66 @@ mod tests {
             &host("DEVIN_API_KEY"),
             &auth_env
         ));
-        assert!(!auth_key_admitted_over_sidecar(
+        // InheritAll resolves the whole host environment into the child, so
+        // the resolved env carries the key itself — the child already sees
+        // the same value the authenticate request would send it.
+        assert!(auth_key_admitted_over_sidecar(
             &host("DEVIN_API_KEY"),
             &a4aa::EnvPolicy::InheritAll {
                 set: BTreeMap::new()
+            }
+        ));
+        // A Sanitized caller must prove possession with a non-empty literal
+        // for an off-allowlist name; an empty literal only shadows the host
+        // value while the resolver's fallback would refill it.
+        let empty_literal = a4aa::EnvPolicy::Sanitized {
+            inherit: vec![],
+            set: BTreeMap::from([(
+                "DEVIN_API_KEY".to_owned(),
+                a4aa::EnvValue::Literal(String::new()),
+            )]),
+        };
+        assert!(!auth_key_admitted_over_sidecar(
+            &host("DEVIN_API_KEY"),
+            &empty_literal
+        ));
+        let resolved_literal = a4aa::EnvPolicy::Sanitized {
+            inherit: vec![],
+            set: BTreeMap::from([(
+                "DEVIN_API_KEY".to_owned(),
+                a4aa::EnvValue::Literal("caller-token".into()),
+            )]),
+        };
+        assert!(auth_key_admitted_over_sidecar(
+            &host("DEVIN_API_KEY"),
+            &resolved_literal
+        ));
+        // An allowlisted name is fine when the policy itself inherits it —
+        // the resolved env then carries a value the caller could pass
+        // anyway — but never when the spec leaves it to the host fallback.
+        assert!(auth_key_admitted_over_sidecar(
+            &host("PATH"),
+            &a4aa::EnvPolicy::Sanitized {
+                inherit: vec!["PATH".to_owned()],
+                set: BTreeMap::new(),
+            }
+        ));
+        assert!(!auth_key_admitted_over_sidecar(
+            &host("PATH"),
+            &a4aa::EnvPolicy::Sanitized {
+                inherit: vec![],
+                set: BTreeMap::new(),
+            }
+        ));
+        // An empty literal voids an otherwise-inherited allowlisted key.
+        assert!(!auth_key_admitted_over_sidecar(
+            &host("PATH"),
+            &a4aa::EnvPolicy::Sanitized {
+                inherit: vec!["PATH".to_owned()],
+                set: BTreeMap::from([(
+                    "PATH".to_owned(),
+                    a4aa::EnvValue::Literal(String::new()),
+                )]),
             }
         ));
         set.insert(
