@@ -111,6 +111,33 @@ impl AgentCard {
             .collect()
     }
 
+    /// The materialized spec with `EnvPolicy::InheritAll` — the fidelity
+    /// path. `spec()` sanitizes the child environment; this opt-in hands
+    /// the spawned agent every ambient host variable, so call it only
+    /// from a custody path that deliberately trusts the launched agent
+    /// (`va serve`'s local chain, AwP presets). Materializing a card is
+    /// never, by itself, a reason to expose host credentials.
+    pub fn spec_inheriting_host_env(&self) -> AgentSpec {
+        let mut spec = self.spec();
+        spec.command.env = EnvPolicy::InheritAll {
+            set: BTreeMap::new(),
+        };
+        spec
+    }
+
+    /// `spec_inheriting_host_env()` plus each alternate.
+    pub fn specs_inheriting_host_env(&self) -> Vec<AgentSpec> {
+        self.specs()
+            .into_iter()
+            .map(|mut spec| {
+                spec.command.env = EnvPolicy::InheritAll {
+                    set: BTreeMap::new(),
+                };
+                spec
+            })
+            .collect()
+    }
+
     fn spec_for(
         &self,
         surface: &AgentSurface,
@@ -253,9 +280,7 @@ impl AgentCard {
                     .map(|arg| (*arg).to_owned())
                     .collect(),
                 cwd: None,
-                env: EnvPolicy::InheritAll {
-                    set: BTreeMap::new(),
-                },
+                env: EnvPolicy::default(),
             },
             max_output_bytes: None,
         }
