@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::AdapterError;
 
@@ -404,6 +404,19 @@ pub struct SupportEntry {
     pub note: Option<String>,
 }
 
+/// An artifact path must stay inside its declared scope root: plain
+/// components only — no root, no parent refs, no separator tricks that
+/// resolve differently on another platform (`\\` counts on Unix too, so
+/// a name meant for Windows cannot smuggle a traversal).
+fn scope_relative(path: &str) -> bool {
+    if path.is_empty() || path.contains('\\') {
+        return false;
+    }
+    let parsed = Path::new(path);
+    !parsed.is_absolute()
+        && parsed.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// What [`crate::dialect::adapt`] produces: artifacts to write plus the
 /// per-item verdicts.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -425,6 +438,17 @@ impl AdaptationPlan {
         content: String,
         mode: WriteMode,
     ) {
+        if !scope_relative(path) {
+            // A mechanism name carrying separators or parent refs would
+            // land the artifact outside its declared scope — refuse the
+            // write instead of escaping user-home/project bounds.
+            self.report(
+                path.to_owned(),
+                Support::Unsupported,
+                Some("artifact path escapes its declared scope"),
+            );
+            return;
+        }
         self.artifacts.push(Artifact {
             scope,
             path: PathBuf::from(path),
@@ -439,5 +463,48 @@ impl AdaptationPlan {
             support,
             note: note.map(str::to_owned),
         });
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn traversal_names_never_escape_the_declared_scope() {
+        let mut plan = AdaptationPlan::default();
+        plan.push(
+            ArtifactScope::UserHome,
+            ".pi/skills/../../etc/passwd/SKILL.md",
+            "x".into(),
+            WriteMode::Create,
+        );
+        plan.push(
+            ArtifactScope::UserHome,
+            ".pi/skills/evil\\..\\outside.md",
+            "x".into(),
+            WriteMode::Create,
+        );
+        plan.push(
+            ArtifactScope::UserHome,
+            "/absolute/path.md",
+            "x".into(),
+            WriteMode::Create,
+        );
+        assert!(plan.artifacts.is_empty());
+        assert_eq!(plan.report.len(), 3);
+        assert!(plan.report.iter().all(|e| e.support == Support::Unsupported));
+    }
+
+    #[test]
+    fn nested_but_in_scope_paths_still_emit() {
+        let mut plan = AdaptationPlan::default();
+        plan.push(
+            ArtifactScope::UserHome,
+            ".pi/skills/review/SKILL.md",
+            "x".into(),
+            WriteMode::Create,
+        );
+        assert_eq!(plan.artifacts.len(), 1);
     }
 }

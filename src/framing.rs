@@ -14,14 +14,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 /// session transcript — opt in per spec via `RpcCallSpec.max_frame_bytes`.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
-/// The sidecar↔host link forwards agent payloads (including transcript
-/// frames) upstream, so it carries the wider bound the largest declared
-/// agent surface needs.
-pub const SIDECAR_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-
 /// Absolute ceiling any lane may declare: `max_frame_bytes` can widen the
 /// default toward this limit but never past it — a wire-supplied spec
-/// cannot turn a frame bound into an allocation attack.
+/// cannot turn a frame bound into an allocation attack. The sidecar→host
+/// direction carries agent payloads (including transcript frames) up to
+/// this bound on the host's read side.
 pub const MAX_FRAME_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
