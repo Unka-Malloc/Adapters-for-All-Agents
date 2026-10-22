@@ -116,9 +116,12 @@ jobs:
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -qam "release: v$NEXT"
 
+      # HEAD already carries the version-bump commit when one was applied,
+      # so promote HEAD — pushing $CANDIDATE would strand stable on the
+      # pre-release commit.
       - name: Promote the candidate to stable
         if: env.RELEASE_KIND != 'tag'
-        run: git push origin "$CANDIDATE:refs/heads/stable"
+        run: git push origin "HEAD:refs/heads/stable"
 
       - name: Authenticate to crates.io
         id: auth

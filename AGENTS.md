@@ -35,21 +35,22 @@ deciding "another lane is enough".
 
 ## Environment fidelity (hard rule)
 
-On a *trusted local launch* agent infrastructure never launches an
-agent with an empty or minimal "no variables" environment — the user's
-machine is the source of truth. Presets, cards and specs declare how
-every needed value is *resolved* from the real environment: host
+A *trusted local launch* that opts into host-environment fidelity
+resolves every needed value from the user's real environment — the
+user's machine is the source of truth. Presets, cards and specs declare
+how every needed value is *resolved* from the real environment: host
 environment variables (PATH and friends), values inside configuration
 files (TOML, YAML or JSON — read by key lookup, never copied by hand),
 and every model or provider the agent can use. The custody layer
 resolves those declarations into concrete values before spawn; the
 child receives the user's real environment plus explicit overrides.
 
-An agent started "clean" loses the user's configuration, credentials,
-providers and tools — that is a defect, not hardening. Security lives
-in *where* values resolve (locally, at the custody boundary) and
-*what* may cross a remote boundary (literal values, not references) —
-never in running with no environment at all.
+A fidelity launch that silently drops the user's configuration,
+credentials, providers and tools is a defect — but a sanitized
+environment is the correct *default*, not a defect: security lives in
+*where* values resolve (locally, at the custody boundary) and *what*
+may cross a remote boundary (literal values, not references), and
+fidelity is an explicit grant, never an implicit default.
 
 Fidelity is an explicit grant, not a default. A card's `spec()`
 materializes a sanitized environment — adopting the card alone never

@@ -134,6 +134,9 @@ jobs:
         run: |
           scripts/verify.sh
 
+      - name: Check surface-freshness
+        if: steps.version.outputs.release == 'true'
+        run: python3 .github/release-train.py freshness --window-days=14
       # The bump is applied here under the read-only token and shipped to the
       # release job as a patch — the OIDC job only ever runs `git apply`.
       - name: Apply the release version
