@@ -1443,14 +1443,17 @@ fn protocol_failure(stage: &'static str, error: agent_client_protocol::Error) ->
     // rejected before the agent served it, so another candidate may
     // safely replay it. ACP reuses JSON-RPC -32000 (`AuthRequired`) for
     // that case, but agents also emit -32000 for provider quota and
-    // capacity refusals. Those are not credential failures: they must
-    // stay `agent_protocol_failed` so a model chain can advance.
-    // Everything else stays uncertain — a dropped connection mid-turn
-    // could have already done billable work.
-    if error.code == agent_client_protocol::ErrorCode::AuthRequired
-        && !crate::error::quota_or_capacity_refusal(&error.to_string())
-    {
-        AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
+    // capacity refusals. Those are not credential failures and not
+    // uncertain either: an explicit refusal names itself, so it settles
+    // as a certain `agent_quota_exhausted` a model chain can fail over
+    // from. Everything else stays uncertain — a dropped connection
+    // mid-turn could have already done billable work.
+    if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+        if crate::error::quota_or_capacity_refusal(&error.to_string()) {
+            AdapterError::retryable("agent_quota_exhausted", stage).with_detail(error.to_string())
+        } else {
+            AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
+        }
     } else {
         AdapterError::uncertain("agent_protocol_failed", stage).with_detail(error.to_string())
     }
@@ -1598,11 +1601,13 @@ mod protocol_failure_tests {
     use super::*;
 
     #[test]
-    fn quota_rate_limit_is_protocol_failed_not_auth() {
+    fn quota_rate_limit_is_certain_quota_exhausted_not_auth() {
         let mut error = agent_client_protocol::Error::auth_required();
         error.message = "AI.Error: Rate limit exceeded. Please try again later.".into();
         let mapped = protocol_failure("session/prompt", error);
-        assert_eq!(mapped.code, "agent_protocol_failed");
+        assert_eq!(mapped.code, "agent_quota_exhausted");
+        assert!(mapped.retryable);
+        assert!(!mapped.uncertain_effect);
     }
 
     #[test]
