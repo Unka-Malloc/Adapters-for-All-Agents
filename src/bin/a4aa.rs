@@ -279,9 +279,10 @@ impl SidecarDelegate {
         // never admits one above the hard ceiling, however trusted the
         // caller. Card-declared surfaces stay under it by construction.
         if let a4aa::model::LaneSpec::Rpc(rpc) = &spec.lane {
-            if rpc.max_frame_bytes.is_some_and(|bytes| {
-                bytes > a4aa::framing::MAX_FRAME_BYTES_LIMIT
-            }) {
+            if rpc
+                .max_frame_bytes
+                .is_some_and(|bytes| bytes > a4aa::framing::MAX_FRAME_BYTES_LIMIT)
+            {
                 return Err(RpcErrorObject {
                     code: -32602,
                     message: "max_frame_bytes above the global limit".into(),

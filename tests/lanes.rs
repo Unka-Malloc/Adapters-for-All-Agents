@@ -1588,7 +1588,10 @@ async fn sidecar_rejects_an_over_limit_frame_bound() {
         },
     };
     let failure = match peer
-        .call("session/open", json!({ "spec": serde_json::to_value(spec).unwrap() }))
+        .call(
+            "session/open",
+            json!({ "spec": serde_json::to_value(spec).unwrap() }),
+        )
         .await
     {
         Ok(_) => panic!("an over-limit frame bound must be refused"),
