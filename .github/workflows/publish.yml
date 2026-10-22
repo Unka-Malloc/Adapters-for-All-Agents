@@ -54,22 +54,6 @@ jobs:
     env:
       RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
     steps:
-      # A manual dispatch names the run to publish from; binding only holds
-      # if that run is this repository's `verify` train and it completed
-      # successfully. workflow_run ids are already bound by the trigger.
-      - name: Bind the run to the verify train
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --json name,conclusion,headSha | python3 -c "
-          import json, sys
-          run = json.load(sys.stdin)
-          assert run['name'] == 'verify', f\"not a verify run: {run['name']}\"
-          assert run['conclusion'] == 'success', f\"run did not succeed: {run['conclusion']}\"
-          "
-
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           name: release-inputs
@@ -81,6 +65,35 @@ jobs:
       # step outputs; it is data, never code, so sourcing it is safe.
       - id: load
         run: cat release-inputs/env >> "$GITHUB_OUTPUT"
+
+      # A run is bound only when all three hold: the run executed this
+      # repository's real verify.yml file (a same-named workflow file
+      # elsewhere does not qualify), it succeeded, and it ran on a
+      # protected ref — the default branch or a release tag — whose head
+      # matches the candidate sha the artifact declares. A `verify`
+      # workflow modified on a side branch therefore cannot forge a
+      # release decision, whether it arrives by workflow_run or by a
+      # dispatched run_id.
+      - name: Bind the run to the verify train
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DECLARED_SHA: ${{ steps.load.outputs.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+            --jq '{path,conclusion,head_sha,head_branch}' | python3 -c "
+          import json, os, sys
+          run = json.load(sys.stdin)
+          assert run['path'] == '.github/workflows/verify.yml', \
+              f\"not verify.yml: {run['path']}\"
+          assert run['conclusion'] == 'success', \
+              f\"run did not succeed: {run['conclusion']}\"
+          branch = run.get('head_branch') or ''
+          default = '${{ github.event.repository.default_branch }}'
+          assert branch in (default, 'nightly') or branch.startswith('v'), \
+              f\"untrusted source ref: {branch or '<none>'}\"
+          assert run['head_sha'] == os.environ['DECLARED_SHA'], \
+              'artifact sha does not match the run head'
+          "
 
   release:
     if: >-

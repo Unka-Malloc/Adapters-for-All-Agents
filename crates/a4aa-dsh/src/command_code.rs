@@ -79,7 +79,10 @@ impl std::error::Error for CommandCodeMountError {}
 /// or link-local target would receive a credential it has no claim to.
 fn base_url_has_private_host(base_url: &str) -> bool {
     let authority = base_url["https://".len()..]
-        .split(['/', '?', '#'])
+        // WHATWG HTTPS parsing treats a backslash as a path separator, so
+        // `https://127.0.0.1\@host` really targets 127.0.0.1 — split on it
+        // here too or the guard and the downstream parser disagree.
+        .split(['/', '\\', '?', '#'])
         .next()
         .unwrap_or_default()
         .rsplit('@')
@@ -406,6 +409,8 @@ mod tests {
             "https://127.1/v1",
             "https://localhost./v1",
             "https://[fe80::1%25eth0]/v1",
+            "https://127.0.0.1\\@public.example/v1",
+            "https://10.0.0.9\\@public.example/v1",
         ] {
             assert_eq!(
                 command_code_patch(CREDENTIALS, url, &models),
