@@ -28,6 +28,11 @@
 # receives the publishing identity.
 #
 # Credentials: this file needs none; a read-only token suffices.
+#
+# Cost note: repositories on this train are public, so GitHub Actions
+# minutes and artifact storage are not billed; the weekly verify run and
+# its short-lived artifacts are free (GitHub Actions is free for public
+# repositories).
 name: verify
 
 on:
