@@ -675,7 +675,10 @@ impl CliLane {
                     .find(|line| !line.trim().is_empty())
                     .map(str::trim)
                     .unwrap_or("child exited non-zero");
-                return Err(AdapterError::retryable("agent_quota_exhausted", "cli/turn")
+                // Text matching cannot prove the turn had no billable
+                // effect — partial work may already have run — so the
+                // failover-eligible refusal stays uncertain-effect.
+                return Err(AdapterError::uncertain("agent_quota_exhausted", "cli/turn")
                     .with_detail(detail.to_string()));
             }
         }

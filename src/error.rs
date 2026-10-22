@@ -78,10 +78,12 @@ impl fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 /// Whether agent output or a protocol error names a quota, capacity or
-/// model-availability refusal. A refusal is a certain non-effect — the
-/// turn was rejected before it ran — so a different candidate may safely
-/// replay it. The needles match the refusal text vendors actually print
-/// (rate limits, usage and spend caps, missing or unavailable models).
+/// model-availability refusal. A refusal is failover-eligible but not a
+/// proven non-effect — text matching cannot tell whether billable work
+/// ran before the refusal surfaced — so callers map it with
+/// `AdapterError::uncertain`, never as a certain replay. The needles
+/// match the refusal text vendors actually print (rate limits, usage
+/// and spend caps, missing or unavailable models).
 pub(crate) fn quota_or_capacity_refusal(text: &str) -> bool {
     let text = text.to_lowercase();
     [
