@@ -1547,6 +1547,61 @@ async fn acp_agent_info_and_session_state_are_exposed() {
 }
 
 #[tokio::test]
+async fn sidecar_rejects_an_over_limit_frame_bound() {
+    let mut child = tokio::process::Command::new(FIXTURE)
+        .arg("serve")
+        .arg("--trust-host-env")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn a4aa serve");
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let delegate = Arc::new(SidecarEvents {
+        notifications: notice_tx,
+        permission_granted: std::sync::atomic::AtomicBool::new(false),
+    });
+    let peer = JsonRpcPeer::spawn(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+        delegate,
+        a4aa::observe::none(),
+        a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+    );
+
+    let lane = LaneSpec::Rpc(Box::new(RpcLaneSpec {
+        transport: RpcTransport::Stdio,
+        max_frame_bytes: Some(a4aa::framing::MAX_FRAME_BYTES_LIMIT + 1),
+        ..Default::default()
+    }));
+    let spec = AgentSpec {
+        id: "oversized".into(),
+        client_name: None,
+        max_output_bytes: None,
+        lane,
+        command: CommandSpec {
+            program: "python3".into(),
+            args: vec!["-c".into(), "print(1)".into()],
+            cwd: None,
+            env: EnvPolicy::default(),
+        },
+    };
+    let failure = match peer
+        .call("session/open", json!({ "spec": serde_json::to_value(spec).unwrap() }))
+        .await
+    {
+        Ok(_) => panic!("an over-limit frame bound must be refused"),
+        Err(failure) => failure,
+    };
+    let a4aa::rpc::CallFailure::Remote(error) = failure else {
+        panic!("expected a remote error object, got {failure:?}");
+    };
+    assert_eq!(error.code, -32602);
+    assert!(error.message.contains("max_frame_bytes"), "{error:?}");
+}
+
+#[tokio::test]
 async fn sidecar_session_options_and_structured_errors() {
     let mut child = tokio::process::Command::new(FIXTURE)
         .arg("serve")

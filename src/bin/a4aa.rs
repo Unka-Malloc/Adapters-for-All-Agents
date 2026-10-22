@@ -275,6 +275,20 @@ impl SidecarDelegate {
                 data: None,
             });
         }
+        // A caller-chosen frame bound is an allocation request: the wire
+        // never admits one above the hard ceiling, however trusted the
+        // caller. Card-declared surfaces stay under it by construction.
+        if let a4aa::model::LaneSpec::Rpc(rpc) = &spec.lane {
+            if rpc.max_frame_bytes.is_some_and(|bytes| {
+                bytes > a4aa::framing::MAX_FRAME_BYTES_LIMIT
+            }) {
+                return Err(RpcErrorObject {
+                    code: -32602,
+                    message: "max_frame_bytes above the global limit".into(),
+                    data: None,
+                });
+            }
+        }
         // The ACP lane's auth_key is another client-named EnvSource — hold
         // it to the same policy unless its hostEnv variable is already
         // supplied as a literal in the spec's own env set.
