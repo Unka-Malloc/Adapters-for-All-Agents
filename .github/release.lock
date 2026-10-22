@@ -1,0 +1,15 @@
+# Generated release train for Unka-Malloc/Adapters-for-All-Agents.
+# Regenerate instead of editing: records which engine revision and
+# which source inputs produced the generated files beside it.
+[generator]
+engine = "release-engine"
+version = "0.1.0"
+
+[source]
+templates = "sha256:06393619887472e73b95773b77a1fa86143e32a90b5e9c0818c260d5093379a9"
+declaration = "sha256:5bc8e5b1af5b70eeb1bf6caca99ee817ea124c4d7026f309523a9caac9d54198"
+
+[outputs]
+".github/workflows/verify.yml" = "sha256:ff16edcfdd6c31193b9e28277f123dc8df8ebe5be76c912866eb1d25f232d83a"
+".github/workflows/publish.yml" = "sha256:e0daba3759f175eb0ffdc1defbe33274a6745b59b6a40712df4e2e259e192191"
+".github/release.py" = "sha256:9d73a3b660dfbefda496c692201c1d488735b3ddfecd7eadc03abf892f11ddf8"
