@@ -130,7 +130,7 @@ static SDK_RPC: RpcSurface = RpcSurface {
 /// credentials itself.
 ///
 /// The SDK JSON-RPC alternate (`dsh --profile sdk`) is the official
-/// library-style stdio carrier LicoUp drives: model and reasoning effort
+/// library-style stdio carrier a host drives in-process: model and reasoning effort
 /// on `initialize`, caller-created session ids on `session/prompt`, no
 /// live deltas and no cancel. Capability ordering ranks Serve, then
 /// SDK, then ACP or RPC, then CLI. That ranking would put the SDK

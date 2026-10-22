@@ -1,6 +1,6 @@
 //! Native-capability table for `dsh`. Last verified 2026-10-21.
 //!
-//! Verdict vs LicoUp's `dsh --profile sdk`: ACP is the richer conversation
+//! Verdict vs the `dsh --profile sdk` lane: ACP is the richer conversation
 //! surface (durable resume, cancel, live `session/update` streaming). SDK
 //! RPC is a first-party JSON-RPC stdio carrier with model/effort on
 //! `initialize` but no live deltas and no cancel. ACP stays primary; SDK
@@ -26,7 +26,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         ),
         rpc: cell(
             NativeStatus::Native,
-            "sdk profile is the rpc lane; same JSON-RPC stdio as LicoUp",
+            "sdk profile is the rpc lane; a first-party JSON-RPC stdio carrier",
         ),
         cli: cell(
             NativeStatus::NotOffered,

@@ -289,8 +289,13 @@ where
                 ));
             }
         };
+        let observed: &[u8] = if line.starts_with("server password ") {
+            b"server password <redacted>"
+        } else {
+            line.as_bytes()
+        };
         if let Some(observer) = observer.as_ref() {
-            observer.record("stdout", Direction::Received, line.as_bytes());
+            observer.record("stdout", Direction::Received, observed);
         }
         if let Some(url) = line.strip_prefix("server listening on ") {
             let announced = url.trim();
@@ -689,6 +694,33 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"opencode:secret"), "b3BlbmNvZGU6c2VjcmV0");
+    }
+
+    #[tokio::test]
+    async fn discovery_never_forwards_the_password_to_observers() {
+        struct Seen(std::sync::Mutex<Vec<Vec<u8>>>);
+        impl crate::observe::Observer for Seen {
+            fn record(&self, _source: &'static str, _dir: Direction, bytes: &[u8]) {
+                self.0.lock().unwrap().push(bytes.to_vec());
+            }
+        }
+        let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+        let feed =
+            "server listening on http://127.0.0.1:9000\nserver password s3cret-value\n".as_bytes();
+        let endpoint = discover(feed, Some(seen.clone())).await.unwrap();
+        assert_eq!(endpoint.auth, base64(b"opencode:s3cret-value"));
+        for line in seen.0.lock().unwrap().iter() {
+            assert!(
+                !line.windows(12).any(|w| w == b"s3cret-value"),
+                "observer received the raw password line"
+            );
+        }
+        assert!(seen
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == b"server password <redacted>"));
     }
 
     #[test]

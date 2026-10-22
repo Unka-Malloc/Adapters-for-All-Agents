@@ -22,7 +22,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         ),
         pty: cell(
             NativeStatus::Native,
-            "interactive agy TTY; LicoUp documents PTY --print/--conversation",
+            "interactive agy TTY with PTY --print/--conversation",
         ),
     },
     mcp: McpRegistration {

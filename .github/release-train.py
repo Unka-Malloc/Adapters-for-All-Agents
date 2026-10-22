@@ -482,38 +482,6 @@ def cmd_order(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_upload(args: argparse.Namespace) -> int:
-    directory = pathlib.Path(args.dir)
-    order = [line.split("\t") for line in
-             (directory / "publish-order.txt").read_text(encoding="utf-8").splitlines()
-             if line.strip()]
-    skipped, uploaded = [], []
-    for name, vers in order:
-        known = {show(v) for v in published_versions(name)}
-        if vers in known:
-            skipped.append(f"{name} {vers}")
-            continue
-        crate = directory / f"{name}-{vers}.crate"
-        with tempfile.TemporaryDirectory() as temp:
-            subprocess.run(["tar", "-xzf", crate, "-C", temp], check=True)
-            (package,) = (p for p in pathlib.Path(temp).iterdir() if p.is_dir())
-            (package / "Cargo.toml.orig").unlink(missing_ok=True)
-            subprocess.run(
-                ["cargo", "publish", "--no-verify", "--registry", "crates-io"],
-                cwd=package, check=True,
-            )
-        deadline = time.monotonic() + 600
-        while vers not in {show(v) for v in published_versions(name)}:
-            if time.monotonic() >= deadline:
-                raise TrainError(f"crates.io index still lacks {name} {vers} after the upload")
-            time.sleep(10)
-        uploaded.append(f"{name} {vers}")
-    lines = [f"- uploaded `{entry}`" for entry in uploaded]
-    lines += [f"- `{entry}` was already on crates.io" for entry in skipped]
-    report("### crates.io\n\n" + "\n".join(lines or ["- nothing to upload"]))
-    return 0
-
-
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="train.py")
     commands = root.add_subparsers(dest="command", required=True)
@@ -533,9 +501,6 @@ def parser() -> argparse.ArgumentParser:
     version.set_defaults(run=cmd_version)
     order = commands.add_parser("order")
     order.set_defaults(run=cmd_order)
-    upload = commands.add_parser("upload")
-    upload.add_argument("--dir", required=True)
-    upload.set_defaults(run=cmd_upload)
     return root
 
 
