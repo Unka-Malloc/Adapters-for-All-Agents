@@ -67,8 +67,8 @@ pub enum EnvPolicy {
         #[serde(default)]
         set: BTreeMap<String, EnvValue>,
     },
-    /// Default policy: inherit the user's real host environment, then apply
-    /// explicit `set` overrides resolved at spawn.
+    /// Full host-environment inheritance — the fidelity path host-declared
+    /// cards and trusted local custody opt into explicitly.
     InheritAll {
         #[serde(default)]
         set: BTreeMap<String, EnvValue>,
@@ -76,8 +76,13 @@ pub enum EnvPolicy {
 }
 
 impl Default for EnvPolicy {
+    /// An unspecified policy sanitizes: full host inheritance is an
+    /// explicit declaration a host makes per spec — cards and trusted
+    /// local custody paths write `InheritAll` deliberately, never
+    /// implicitly.
     fn default() -> Self {
-        Self::InheritAll {
+        Self::Sanitized {
+            inherit: Vec::new(),
             set: BTreeMap::new(),
         }
     }
@@ -174,12 +179,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_policy_inherits_user_environment() {
-        spec_env("A4AA_TEST_INHERIT_MARKER", "visible");
+    async fn default_policy_excludes_unlisted_credential_markers() {
+        spec_env("A4AA_TEST_INHERIT_MARKER", "hidden");
         let resolved = resolve(&EnvPolicy::default(), &BTreeMap::new(), &NoSecrets)
             .await
             .unwrap();
-        assert_eq!(resolved.get("A4AA_TEST_INHERIT_MARKER").unwrap(), "visible");
+        assert!(!resolved.contains_key("A4AA_TEST_INHERIT_MARKER"));
+        assert!(resolved.contains_key("PATH") || resolved.contains_key("HOME"));
     }
 
     #[tokio::test]
