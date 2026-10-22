@@ -93,11 +93,7 @@ impl AgentCard {
     /// them — trusting a workspace is the host's explicit decision, not
     /// the card's default.
     pub fn spec_trusting_workspace(&self) -> AgentSpec {
-        self.spec_for(
-            &self.surface,
-            self.detect.binaries.first().copied(),
-            true,
-        )
+        self.spec_for(&self.surface, self.detect.binaries.first().copied(), true)
     }
 
     /// `spec_trusting_workspace()` plus each alternate.
