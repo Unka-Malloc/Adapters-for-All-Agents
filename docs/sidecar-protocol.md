@@ -6,8 +6,9 @@ crate's adapters verbatim — one subprocess per host process.
 
 ## Framing
 
-- One JSON-RPC message per line (`\n`-terminated), UTF-8, max 1 MiB + line
-  terminator slack. Oversized or malformed lines are reported through the
+- One JSON-RPC message per line (`\n`-terminated), UTF-8, max 64 MiB + line
+  terminator slack — the link forwards agent payloads such as transcript
+  frames upstream. Oversized or malformed lines are reported through the
   delegate's protocol-error path and the stream continues.
 - Request ids are arbitrary JSON values and are echoed verbatim (ACP-style
   UUID strings are legal ids).
@@ -28,6 +29,20 @@ crate's adapters verbatim — one subprocess per host process.
 (cancelled, or an unknown-session error) is acknowledged in the response. A
 notification-form `session/cancel` is ignored with a stderr warning — never
 silently applied.
+
+## Environment boundary
+
+A spec's `command.env` policy is checked before spawn:
+
+- `Sanitized.inherit` names and `hostEnv` indirections are confined to the
+  inert `INHERITED_ENV` allowlist (PATH, HOME, locale, temp — never
+  credentials). `secret` references are refused; a trusted custody host
+  resolves them to literals before sending the spec.
+- `InheritAll` is refused unless the sidecar was launched with
+  `--trust-host-env`, which declares the launcher's callers trusted to
+  give a caller-chosen child the full ambient environment. A trusted host
+  that wants environment fidelity without the flag materializes the
+  environment into `set` literals itself.
 
 `AgentSpec` is the crate's canonical spec (serde, `camelCase` fields
 documented in `model.rs`): `id`, `clientName?`, `command{program,args,cwd?,
