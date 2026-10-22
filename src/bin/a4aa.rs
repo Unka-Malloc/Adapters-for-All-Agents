@@ -42,10 +42,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 async fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let code = match mode.as_str() {
-        "serve" => serve().await,
+        "serve" => {
+            // `--trust-host-env` declares the launcher's callers trusted:
+            // only then may a spec's `InheritAll` env policy cross the
+            // sidecar boundary. Without it the wire carries sanitized
+            // policies and literals only.
+            let trust_host_env = std::env::args()
+                .skip(2)
+                .any(|arg| arg == "--trust-host-env");
+            serve(trust_host_env).await
+        }
         "fixture-agent" => fixture_agent(),
         _ => {
-            eprintln!("usage: a4aa serve | a4aa fixture-agent");
+            eprintln!("usage: a4aa serve [--trust-host-env] | a4aa fixture-agent");
             2
         }
     };
@@ -104,6 +113,9 @@ struct SidecarDelegate {
     peer: Arc<std::sync::OnceLock<Arc<JsonRpcPeer>>>,
     peer_ready: Arc<tokio::sync::Notify>,
     closed: Arc<tokio::sync::Notify>,
+    /// Whether the launcher's callers are trusted to submit `InheritAll`
+    /// env policies: set by `--trust-host-env` at spawn.
+    trust_host_env: bool,
 }
 
 /// Waits for the shared peer cell; installed immediately after spawn.
@@ -249,14 +261,16 @@ impl SidecarDelegate {
         // name: per-name `inherit` on a sanitized policy or `hostEnv`
         // indirections are confined to the inert allowlist, and secret
         // references must be resolved to literals at the custody boundary
-        // before crossing the wire. The child process itself inherits the
-        // user's real environment under `InheritAll` (the default).
-        if !env_admitted_over_sidecar(&spec.command.env) {
+        // before crossing the wire. `InheritAll` lets a caller-chosen child
+        // read every ambient credential, so it crosses only when the
+        // launcher declared its callers trusted (`--trust-host-env`).
+        if !env_admitted_over_sidecar(&spec.command.env, self.trust_host_env) {
             return Err(RpcErrorObject {
                 code: -32602,
                 message: "env policy not admitted over the sidecar: \
                           non-allowlisted inherit names, hostEnv outside the allowlist, \
-                          and secret references are refused"
+                          secret references, and InheritAll without --trust-host-env \
+                          are refused"
                     .into(),
                 data: None,
             });
@@ -519,20 +533,21 @@ impl SidecarDelegate {
     }
 }
 
-async fn serve() -> i32 {
+async fn serve(trust_host_env: bool) -> i32 {
     let closed = Arc::new(tokio::sync::Notify::new());
     let delegate = Arc::new(SidecarDelegate {
         sessions: Arc::new(Sessions::new()),
         peer: Arc::new(std::sync::OnceLock::new()),
         peer_ready: Arc::new(tokio::sync::Notify::new()),
         closed: closed.clone(),
+        trust_host_env,
     });
     let peer = JsonRpcPeer::spawn(
         tokio::io::stdin(),
         tokio::io::stdout(),
         delegate.clone(),
         a4aa::observe::none(),
-        a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
+        a4aa::framing::SIDECAR_MAX_MESSAGE_BYTES,
     );
     let _ = delegate.peer.set(peer);
     delegate.peer_ready.notify_waiters();
@@ -1057,12 +1072,13 @@ fn fixture_agent() -> i32 {
 
 /// Whether a spec's env policy may cross the sidecar boundary.
 ///
-/// Under the Environment Fidelity contract, child processes inherit the
-/// user's host environment by default (`EnvPolicy::InheritAll`), while
-/// caller-supplied `set` mappings and `Sanitized.inherit` names are checked so
+/// Caller-supplied `set` mappings and `Sanitized.inherit` names are checked so
 /// a remote peer cannot remap an arbitrary host variable into a different env
 /// key or request an unresolved `secret` reference without supplying a literal.
-fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy) -> bool {
+/// `InheritAll` additionally requires the launcher's trusted-caller opt-in:
+/// Environment Fidelity applies to trusted local launches, while an untrusted
+/// wire caller may only name allowlisted inherits and resolved literals.
+fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy, trusted: bool) -> bool {
     let allowed = |name: &str| a4aa::env::INHERITED_ENV.contains(&name);
     let set_admitted = |set: &std::collections::BTreeMap<String, a4aa::EnvValue>| {
         set.values().all(|value| match value {
@@ -1071,7 +1087,7 @@ fn env_admitted_over_sidecar(env: &a4aa::EnvPolicy) -> bool {
         })
     };
     match env {
-        a4aa::EnvPolicy::InheritAll { set } => set_admitted(set),
+        a4aa::EnvPolicy::InheritAll { set } => trusted && set_admitted(set),
         a4aa::EnvPolicy::Sanitized { inherit, set } => {
             inherit.iter().all(|name| allowed(name)) && set_admitted(set)
         }
@@ -1143,13 +1159,30 @@ mod tests {
         let mut set = BTreeMap::new();
         set.insert("SAFE".to_owned(), a4aa::EnvValue::Literal("1".into()));
         set.insert("PATH".to_owned(), a4aa::EnvValue::Source(host("PATH")));
-        assert!(env_admitted_over_sidecar(&a4aa::EnvPolicy::Sanitized {
-            inherit: vec!["PATH".into()],
-            set: set.clone(),
-        }));
-        assert!(env_admitted_over_sidecar(&a4aa::EnvPolicy::InheritAll {
-            set: set.clone(),
-        }));
+        assert!(env_admitted_over_sidecar(
+            &a4aa::EnvPolicy::Sanitized {
+                inherit: vec!["PATH".into()],
+                set: set.clone(),
+            },
+            false
+        ));
+        // InheritAll crosses only when the launcher declared its callers
+        // trusted: an untrusted wire caller gets refused even with an empty
+        // set, or ambient credentials would leak to a caller-chosen child.
+        assert!(env_admitted_over_sidecar(
+            &a4aa::EnvPolicy::InheritAll { set: set.clone() },
+            true
+        ));
+        assert!(!env_admitted_over_sidecar(
+            &a4aa::EnvPolicy::InheritAll { set: set.clone() },
+            false
+        ));
+        assert!(!env_admitted_over_sidecar(
+            &a4aa::EnvPolicy::InheritAll {
+                set: BTreeMap::new()
+            },
+            false
+        ));
         let auth_env = a4aa::EnvPolicy::InheritAll {
             set: BTreeMap::from([(
                 "DEVIN_API_KEY".to_owned(),
@@ -1170,12 +1203,16 @@ mod tests {
             "LEAK".to_owned(),
             a4aa::EnvValue::Source(host("OPENAI_API_KEY")),
         );
-        assert!(!env_admitted_over_sidecar(&a4aa::EnvPolicy::Sanitized {
-            inherit: vec![],
-            set: set.clone(),
-        }));
-        assert!(!env_admitted_over_sidecar(&a4aa::EnvPolicy::InheritAll {
-            set,
-        }));
+        assert!(!env_admitted_over_sidecar(
+            &a4aa::EnvPolicy::Sanitized {
+                inherit: vec![],
+                set: set.clone(),
+            },
+            true
+        ));
+        assert!(!env_admitted_over_sidecar(
+            &a4aa::EnvPolicy::InheritAll { set },
+            true
+        ));
     }
 }

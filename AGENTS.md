@@ -51,6 +51,12 @@ in *where* values resolve (locally, at the custody boundary) and
 *what* may cross a remote boundary (literal values, not references) —
 never in running with no environment at all.
 
+Fidelity applies to trusted local launches. An untrusted wire caller —
+a sidecar client — never receives ambient credentials: `InheritAll`
+crosses the sidecar boundary only under the launcher's explicit
+trusted-caller opt-in, and every other remote policy is confined to
+the inert allowlist plus resolved literals.
+
 ## Verify
 
 `scripts/verify.sh` — fmt + clippy + tests across the workspace.
