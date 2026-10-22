@@ -557,12 +557,16 @@ async fn serve(trust_host_env: bool) -> i32 {
         closed: closed.clone(),
         trust_host_env,
     });
+    // Ingress stays at the default bound: host→sidecar requests are small
+    // control frames (a 64 MiB request would be a paid-prompt blowup). The
+    // wide bound belongs to the egress direction only — large agent events
+    // flow sidecar→host, bounded by the host's own read limit.
     let peer = JsonRpcPeer::spawn(
         tokio::io::stdin(),
         tokio::io::stdout(),
         delegate.clone(),
         a4aa::observe::none(),
-        a4aa::framing::SIDECAR_MAX_MESSAGE_BYTES,
+        a4aa::framing::DEFAULT_MAX_MESSAGE_BYTES,
     );
     let _ = delegate.peer.set(peer);
     delegate.peer_ready.notify_waiters();
