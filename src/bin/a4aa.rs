@@ -1278,10 +1278,7 @@ mod tests {
             &host("PATH"),
             &a4aa::EnvPolicy::Sanitized {
                 inherit: vec!["PATH".to_owned()],
-                set: BTreeMap::from([(
-                    "PATH".to_owned(),
-                    a4aa::EnvValue::Literal(String::new()),
-                )]),
+                set: BTreeMap::from([("PATH".to_owned(), a4aa::EnvValue::Literal(String::new()),)]),
             }
         ));
         set.insert(

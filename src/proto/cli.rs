@@ -551,6 +551,7 @@ impl CliLane {
     /// future rides the same select; a write or read failure still
     /// terminates and reaps the child explicitly before the original error
     /// returns, and a cleanup failure is recorded for `close`.
+    #[allow(clippy::too_many_arguments)]
     async fn collect<W: std::future::Future<Output = Result<(), AdapterError>>>(
         &self,
         mut child: SupervisedChild,
