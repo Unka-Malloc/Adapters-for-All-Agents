@@ -1629,10 +1629,7 @@ mod protocol_failure_tests {
         // PATH is populated in every ambient process environment: a resolved
         // empty value must count as absent, not as an invitation to re-read
         // the host.
-        let env = std::collections::BTreeMap::from([(
-            "PATH".to_owned(),
-            OsString::from(""),
-        )]);
+        let env = std::collections::BTreeMap::from([("PATH".to_owned(), OsString::from(""))]);
         let resolved = resolve_auth_key(
             Some(&crate::env::EnvSource::HostEnv {
                 host_env: "PATH".to_owned(),
