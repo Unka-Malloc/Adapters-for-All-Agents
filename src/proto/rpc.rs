@@ -455,6 +455,23 @@ impl PendingTerminals {
 }
 
 impl RpcLane {
+    /// Resolve the lane's declared MCP registration into argv and child
+    /// environment additions. An empty server list needs no declaration; a
+    /// non-empty list without one is a configuration refusal, never a
+    /// silent drop.
+    fn install_mcp(&self) -> Result<crate::mcp::McpInstall, AdapterError> {
+        if self.spec.mcp_servers.is_empty() {
+            return Ok(crate::mcp::McpInstall::default());
+        }
+        let config = self.spec.mcp_config.as_ref().ok_or_else(|| {
+            AdapterError::permanent("agent_mcp_server_invalid", "session/open").with_detail(
+                "the rpc lane declares no MCP registration surface; refusing to run without the requested servers",
+            )
+        })?;
+        let servers = crate::mcp::McpServer::parse_all(&self.spec.mcp_servers)?;
+        crate::mcp::install(config, &servers)
+    }
+
     pub async fn open(
         &self,
         request: SessionRequest,
@@ -467,7 +484,17 @@ impl RpcLane {
                 "session/open",
             ));
         }
-        let env = crate::env::resolve(&self.command.env, &request.env, &*self.secrets).await?;
+        // MCP registration is part of admission, before any process is
+        // spawned: a lane that cannot install the requested servers fails
+        // closed instead of running the turn without the tools that carry
+        // its verdict.
+        let mcp = self.install_mcp()?;
+        let mut env = crate::env::resolve(&self.command.env, &request.env, &*self.secrets).await?;
+        for (name, value) in mcp.env {
+            env.insert(name, std::ffi::OsString::from(value));
+        }
+        let mut command_spec = self.command.clone();
+        command_spec.args.extend(mcp.args);
         type PeerIo = (
             Box<dyn tokio::io::AsyncRead + Unpin + Send>,
             Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -475,7 +502,7 @@ impl RpcLane {
         let (peer_io, child): (PeerIo, SupervisedChild) = match &self.spec.transport {
             crate::model::RpcTransport::Stdio => {
                 let mut command =
-                    SupervisedChild::command(&self.command, &env, request.cwd.as_deref());
+                    SupervisedChild::command(&command_spec, &env, request.cwd.as_deref());
                 let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
                 let (stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
                 if let Some(stderr) = stderr {
@@ -496,13 +523,13 @@ impl RpcLane {
             crate::model::RpcTransport::WebSocket { announce } => {
                 // A first-party daemon: the lane picks the loopback port,
                 // the server announces its `ws://` endpoint on stdout.
-                let mut command_spec = self.command.clone();
+                let mut ws_command = command_spec.clone();
                 let port = free_port()?;
-                for arg in &mut command_spec.args {
+                for arg in &mut ws_command.args {
                     *arg = arg.replace("{port}", &port.to_string());
                 }
                 let mut command =
-                    SupervisedChild::command(&command_spec, &env, request.cwd.as_deref());
+                    SupervisedChild::command(&ws_command, &env, request.cwd.as_deref());
                 let mut child = SupervisedChild::spawn(&mut command, stdio::PROTOCOL_IO)?;
                 let (_stdin, stdout, stderr) = stdio::protocol_halves(&mut child)?;
                 if let Some(stderr) = stderr {

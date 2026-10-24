@@ -15,7 +15,8 @@ mod native;
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
     DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, OsPath,
-    RpcCallDecl, RpcSurface, RpcTransportDecl, StoreKind, TranscriptUsage, UsageSurface,
+    RpcCallDecl, RpcMcpDecl, RpcSurface, RpcTransportDecl, StoreKind, TranscriptUsage,
+    UsageSurface,
 };
 use a4aa::dialect::{
     CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
@@ -68,6 +69,25 @@ pub fn adapt(set: &MechanismSet) -> AdaptationPlan {
 pub const fn dialect() -> &'static Dialect {
     &DIALECT
 }
+
+/// MCP registration for the app-server rpc lane.
+///
+/// `codex app-server` accepts the same dotted config overrides as the CLI:
+/// each named stdio server is installed with `-c
+/// mcp_servers.<name>.{command,args,env_vars}` before the process starts.
+/// Environment values stay in the child's environment and only their names
+/// cross the command line. The card declares the approval *mechanism*
+/// (`default_tools_approval_mode = "approve"`) but names no servers: the
+/// host opts each trusted verifier server in through
+/// `mcpConfig.toolsApprovalServers`, so every other server keeps codex's
+/// prompting default.
+const RPC_MCP: RpcMcpDecl = RpcMcpDecl {
+    flag: "-c",
+    root: "mcp_servers",
+    env_vars_key: "env_vars",
+    tools_approval_key: Some("default_tools_approval_mode"),
+    tools_approval_value: Some("approve"),
+};
 
 /// The `codex` agent card: `codex app-server --stdio` JSON-RPC.
 ///
@@ -141,6 +161,7 @@ pub const AGENT: AgentCard = AgentCard {
         transport: RpcTransportDecl::Stdio,
         max_frame_bytes: None,
         usage_path: None,
+        mcp: Some(&RPC_MCP),
     }),
     alternates: &[AlternateLane {
         // `codex exec --json` batch mode: NDJSON events on stdout —
@@ -340,6 +361,28 @@ mod tests {
         assert_eq!(done.turn_id_path.as_deref(), Some("turn.id"));
         assert!(rpc.passthrough.iter().any(|m| m == "model/list"));
         assert!(rpc.capabilities().session_resume);
+        // A verifier turn needs the host's MCP tools on the same process;
+        // the lane declares how they are installed instead of dropping them.
+        let mcp = rpc
+            .mcp_config
+            .as_ref()
+            .expect("app-server MCP registration");
+        assert_eq!(mcp.flag, "-c");
+        assert_eq!(mcp.root, "mcp_servers");
+        assert_eq!(mcp.env_vars_key, "env_vars");
+        let approval = mcp.tools_approval.as_ref().expect("tool approval default");
+        assert_eq!(approval.key, "default_tools_approval_mode");
+        assert_eq!(approval.value, "approve");
+        // The published card names no server; approval is host opt-in.
+        assert!(mcp.tools_approval_servers.is_empty());
+        assert!(rpc.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn native_table_reports_the_app_server_mcp_route() {
+        assert_eq!(NATIVE.mcp.mechanism, a4aa::McpMechanism::ConfigKey);
+        assert!(NATIVE.mcp.detail.contains("mcp_servers"), "{NATIVE:?}");
+        assert_eq!(NATIVE.last_verified, "2026-10-24");
     }
 
     #[test]

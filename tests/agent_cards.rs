@@ -540,6 +540,62 @@ exit 1
 }
 
 #[test]
+fn dsh_command_code_mount_is_a_real_production_step_and_feeds_the_catalog() {
+    // The mount helper is the production provisioning path behind
+    // `a4aa-dsh mount`: it reads the credential *reference* document and
+    // writes the ACP profile patch DSH loads on its next boot.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".credentials.yaml"),
+        include_str!("../crates/a4aa-dsh/tests/fixtures/dsh-command-code-mount.yaml"),
+    )
+    .unwrap();
+    let models = [
+        a4aa_dsh::CommandCodeModel {
+            id: "gpt-5.4".into(),
+            name: "GPT-5.4".into(),
+        },
+        a4aa_dsh::CommandCodeModel {
+            id: "gpt-5.4-mini".into(),
+            name: "GPT-5.4 Mini".into(),
+        },
+    ];
+    let mounted = a4aa_dsh::mount_command_code(
+        home.path(),
+        a4aa_dsh::COMMAND_CODE_BASE_URL,
+        &models,
+        a4aa_dsh::MountPolicy::CreateOnly,
+    )
+    .expect("production mount");
+    assert!(mounted.changed);
+    let patch = std::fs::read_to_string(&mounted.patch_path).expect("profile patch");
+    assert!(patch.contains("name: '@deepseek-ai/dsh-llm-pi-ai'"));
+    assert!(patch.contains("apiKeyEnv: COMMAND_CODE_API_KEY"));
+    assert!(patch.contains("id: gpt-5.4"));
+    assert!(!patch.contains("fixture"));
+
+    // Once DSH mounts that route, `session/new` advertises the provider in
+    // configOptions; the card's catalog parser must read it back.
+    let catalog: serde_json::Value = serde_json::from_str(include_str!(
+        "../crates/a4aa-dsh/tests/fixtures/session_new_config_options.json"
+    ))
+    .unwrap();
+    let providers = a4aa_dsh::providers_from_config_options(&catalog["configOptions"]);
+    let command_code = providers
+        .iter()
+        .find(|provider| provider.id == a4aa_dsh::COMMAND_CODE_PROVIDER)
+        .expect("command-code in the ACP catalog");
+    assert_eq!(
+        command_code
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gpt-5.4", "gpt-5.4-mini"]
+    );
+}
+
+#[test]
 fn registry_exposes_all_five_second_batch_cards() {
     for id in ["opencode", "dsh", "antigravity", "pi", "cursor"] {
         let card = a4aa_dialects::card(id).unwrap_or_else(|| panic!("card {id}"));

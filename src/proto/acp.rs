@@ -1443,21 +1443,23 @@ fn cancelled_prompt() -> TurnOutcome {
 }
 
 fn protocol_failure(stage: &'static str, error: agent_client_protocol::Error) -> AdapterError {
-    // An explicit auth refusal is a certain non-effect: the request was
-    // rejected before the agent served it, so another candidate may
-    // safely replay it. ACP reuses JSON-RPC -32000 (`AuthRequired`) for
-    // that case, but agents also emit -32000 for provider quota and
-    // capacity refusals. A refusal text cannot prove the turn had no
-    // billable effect — tools or tokens may already have been spent —
-    // so it settles as failover-eligible but uncertain-effect. Everything
-    // else stays uncertain — a dropped connection mid-turn could have
-    // already done billable work.
-    if error.code == agent_client_protocol::ErrorCode::AuthRequired {
-        if crate::error::quota_or_capacity_refusal(&error.to_string()) {
-            AdapterError::uncertain("agent_quota_exhausted", stage).with_detail(error.to_string())
-        } else {
-            AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
-        }
+    // Quota, capacity and model-availability refusals are classified from
+    // the refusal itself before the JSON-RPC code is considered. ACP uses
+    // `AuthRequired` (-32000) for credential failures, but OpenCode emits
+    // its exhausted free-usage refusal as `InternalError` (-32603); keying
+    // on the code alone would leave that incident classified as a generic
+    // protocol failure. The refusal text cannot prove the turn had no
+    // billable effect — tools or tokens may already have been spent — so
+    // it settles as failover-eligible but uncertain-effect.
+    //
+    // A credential-only `AuthRequired` is still a certain non-effect: the
+    // request was rejected before the agent served it, so another
+    // candidate may safely replay it. Everything else stays uncertain — a
+    // dropped connection mid-turn could already have done billable work.
+    if crate::error::quota_or_capacity_refusal(&error.to_string()) {
+        AdapterError::uncertain("agent_quota_exhausted", stage).with_detail(error.to_string())
+    } else if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+        AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
     } else {
         AdapterError::uncertain("agent_protocol_failed", stage).with_detail(error.to_string())
     }
@@ -1621,6 +1623,52 @@ mod protocol_failure_tests {
             agent_client_protocol::Error::auth_required(),
         );
         assert_eq!(mapped.code, "agent_auth_required");
+    }
+
+    /// Recorded OpenCode refusal: a sanitized excerpt of the server's ACP
+    /// error keeps its JSON-RPC code (-32603, not AuthRequired), message and
+    /// cause type. The free-usage exhaustion must surface as a quota
+    /// refusal so custody can fail over instead of recording a generic
+    /// protocol failure.
+    #[test]
+    fn recorded_opencode_quota_refusal_on_internal_error_is_quota_exhausted() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/opencode-acp-quota-refusal.json");
+        let fixture: Value = serde_json::from_str(FIXTURE).expect("recorded refusal fixture");
+        let recorded = &fixture["recorded_error"];
+        let code = recorded["code"].as_i64().expect("error code") as i32;
+        assert_ne!(
+            code,
+            i32::from(agent_client_protocol::ErrorCode::AuthRequired),
+            "the incident was an InternalError, which the old auth-only branch missed"
+        );
+        let error = agent_client_protocol::Error::new(
+            code,
+            recorded["message"].as_str().expect("refusal message"),
+        )
+        .data(serde_json::json!({
+            "type": recorded["cause_type"].as_str().expect("cause type"),
+        }));
+        let mapped = protocol_failure("session/prompt", error);
+        assert_eq!(mapped.code, "agent_quota_exhausted");
+        assert!(mapped.retryable);
+        assert!(mapped.uncertain_effect);
+        assert!(
+            mapped
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Free usage limit reached")),
+            "{mapped}"
+        );
+    }
+
+    #[test]
+    fn internal_error_without_a_quota_refusal_stays_protocol_failed() {
+        let mapped = protocol_failure(
+            "session/prompt",
+            agent_client_protocol::Error::new(-32603, "Internal server error"),
+        );
+        assert_eq!(mapped.code, "agent_protocol_failed");
+        assert!(mapped.uncertain_effect);
     }
 
     #[tokio::test]

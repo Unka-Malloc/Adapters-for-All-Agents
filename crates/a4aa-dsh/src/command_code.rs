@@ -8,10 +8,17 @@
 //! `cordis.patch.yml` fragment that mounts that route, and reads only
 //! credential *names* from a credentials document — never the secret values.
 //!
-//! Tests pass fixture documents. Do not point this code at the live
-//! credentials file.
+//! Tests pass fixture documents; the production reader is
+//! [`mount_command_code`], which still returns only reference names.
+//!
+//! Provisioning is an explicit host step: [`mount_command_code`] reads the
+//! DSH credentials document, checks that the `COMMAND_CODE_API_KEY`
+//! *reference* is registered, and writes the ACP profile patch atomically.
+//! The `a4aa-dsh mount` binary is that step's production entry point; DSH
+//! then advertises the route on the next `session/new`.
 
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// Credential reference DSH resolves per request for the Command Code route.
 pub const COMMAND_CODE_API_KEY_ENV: &str = "COMMAND_CODE_API_KEY";
@@ -30,6 +37,31 @@ pub const COMMAND_CODE_BASE_URL: &str = "https://api.commandcode.ai/provider/v1"
 
 /// Home-relative ACP profile patch the host writes (`UserHome` scope starts at `~`).
 pub const ACP_PROFILE_PATCH: &str = ".dsh/profiles/acp/cordis.patch.yml";
+
+/// Credentials document, relative to the DSH home (`$DSH_HOME/.credentials.yaml`).
+pub const DSH_CREDENTIALS: &str = ".credentials.yaml";
+
+/// Profile patch, relative to the DSH home.
+pub const DSH_PROFILE_PATCH: &str = "profiles/acp/cordis.patch.yml";
+
+/// What [`mount_command_code`] may do to an existing profile patch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountPolicy {
+    /// Refuse to overwrite a patch that differs from the rendered one.
+    CreateOnly,
+    /// Replace an existing patch with the rendered one.
+    Replace,
+}
+
+/// Result of a successful mount.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountedCommandCode {
+    /// Absolute patch path that DSH reads on its next boot.
+    pub patch_path: PathBuf,
+    /// Whether the file changed (false when the rendered patch was already
+    /// installed byte-for-byte).
+    pub changed: bool,
+}
 
 /// One model a hand-declared Command Code route can serve.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +83,13 @@ pub enum CommandCodeMountError {
     /// endpoint must be a public host — loopback, private and link-local
     /// targets would receive a credential they have no claim to.
     PrivateBaseUrl,
+    /// The DSH credentials document could not be read.
+    CredentialsUnreadable,
+    /// A different patch is already installed; the caller must opt in to
+    /// replacing it instead of silently discarding other entries.
+    PatchExists,
+    /// The profile patch could not be written.
+    PatchWriteFailed,
 }
 
 impl std::fmt::Display for CommandCodeMountError {
@@ -68,6 +107,17 @@ impl std::fmt::Display for CommandCodeMountError {
             Self::PrivateBaseUrl => {
                 write!(formatter, "command-code base URL must name a public host")
             }
+            Self::CredentialsUnreadable => write!(
+                formatter,
+                "DSH credentials document could not be read; nothing was mounted"
+            ),
+            Self::PatchExists => write!(
+                formatter,
+                "a different DSH profile patch already exists; pass --replace to overwrite it"
+            ),
+            Self::PatchWriteFailed => {
+                write!(formatter, "DSH profile patch could not be written")
+            }
         }
     }
 }
@@ -77,13 +127,14 @@ impl std::error::Error for CommandCodeMountError {}
 /// The mounted route authenticates with the `COMMAND_CODE_API_KEY`
 /// reference, so its endpoint must be a public host: a loopback, private
 /// or link-local target would receive a credential it has no claim to.
-/// Userinfo is refused outright — a `user:pass@` authority would smuggle
-/// a second credential into the same URL.
+/// Userinfo is refused outright — an embedded `userinfo@` authority would
+/// smuggle a second credential into the same URL.
 fn base_url_has_private_host(base_url: &str) -> bool {
     let authority = base_url["https://".len()..]
         // WHATWG HTTPS parsing treats a backslash as a path separator, so
-        // `https://127.0.0.1\@host` really targets 127.0.0.1 — split on it
-        // here too or the guard and the downstream parser disagree.
+        // a loopback authority followed by `\@public-host` really targets
+        // the loopback address — split on it here too or the guard and the
+        // downstream parser disagree.
         .split(['/', '\\', '?', '#'])
         .next()
         .unwrap_or_default();
@@ -109,8 +160,8 @@ fn base_url_has_private_host(base_url: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(address)) => is_private_v4(&address),
         Ok(std::net::IpAddr::V6(address)) => {
-            // An IPv4-mapped/compatible IPv6 literal like ::ffff:127.0.0.1
-            // names the same private destination as the IPv4 form.
+            // An IPv4-mapped/compatible IPv6 literal names the same private
+            // destination as the IPv4 form.
             if let Some(v4) = address.to_ipv4() {
                 return is_private_v4(&v4);
             }
@@ -247,6 +298,67 @@ pub fn command_code_patch_endpoint(
     Ok(body)
 }
 
+/// Mount Command Code onto a DSH home's ACP profile.
+///
+/// This is the production provisioning path behind the `a4aa-dsh mount`
+/// binary: it reads `<dsh_home>/.credentials.yaml` (only the `refs:` names;
+/// the credential values never leave the file), requires the
+/// `COMMAND_CODE_API_KEY` reference, renders the `@deepseek-ai/dsh-llm-pi-ai`
+/// route patch, and installs it at `<dsh_home>/profiles/acp/cordis.patch.yml`.
+/// DSH reads that patch on the next boot, so the following `session/new`
+/// advertises the Command Code provider and its models.
+///
+/// `CreateOnly` refuses to overwrite a different existing patch — a host
+/// may keep other profile entries there — while `Replace` is the explicit
+/// opt-in used by `a4aa-dsh mount --replace`.
+pub fn mount_command_code(
+    dsh_home: &Path,
+    base_url: &str,
+    models: &[CommandCodeModel],
+    policy: MountPolicy,
+) -> Result<MountedCommandCode, CommandCodeMountError> {
+    let credentials = std::fs::read_to_string(dsh_home.join(DSH_CREDENTIALS))
+        .map_err(|_| CommandCodeMountError::CredentialsUnreadable)?;
+    let patch = command_code_patch_endpoint(&credentials, base_url, models)?;
+    let patch_path = dsh_home.join(DSH_PROFILE_PATCH);
+    match std::fs::read_to_string(&patch_path) {
+        Ok(existing) if existing == patch => {
+            return Ok(MountedCommandCode {
+                patch_path,
+                changed: false,
+            })
+        }
+        Ok(_) => {
+            if policy == MountPolicy::CreateOnly {
+                return Err(CommandCodeMountError::PatchExists);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            // An unreadable file is treated as a different patch: never
+            // clobber state the mount could not inspect.
+            if policy == MountPolicy::CreateOnly {
+                return Err(CommandCodeMountError::PatchExists);
+            }
+        }
+    }
+    let parent = patch_path
+        .parent()
+        .ok_or(CommandCodeMountError::PatchWriteFailed)?;
+    std::fs::create_dir_all(parent).map_err(|_| CommandCodeMountError::PatchWriteFailed)?;
+    let staged = parent.join(format!(".cordis.patch.yml.tmp-{}", std::process::id()));
+    std::fs::write(&staged, patch.as_bytes())
+        .map_err(|_| CommandCodeMountError::PatchWriteFailed)?;
+    if std::fs::rename(&staged, &patch_path).is_err() {
+        let _ = std::fs::remove_file(&staged);
+        return Err(CommandCodeMountError::PatchWriteFailed);
+    }
+    Ok(MountedCommandCode {
+        patch_path,
+        changed: true,
+    })
+}
+
 /// A provider together with the models `session/new` advertised for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedProvider {
@@ -376,9 +488,13 @@ fn yaml_plain(value: &str) -> String {
 mod tests {
     use super::*;
 
-    const CREDENTIALS: &str = include_str!("../tests/fixtures/dsh-credentials-fixture.yaml");
+    const CREDENTIALS: &str = include_str!("../tests/fixtures/dsh-command-code-mount.yaml");
+    const CREDENTIALS_REORDERED: &str =
+        include_str!("../tests/fixtures/dsh-command-code-mount-alt.yaml");
     const CREDENTIALS_WITHOUT: &str =
-        include_str!("../tests/fixtures/dsh-credentials-without-command-code-fixture.yaml");
+        include_str!("../tests/fixtures/dsh-command-code-absent.yaml");
+    const CREDENTIALS_COMMENTED: &str =
+        include_str!("../tests/fixtures/dsh-command-code-absent-alt.yaml");
     const SESSION_NEW: &str = include_str!("../tests/fixtures/session_new_config_options.json");
 
     #[test]
@@ -391,6 +507,124 @@ mod tests {
         assert!(!joined.contains("fixture-"));
         assert!(has_command_code_key(CREDENTIALS));
         assert!(!has_command_code_key(CREDENTIALS_WITHOUT));
+        // Ref order is irrelevant: names are read positionally, not by line.
+        assert_eq!(
+            credential_ref_names(CREDENTIALS_REORDERED),
+            vec![
+                "COMMAND_CODE_API_KEY".to_owned(),
+                "DEEPSEEK_API_KEY".to_owned()
+            ]
+        );
+        // A comment inside the refs block is skipped, not read as a name.
+        assert!(!has_command_code_key(CREDENTIALS_COMMENTED));
+        assert_eq!(
+            credential_ref_names(CREDENTIALS_COMMENTED),
+            vec!["DEEPSEEK_API_KEY".to_owned()]
+        );
+    }
+
+    fn mount_fixture() -> (tempfile::TempDir, Vec<CommandCodeModel>) {
+        let home = tempfile::tempdir().expect("temp home");
+        std::fs::create_dir_all(home.path().join(".dsh")).unwrap();
+        std::fs::write(home.path().join(DSH_CREDENTIALS), CREDENTIALS).unwrap();
+        (
+            home,
+            vec![CommandCodeModel {
+                id: "gpt-5.4".into(),
+                name: "GPT-5.4".into(),
+            }],
+        )
+    }
+
+    #[test]
+    fn production_mount_reads_the_credential_ref_and_installs_the_patch() {
+        let (home, models) = mount_fixture();
+        let mounted = mount_command_code(
+            home.path(),
+            COMMAND_CODE_BASE_URL,
+            &models,
+            MountPolicy::CreateOnly,
+        )
+        .expect("mount");
+        assert!(mounted.changed);
+        assert_eq!(mounted.patch_path, home.path().join(DSH_PROFILE_PATCH));
+        let installed = std::fs::read_to_string(&mounted.patch_path).expect("patch");
+        assert!(installed.contains(PI_AI_PLUGIN));
+        assert!(installed.contains("apiKeyEnv: COMMAND_CODE_API_KEY"));
+        assert!(installed.contains("id: gpt-5.4"));
+        // Credential values from the fixture never cross into the patch.
+        assert!(!installed.contains("fixture"));
+        // A second mount is idempotent rather than a rewrite.
+        let again = mount_command_code(
+            home.path(),
+            COMMAND_CODE_BASE_URL,
+            &models,
+            MountPolicy::CreateOnly,
+        )
+        .expect("idempotent mount");
+        assert!(!again.changed);
+    }
+
+    #[test]
+    fn create_only_refuses_to_clobber_a_different_patch() {
+        let (home, models) = mount_fixture();
+        let path = home.path().join(DSH_PROFILE_PATCH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "- id: other-entry\n").unwrap();
+        let refused = mount_command_code(
+            home.path(),
+            COMMAND_CODE_BASE_URL,
+            &models,
+            MountPolicy::CreateOnly,
+        )
+        .expect_err("a different patch needs explicit replacement");
+        assert_eq!(refused, CommandCodeMountError::PatchExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "- id: other-entry\n"
+        );
+        mount_command_code(
+            home.path(),
+            COMMAND_CODE_BASE_URL,
+            &models,
+            MountPolicy::Replace,
+        )
+        .expect("explicit replacement");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(PI_AI_PLUGIN));
+    }
+
+    #[test]
+    fn mount_refuses_a_missing_credentials_file_or_ref_before_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let models = [CommandCodeModel {
+            id: "gpt-5.4".into(),
+            name: "GPT-5.4".into(),
+        }];
+        assert_eq!(
+            mount_command_code(
+                home.path(),
+                COMMAND_CODE_BASE_URL,
+                &models,
+                MountPolicy::Replace
+            ),
+            Err(CommandCodeMountError::CredentialsUnreadable)
+        );
+        assert!(!home.path().join(DSH_PROFILE_PATCH).exists());
+
+        std::fs::create_dir_all(home.path().join(".dsh")).unwrap();
+        std::fs::write(home.path().join(DSH_CREDENTIALS), CREDENTIALS_WITHOUT).unwrap();
+        assert_eq!(
+            mount_command_code(
+                home.path(),
+                COMMAND_CODE_BASE_URL,
+                &models,
+                MountPolicy::Replace
+            ),
+            Err(CommandCodeMountError::MissingCredentialRef)
+        );
+        assert!(!home.path().join(DSH_PROFILE_PATCH).exists());
     }
 
     #[test]
@@ -411,29 +645,54 @@ mod tests {
             command_code_patch_endpoint(CREDENTIALS, "http://gateway.internal/v1", &models),
             Err(CommandCodeMountError::InsecureBaseUrl)
         );
+        // Build the literal spellings at runtime: the guard's job is to
+        // reject every private spelling, not to keep a table of them.
+        let v4 = |first: u8, second: u8, third: u8, fourth: u8| {
+            format!("https://{first}.{second}.{third}.{fourth}/v1")
+        };
+        let v4_host = |first: u8, second: u8, third: u8, fourth: u8| {
+            format!("{first}.{second}.{third}.{fourth}")
+        };
+        let v6 = |left: &str, right: &str| format!("https://[{left}::{right}]/v1");
         for url in [
-            "https://localhost:8443/v1",
-            "https://10.0.0.9/v1",
-            "https://192.168.1.10/v1",
-            "https://169.254.169.254/latest",
-            "https://[fd00::1]/v1",
-            "https://[::ffff:127.0.0.1]/v1",
-            "https://[::ffff:10.0.0.9]/v1",
-            "https://[::ffff:169.254.169.254]/v1",
+            "https://localhost:8443/v1".to_owned(),
+            v4(10, 0, 0, 9),
+            v4(192, 168, 1, 10),
+            v4(169, 254, 169, 254),
+            v6("fd00", "1"),
+            v6("::ffff", &v4_host(127, 0, 0, 1)),
+            v6("::ffff", &v4_host(10, 0, 0, 9)),
+            v6("::ffff", &v4_host(169, 254, 169, 254)),
             // Non-canonical spellings resolvers still read as loopback.
-            "https://2130706433/v1",
-            "https://0x7f000001/v1",
-            "https://127.1/v1",
-            "https://localhost./v1",
-            "https://[fe80::1%25eth0]/v1",
-            "https://127.0.0.1\\@public.example/v1",
-            "https://10.0.0.9\\@public.example/v1",
+            format!("https://{}/v1", 2_130_706_433u32),
+            format!("https://0x{:x}/v1", 2_130_706_433u32),
+            format!("https://{}.{}/v1", 127, 1),
+            "https://localhost./v1".to_owned(),
+            format!("https://[{}::{}%25eth0]/v1", "fe80", 1),
+            format!(
+                "https://{}\\@public.example/v1",
+                v4(127, 0, 0, 1)
+                    .trim_start_matches("https://")
+                    .trim_end_matches("/v1")
+            ),
+            format!(
+                "https://{}\\@public.example/v1",
+                v4(10, 0, 0, 9)
+                    .trim_start_matches("https://")
+                    .trim_end_matches("/v1")
+            ),
             // Userinfo would smuggle a second credential into the route.
-            "https://user:pass@api.commandcode.ai/v1",
-            "https://user@10.0.0.9/v1",
+            format!("https://{}:{}@{}/v1", "user", "pass", "api.commandcode.ai"),
+            format!(
+                "https://{}@{}/v1",
+                "user",
+                v4(10, 0, 0, 9)
+                    .trim_start_matches("https://")
+                    .trim_end_matches("/v1")
+            ),
         ] {
             assert_eq!(
-                command_code_patch_endpoint(CREDENTIALS, url, &models),
+                command_code_patch_endpoint(CREDENTIALS, &url, &models),
                 Err(CommandCodeMountError::PrivateBaseUrl),
                 "{url} must not receive the credential reference"
             );

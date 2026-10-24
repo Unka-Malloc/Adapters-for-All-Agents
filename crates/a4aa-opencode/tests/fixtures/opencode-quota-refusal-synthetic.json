@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "description": "Hand-authored, schema-faithful OpenCode terminal message shape for a quota refusal. Nothing here was captured: the id and timestamp are fabricated placeholders, and the error class and message reproduce OpenCode's own AI.Error.QuotaExceeded wording. No session, account, host, usage event, or operational feed data is represented.",
+  "record": {
+    "id": "msg_synthetic_quota_refusal",
+    "time": { "created": 1700000000000 },
+    "type": "idle",
+    "outcome": "failed",
+    "error": {
+      "type": "provider.quota",
+      "message": "AI.Error: Free usage limit reached. Subscribe to OpenCode Go to keep going: https://opencode.ai/go"
+    }
+  }
+}

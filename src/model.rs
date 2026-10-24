@@ -156,6 +156,12 @@ pub struct CliLaneSpec {
     /// `-fast` speed marker survives the rewrite.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort_model_suffixes: Vec<String>,
+    /// MCP servers the host asked this lane to install. The cli lane
+    /// declares no native MCP registration surface, so a non-empty list is
+    /// refused at session open. Carrying the list (instead of dropping it
+    /// in the custody layer) is what keeps the refusal explicit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<serde_json::Value>,
 }
 
 /// One configured JSON-RPC call: method plus a params template. String
@@ -265,6 +271,56 @@ pub struct RpcLaneSpec {
     /// scanned instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_path: Option<String>,
+    /// MCP servers installed for every session, in the ACP declaration shape
+    /// (`{name, command, args, env}`). A lane with no `mcp_config` refuses a
+    /// non-empty list at open instead of silently running without tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<serde_json::Value>,
+    /// How this lane installs `mcp_servers`. `None` is an explicit
+    /// no-registration declaration; it is not permission to drop the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config: Option<RpcMcpConfig>,
+}
+
+/// How an rpc lane installs MCP servers before the first session call.
+///
+/// The config-override shape is for agents that accept dotted `-c
+/// key=value` overrides on their own argv. Environment values never ride
+/// that command line: each server's names are forwarded through the child's
+/// environment, so a run token stays out of process listings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RpcMcpConfig {
+    /// Argv flag introducing one dotted `key=value` override (`-c`).
+    pub flag: String,
+    /// Dotted config root under which servers are named
+    /// (`mcp_servers`).
+    pub root: String,
+    /// Config key that forwards environment variable names into the server
+    /// process (`env_vars`). Empty means env-carrying servers are refused.
+    #[serde(default)]
+    pub env_vars_key: String,
+    /// How to express a tool-approval default for the servers named in
+    /// `tools_approval_servers`. `None` means this lane cannot express one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_approval: Option<RpcMcpToolApproval>,
+    /// Exact server names whose tools are pre-approved. Approval is never
+    /// card-wide: a server absent from this list keeps the agent's prompting
+    /// default, and an empty list pre-approves nothing. The host names each
+    /// trusted server explicitly instead of every server inheriting one
+    /// blanket setting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_approval_servers: Vec<String>,
+}
+
+/// One config key/value pair that pre-approves a server's tools.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RpcMcpToolApproval {
+    /// Config key under the server table (`default_tools_approval_mode`).
+    pub key: String,
+    /// Value installed for that key (`approve`).
+    pub value: String,
 }
 
 /// Where an rpc lane's bytes flow.

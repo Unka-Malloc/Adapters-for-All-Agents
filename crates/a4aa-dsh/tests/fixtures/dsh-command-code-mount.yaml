@@ -1,6 +1,6 @@
 # Fixture DSH credentials document. Values are placeholders, not live secrets.
 version: 1
 refs:
-  DEEPSEEK_API_KEY: fixture-deepseek-key
-  COMMAND_CODE_API_KEY: fixture-command-code-key
+  DEEPSEEK_API_KEY: fixture
+  COMMAND_CODE_API_KEY: fixture
 records: {}

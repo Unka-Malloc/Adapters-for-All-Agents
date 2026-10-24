@@ -53,6 +53,23 @@ impl CliLane {
     fn record_cleanup_failure(&self, error: AdapterError) {
         *self.cleanup_failure.lock().unwrap() = Some(error);
     }
+
+    /// The CLI lane has no native MCP registration surface: it cannot pass a
+    /// server list to the spawned agent. A non-empty list is refused before
+    /// any process exists, instead of a verifier turn silently running
+    /// without the tools that carry its verdict.
+    pub(crate) fn admit_mcp(&self) -> Result<(), AdapterError> {
+        if self.lane.mcp_servers.is_empty() {
+            return Ok(());
+        }
+        Err(AdapterError::permanent(
+            "agent_mcp_server_invalid",
+            "session/open",
+        )
+        .with_detail(
+            "the cli lane declares no MCP registration surface; refusing to run without the requested servers",
+        ))
+    }
 }
 
 impl CliLane {
@@ -60,6 +77,7 @@ impl CliLane {
     /// resume binding exists; the first non-empty stdout line becomes the
     /// observed session binding (for example `cursor-agent create-chat`).
     pub async fn open_binding(&self, request: &SessionRequest) -> Result<(), AdapterError> {
+        self.admit_mcp()?;
         let requested = request
             .resume
             .as_deref()
@@ -227,6 +245,7 @@ impl CliLane {
             .filter(|v| !v.trim().is_empty())
             .map(str::to_owned)
             .or_else(|| self.observed.get().cloned());
+        self.admit_mcp()?;
         // An explicitly requested binding the CLI cannot express fails
         // closed — silently running a fresh process would lose the host's
         // session. `resume_args` or a `{sessionId}` placeholder inside the

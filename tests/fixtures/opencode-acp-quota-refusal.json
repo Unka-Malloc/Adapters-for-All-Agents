@@ -1,0 +1,8 @@
+{
+  "provenance": "Sanitized excerpt of OpenCode's ACP error for an exhausted free-usage allowance. Stack frames, identifiers, session records, timestamps and host paths were removed; the vendor's JSON-RPC code, message and cause type are unchanged.",
+  "recorded_error": {
+    "code": -32603,
+    "message": "AI.Error: Free usage limit reached. Subscribe to OpenCode Go to keep going: https://opencode.ai/go",
+    "cause_type": "AI.Error.QuotaExceeded"
+  }
+}

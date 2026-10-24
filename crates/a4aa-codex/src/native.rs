@@ -7,7 +7,7 @@ use a4aa::native::{
 
 /// Native surfaces and AwP primitives for Codex.
 pub const NATIVE: NativeCapability = NativeCapability {
-    last_verified: "2026-10-21",
+    last_verified: "2026-10-24",
     surfaces: InteractionSurfaces {
         serve: cell(NativeStatus::NotOffered, "no first-party HTTP serve"),
         sdk: cell(
@@ -20,14 +20,14 @@ pub const NATIVE: NativeCapability = NativeCapability {
         ),
         rpc: cell(
             NativeStatus::Native,
-            "codex app-server --stdio: initialize, thread/start|resume, turn/start",
+            "codex app-server --stdio: -c MCP registration, initialize, thread/start|resume, turn/start",
         ),
         cli: cell(NativeStatus::Native, "codex exec --json batch alternate"),
         pty: cell(NativeStatus::Native, "interactive codex TTY"),
     },
     mcp: McpRegistration {
-        mechanism: McpMechanism::Unsupported,
-        detail: "McpSurface::None",
+        mechanism: McpMechanism::ConfigKey,
+        detail: "codex app-server -c mcp_servers.<name>.{command,args,env_vars}; default_tools_approval_mode only for mcpConfig.toolsApprovalServers; ~/.codex/config.toml [mcp_servers]",
     },
     config: ConfigLocations {
         settings: "{home}/.codex/config.toml",

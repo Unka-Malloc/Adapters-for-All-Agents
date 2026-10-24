@@ -13,7 +13,7 @@ use a4aa::native::{
 
 /// Native surfaces and AwP primitives for DeepSeek Harness.
 pub const NATIVE: NativeCapability = NativeCapability {
-    last_verified: "2026-10-21",
+    last_verified: "2026-10-24",
     surfaces: InteractionSurfaces {
         serve: cell(NativeStatus::NotOffered, "no first-party HTTP serve"),
         sdk: cell(
@@ -45,7 +45,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         settings: "{home}/.dsh/.credentials.yaml",
         hooks: "",
         permissions: "",
-        model_catalog: "ACP session/new configOptions; SDK initialize provider/model",
+        model_catalog: "ACP session/new configOptions (shipped providers plus a Command Code route provisioned by `a4aa-dsh mount`); SDK initialize provider/model",
     },
     primitives: AwpPrimitives {
         model_selection: cell(

@@ -28,7 +28,8 @@ use crate::dialect::Dialect;
 use crate::env::{EnvPolicy, EnvSource};
 use crate::model::{
     AgentSpec, BindingReceiptShape, CliLaneSpec, CommandSpec, LaneSpec, PromptChannel, RpcCallSpec,
-    RpcCompletionSpec, RpcEnvelopeSpec, RpcLaneSpec, RpcTransport, SessionScope, StreamMode,
+    RpcCompletionSpec, RpcEnvelopeSpec, RpcLaneSpec, RpcMcpConfig, RpcMcpToolApproval,
+    RpcTransport, SessionScope, StreamMode,
 };
 
 /// The complete descriptor for one agent.
@@ -211,6 +212,7 @@ impl AgentCard {
                     .iter()
                     .map(|level| (*level).to_owned())
                     .collect(),
+                mcp_servers: Vec::new(),
             })),
             AgentSurface::Rpc(rpc) => LaneSpec::Rpc(Box::new(RpcLaneSpec {
                 initialize: rpc.initialize.map(RpcCallDecl::call),
@@ -264,6 +266,24 @@ impl AgentCard {
                 },
                 max_frame_bytes: rpc.max_frame_bytes,
                 usage_path: rpc.usage_path.map(str::to_owned),
+                mcp_servers: Vec::new(),
+                mcp_config: rpc.mcp.map(|mcp| RpcMcpConfig {
+                    flag: mcp.flag.to_owned(),
+                    root: mcp.root.to_owned(),
+                    env_vars_key: mcp.env_vars_key.to_owned(),
+                    tools_approval: match (mcp.tools_approval_key, mcp.tools_approval_value) {
+                        (Some(key), Some(value)) => Some(RpcMcpToolApproval {
+                            key: key.to_owned(),
+                            value: value.to_owned(),
+                        }),
+                        _ => None,
+                    },
+                    // The card declares the mechanism only. Naming the
+                    // trusted servers is host configuration (`mcpConfig`),
+                    // so a published card never carries a private service
+                    // name and no server is pre-approved by default.
+                    tools_approval_servers: Vec::new(),
+                }),
             })),
             AgentSurface::Serve { .. } => LaneSpec::Serve {
                 mcp_servers: Vec::new(),
@@ -476,6 +496,28 @@ pub struct RpcSurface {
     /// `TurnOutcome::usage`. `None` scans the conventional carriers
     /// (`params.usage`, `params.message.usage`).
     pub usage_path: Option<&'static str>,
+    /// Native MCP registration surface; `None` means this rpc lane cannot
+    /// install servers and must refuse a non-empty server list.
+    pub mcp: Option<&'static RpcMcpDecl>,
+}
+
+/// Card-level MCP registration declaration for a dotted `key=value`
+/// config-override surface (for example `codex app-server -c …`).
+#[derive(Clone, Copy)]
+pub struct RpcMcpDecl {
+    /// Argv flag introducing one override (`-c`).
+    pub flag: &'static str,
+    /// Dotted config root under which servers are named (`mcp_servers`).
+    pub root: &'static str,
+    /// Config key that forwards environment variable names (`env_vars`).
+    pub env_vars_key: &'static str,
+    /// Optional key installed per server to pre-approve tool calls
+    /// (`default_tools_approval_mode`). Which servers receive it is host
+    /// configuration (`mcpConfig.toolsApprovalServers`), never a blanket
+    /// card-wide default.
+    pub tools_approval_key: Option<&'static str>,
+    /// Value installed for `tools_approval_key` (`approve`).
+    pub tools_approval_value: Option<&'static str>,
 }
 
 /// Card-level transport declaration — `&'static` friendly counterpart of

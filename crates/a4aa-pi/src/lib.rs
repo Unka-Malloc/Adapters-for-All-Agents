@@ -155,6 +155,7 @@ pub const AGENT: AgentCard = AgentCard {
         // frame - a real audit transcript is megabytes, not kilobytes.
         max_frame_bytes: Some(64 * 1024 * 1024),
         usage_path: Some("message.usage"),
+        mcp: None,
     }),
     alternates: &[AlternateLane {
         // `pi --print`: one-shot CLI. `--thinking` is the native effort

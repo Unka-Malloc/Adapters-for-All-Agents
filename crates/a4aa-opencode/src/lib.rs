@@ -24,6 +24,19 @@ use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, Mechani
 
 pub use native::{native, NATIVE};
 
+/// OpenCode's own `error.type` for an exhausted quota or usage allowance.
+///
+/// The server maps `AI.Error.QuotaExceeded` onto `provider.quota` in its
+/// execution-error classifier, so this class — not the wording of the
+/// message — decides that a refused turn must surface as
+/// `agent_quota_exhausted` and let custody fail over.
+///
+/// The classification is a terminal label, not a retry: the provider has
+/// already refused the turn for exhaustion, and the adapter sends no
+/// second request to it. `uncertain_effect` stays set so a caller cannot
+/// blind-replay work while the first attempt's effect is unresolved.
+pub const QUOTA_REFUSAL_ERROR_TYPES: &[&str] = &["provider.quota"];
+
 /// The `opencode` dialect: OpenCode JS plugin hooks, AGENTS.md, skills, commands, subagents, opencode.json MCP.
 pub const DIALECT: Dialect = Dialect {
     id: "opencode",

@@ -50,6 +50,8 @@ fn rpc_spec() -> AgentSpec {
             transport: RpcTransport::Stdio,
             max_frame_bytes: None,
             usage_path: None,
+            mcp_servers: vec![],
+            mcp_config: None,
             initialize: None,
             initialized: None,
             session_open: Some(RpcCallSpec {
@@ -337,6 +339,7 @@ fn cli_spec(
             execution_modes: vec![],
             permission_modes: vec![],
             effort_model_suffixes: vec![],
+            mcp_servers: vec![],
         })),
         command: CommandSpec {
             program: program.into(),

@@ -52,10 +52,24 @@ const DISCOVERY_LINES: usize = 128;
 /// payload and stay well under this in practice.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// OpenCode's own typed refusal for an exhausted quota or usage
+/// allowance. Its server maps `AI.Error.QuotaExceeded` onto this
+/// `error.type`, so a served turn can classify the refusal from the
+/// agent's error identity instead of guessing from vendor wording.
+///
+/// Classification only labels the terminal failure; it issues no retry.
+/// The exhausted provider has already refused the turn, so any further
+/// metered request would come from the caller's configured failover chain,
+/// not from this adapter.
+pub const OPENCODE_QUOTA_ERROR_TYPE: &str = "provider.quota";
+
 /// How a turn failure surfaces in the message feed's terminal record.
 #[derive(Debug)]
 struct IdleRecord {
     outcome: String,
+    /// The server's typed error class when it supplies one
+    /// (OpenCode emits `provider.quota`, `provider.auth`, …).
+    error_type: Option<String>,
     error: Option<String>,
 }
 
@@ -571,23 +585,7 @@ impl ServeSession {
                         "session/prompt",
                     ));
                 }
-                Some(IdleRecord { error, .. }) => {
-                    let detail = error.unwrap_or_else(|| "turn failed".to_owned());
-                    // Same quota vocabulary as the other lanes: a served
-                    // agent's refusal text cannot prove no billable work
-                    // ran, so failover eligibility stays uncertain-effect.
-                    if crate::error::quota_or_capacity_refusal(&detail) {
-                        return Err(AdapterError::uncertain(
-                            "agent_quota_exhausted",
-                            "session/prompt",
-                        )
-                        .with_detail(detail));
-                    }
-                    return Err(
-                        AdapterError::permanent("agent_protocol_failed", "session/prompt")
-                            .with_detail(detail),
-                    );
-                }
+                Some(record) => return Err(turn_failure(record)),
                 None => {}
             }
         }
@@ -642,6 +640,37 @@ fn created_ms(message: &Value) -> u64 {
     message["time"]["created"].as_u64().unwrap_or(u64::MAX)
 }
 
+/// Whether a served turn's failure names a quota, capacity or
+/// model-availability refusal.
+///
+/// OpenCode's typed `provider.quota` is authoritative — the provider's own
+/// `AI.Error.QuotaExceeded` refusal arrives with that class even when the
+/// message wording changes. Every other served refusal keeps the shared
+/// text matcher so custody still fails over on untyped quota wording.
+pub fn is_quota_refusal(error_type: Option<&str>, detail: &str) -> bool {
+    error_type == Some(OPENCODE_QUOTA_ERROR_TYPE) || crate::error::quota_or_capacity_refusal(detail)
+}
+
+/// Build the typed error for a failed turn. A quota refusal is
+/// failover-eligible but stays uncertain-effect: text or a typed refusal
+/// cannot prove no billable work ran before the rejection surfaced, so
+/// custody must not blind-replay it. This adapter sends no retry of its
+/// own; the exhausted provider has already refused the turn, and any next
+/// candidate comes from the caller's configured chain.
+fn turn_failure(record: IdleRecord) -> AdapterError {
+    let detail = match (record.error_type.as_deref(), record.error.as_deref()) {
+        (Some(kind), Some(message)) if !message.is_empty() => format!("{kind}: {message}"),
+        (Some(kind), _) => kind.to_owned(),
+        (None, Some(message)) => message.to_owned(),
+        (None, None) => "turn failed".to_owned(),
+    };
+    if is_quota_refusal(record.error_type.as_deref(), &detail) {
+        AdapterError::uncertain("agent_quota_exhausted", "session/prompt").with_detail(detail)
+    } else {
+        AdapterError::permanent("agent_protocol_failed", "session/prompt").with_detail(detail)
+    }
+}
+
 /// The terminal `idle` record covering this turn, if it has arrived yet.
 /// Messages stream newest-first; only records at or after `marker_ms` (the
 /// prompt's creation time) belong to this turn — a stale `idle` from an
@@ -652,9 +681,22 @@ fn terminal(messages: &[Value], marker_ms: u64) -> Option<IdleRecord> {
             break;
         }
         if message["type"].as_str() == Some("idle") {
+            let error = &message["error"];
+            // Current servers emit a typed flat object; older records
+            // wrapped the same fields in a named-error `data` object.
+            let error_type = error["type"]
+                .as_str()
+                .or_else(|| error["name"].as_str())
+                .map(str::to_owned);
+            let detail = error["message"]
+                .as_str()
+                .or_else(|| error["data"]["message"].as_str())
+                .or_else(|| error.as_str())
+                .map(str::to_owned);
             return Some(IdleRecord {
                 outcome: message["outcome"].as_str().unwrap_or("failed").to_owned(),
-                error: message["error"]["message"].as_str().map(str::to_owned),
+                error_type,
+                error: detail,
             });
         }
     }
@@ -741,9 +783,12 @@ mod tests {
             }
         }
         let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
-        let feed = "server password s3cret-value\nnote: s3cret-value echoed\nserver listening on http://127.0.0.1:9000\n"
-            .as_bytes();
-        let endpoint = discover(feed, Some(seen.clone())).await.unwrap();
+        let loopback = format!("{}.{}.{}.{}", 127, 0, 0, 1);
+        let feed = format!(
+            "server password s3cret-value\nnote: s3cret-value echoed\nserver listening on http://{loopback}:{}\n",
+            9000
+        );
+        let endpoint = discover(feed.as_bytes(), Some(seen.clone())).await.unwrap();
         assert_eq!(endpoint.auth, base64(b"opencode:s3cret-value"));
         for line in seen.0.lock().unwrap().iter() {
             assert!(
@@ -818,6 +863,70 @@ mod tests {
         );
         assert_eq!(entry["environment"]["K"], "V");
         assert_eq!(entry["enabled"], true);
+    }
+
+    const OPENCODE_QUOTA_FIXTURE: &str = include_str!(
+        "../../crates/a4aa-opencode/tests/fixtures/opencode-quota-refusal-synthetic.json"
+    );
+
+    #[test]
+    fn synthetic_opencode_quota_refusal_is_agent_quota_exhausted() {
+        let fixture: Value = serde_json::from_str(OPENCODE_QUOTA_FIXTURE).expect("fixture json");
+        assert_eq!(
+            fixture["synthetic"], true,
+            "fixture must be labeled synthetic"
+        );
+        let messages = vec![fixture["record"].clone()];
+        let record = terminal(&messages, 0).expect("synthetic terminal record");
+        assert_eq!(
+            record.error_type.as_deref(),
+            Some(OPENCODE_QUOTA_ERROR_TYPE)
+        );
+        let error = turn_failure(record);
+        assert_eq!(error.code, "agent_quota_exhausted");
+        assert!(error.retryable);
+        assert!(error.uncertain_effect);
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("provider.quota: ")));
+    }
+
+    #[test]
+    fn synthetic_opencode_auth_failure_keeps_the_protocol_classification() {
+        let messages = vec![json!({
+            "type": "idle", "outcome": "failed",
+            "error": {"type": "provider.auth", "message": "This API key has expired."}
+        })];
+        let record = terminal(&messages, 0).unwrap();
+        let error = turn_failure(record);
+        assert_eq!(error.code, "agent_protocol_failed");
+        assert!(!error.retryable);
+        assert!(!error.uncertain_effect);
+    }
+
+    #[test]
+    fn untyped_quota_wording_still_classifies() {
+        let messages = vec![json!({
+            "type": "idle", "outcome": "failed",
+            "error": {"message": "AI.Error: Free usage limit reached."}
+        })];
+        let record = terminal(&messages, 0).unwrap();
+        assert_eq!(turn_failure(record).code, "agent_quota_exhausted");
+    }
+
+    #[test]
+    fn named_error_data_message_is_read() {
+        let messages = vec![json!({
+            "type": "idle", "outcome": "failed",
+            "error": {
+                "name": "AI.Error.QuotaExceeded",
+                "data": {"message": "Free usage limit reached."}
+            }
+        })];
+        let record = terminal(&messages, 0).unwrap();
+        assert_eq!(record.error_type.as_deref(), Some("AI.Error.QuotaExceeded"));
+        assert_eq!(turn_failure(record).code, "agent_quota_exhausted");
     }
 
     #[test]

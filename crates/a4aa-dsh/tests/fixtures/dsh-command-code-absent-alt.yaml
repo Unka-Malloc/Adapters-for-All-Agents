@@ -1,5 +1,6 @@
 # Fixture DSH credentials document without a Command Code reference.
 version: 1
 refs:
-  DEEPSEEK_API_KEY: fixture-deepseek-key
+  # Only the DeepSeek reference is registered.
+  DEEPSEEK_API_KEY: fixture
 records: {}

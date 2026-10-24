@@ -34,11 +34,11 @@ installed `copilot --acp` surface is native but unowned here.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
 | claude | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
-| codex | 2026-10-21 | not-offered | not-offered | not-offered | native | native | native |
+| codex | 2026-10-24 | not-offered | not-offered | not-offered | native | native | native |
 | commandcode | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
 | cursor | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
 | devin | 2026-10-21 | not-offered | not-offered | native | not-offered | native | native |
-| dsh | 2026-10-21 | not-offered | native | native | native | not-offered | native |
+| dsh | 2026-10-24 | not-offered | native | native | native | not-offered | native |
 | factory | 2026-10-21 | native | not-offered | native | native | native | native |
 | grok | 2026-10-21 | not-offered | not-offered | native | not-offered | native | native |
 | hermes | 2026-10-21 | not-offered | not-offered | native | not-offered | not-offered | native |
@@ -55,7 +55,7 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | --- | --- | --- | --- |
 | antigravity | cli | `agy --print --output-format stream-json` | `agy_acp_server.par` dropped |
 | claude | cli | `claude --print` stream-json | vendored `claude-agent-acp` dropped |
-| codex | rpc | `codex app-server --stdio` | vendored `codex-acp` dropped |
+| codex | rpc | `codex app-server --stdio` | vendored `codex-acp` dropped; host MCP servers installed with `-c mcp_servers.*` |
 | commandcode | cli | `command-code --print --output-format json` | no ACP/SDK/serve |
 | cursor | cli | `cursor-agent --print` stream-json | no acp subcommand |
 | devin | acp | `devin acp` | CLI `-p` is an alternate |
@@ -76,11 +76,11 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | 2026-10-21 | config-key | `.gemini/config/mcp_config.json mcpServers` | `{home}/.gemini/antigravity-cli/settings.json` | `{home}/.gemini/config/hooks.json` | — | `agy models` |
 | claude | 2026-10-21 | config-key | `.mcp.json mcpServers` (project, not adapted) | `{home}/.claude/settings.json` | `{home}/.claude/settings.json hooks` | `{home}/.claude/settings.json permissions.defaultMode` | — |
-| codex | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.codex/config.toml` | `{home}/.codex/hooks.json` | sandbox flags | `model/list` |
+| codex | 2026-10-24 | config-key | `codex app-server -c mcp_servers.<name>.{command,args,env_vars}`; `default_tools_approval_mode` only for servers named in `mcpConfig.toolsApprovalServers`; config.toml `[mcp_servers]` | `{home}/.codex/config.toml` | `{home}/.codex/hooks.json` | sandbox flags | `model/list` |
 | commandcode | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.commandcode/config.json` | `{home}/.commandcode/settings.json hooks` | `--permission-mode` | `command-code --list-models` |
 | cursor | 2026-10-21 | config-key | `.cursor/mcp.json mcpServers` | `{home}/.cursor/cli-config.json` | `{home}/.cursor/hooks.json` | `{home}/.cursor/cli-config.json permissions` | model-id suffix |
 | devin | 2026-10-21 | config-key | `.config/devin/mcp_config.json mcpServers` | `{home}/.config/devin/config.json` | `{home}/.config/devin/config.json hooks` | `--permission-mode` | `devin models` |
-| dsh | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.dsh/.credentials.yaml` | — | — | ACP `session/new` configOptions |
+| dsh | 2026-10-24 | unsupported | `McpSurface::None` | `{home}/.dsh/.credentials.yaml` | — | — | ACP `session/new` configOptions; Command Code route provisioned by `a4aa-dsh mount` |
 | factory | 2026-10-21 | config-key | `.factory/settings.json mcp` | `{home}/.factory/settings.json` | — | `--auto` autonomy | `droid.list_models` |
 | grok | 2026-10-21 | protocol | ACP mcp http/sse | `{home}/.grok/config.toml` | `{home}/.grok/hooks` | `--permission-mode` | `grok models` |
 | hermes | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.hermes/config.yaml` | — | — | — |
@@ -97,11 +97,11 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | 2026-10-21 | native | native | native | native | native | native | native | not-offered | native | native | native | not-offered |
 | claude | 2026-10-21 | native | native | native | native | native | native | native | native | native | native | native | not-offered |
-| codex | 2026-10-21 | native | native | native | native | native | native | native | native | native | native | native | not-offered |
+| codex | 2026-10-24 | native | native | native | native | native | native | native | native | native | native | native | not-offered |
 | commandcode | 2026-10-21 | native | native | native | native | native | native | native | native | native | native | not-offered | not-offered |
 | cursor | 2026-10-21 | native | native | native | native | native | native | native | not-offered | native | native | native | not-offered |
 | devin | 2026-10-21 | native | not-offered | native | native | native | native | native | native | native | native | native | not-offered |
-| dsh | 2026-10-21 | native | native | native | native | native | native | native | not-offered | native | not-offered | not-offered | not-offered |
+| dsh | 2026-10-24 | native | native | native | native | native | native | native | not-offered | native | not-offered | not-offered | not-offered |
 | factory | 2026-10-21 | native | native | native | native | native | native | native | native | native | not-offered | native | not-offered |
 | grok | 2026-10-21 | native | native | native | native | native | native | native | native | native | native | native | not-offered |
 | hermes | 2026-10-21 | not-offered | native | native | not-offered | native | native | native | not-offered | native | not-offered | not-offered | native |

@@ -25,9 +25,10 @@ use a4aa::{AdaptationPlan, AgentSpec, Dialect, MechanismSet, SessionScope};
 
 pub use command_code::{
     command_code_patch, command_code_patch_endpoint, credential_ref_names, has_command_code_key,
-    providers_from_config_options, AdvertisedModel, AdvertisedProvider, CommandCodeModel,
-    CommandCodeMountError, ACP_PROFILE_PATCH, COMMAND_CODE_API_KEY_ENV, COMMAND_CODE_BASE_URL,
-    COMMAND_CODE_PROVIDER, PI_AI_PATCH_ID, PI_AI_PLUGIN,
+    mount_command_code, providers_from_config_options, AdvertisedModel, AdvertisedProvider,
+    CommandCodeModel, CommandCodeMountError, MountPolicy, MountedCommandCode, ACP_PROFILE_PATCH,
+    COMMAND_CODE_API_KEY_ENV, COMMAND_CODE_BASE_URL, COMMAND_CODE_PROVIDER, DSH_CREDENTIALS,
+    DSH_PROFILE_PATCH, PI_AI_PATCH_ID, PI_AI_PLUGIN,
 };
 
 pub use native::{native, NATIVE};
@@ -110,6 +111,7 @@ static SDK_RPC: RpcSurface = RpcSurface {
     transport: RpcTransportDecl::Stdio,
     max_frame_bytes: None,
     usage_path: None,
+    mcp: None,
 };
 
 /// The `dsh` agent card: `dsh acp` (Agent Client Protocol over stdio) is
@@ -128,6 +130,13 @@ static SDK_RPC: RpcSurface = RpcSurface {
 /// `configOptions` (provider/model choices plus `reasoning_effort` when the
 /// exact model declares one). Authentication is a no-op; DSH resolves
 /// credentials itself.
+///
+/// Command Code is a hand-declared `@deepseek-ai/dsh-llm-pi-ai` route, not a
+/// shipped catalog entry. Hosts provision it once with `a4aa-dsh mount`
+/// ([`mount_command_code`]): the command reads only the
+/// `COMMAND_CODE_API_KEY` reference name from `$DSH_HOME/.credentials.yaml`,
+/// installs the route patch, and the next `session/new` advertises the
+/// `command-code` provider alongside the shipped ones.
 ///
 /// The SDK JSON-RPC alternate (`dsh --profile sdk`) is the official
 /// library-style stdio carrier a host drives in-process: model and reasoning effort
@@ -262,7 +271,7 @@ mod card_tests {
 
     #[test]
     fn native_table_records_acp_primary_and_sdk_rpc() {
-        assert_eq!(NATIVE.last_verified, "2026-10-21");
+        assert_eq!(NATIVE.last_verified, "2026-10-24");
         assert_eq!(NATIVE.surfaces.acp.status, a4aa::NativeStatus::Native);
         assert_eq!(NATIVE.surfaces.sdk.status, a4aa::NativeStatus::Native);
         assert_eq!(NATIVE.surfaces.rpc.status, a4aa::NativeStatus::Native);

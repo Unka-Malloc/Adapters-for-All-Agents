@@ -32,6 +32,7 @@ pub mod dialect;
 pub mod env;
 pub mod error;
 pub mod framing;
+pub mod mcp;
 pub mod mechanisms;
 pub mod model;
 pub mod native;
@@ -46,7 +47,7 @@ pub use adapter::{Adapter, AgentSession, BeforeTurn, LaneSession, PermissionHand
 pub use card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
     DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog,
-    OsPath, RpcCallDecl, RpcSurface, StoreKind, TranscriptUsage, UsageSurface,
+    OsPath, RpcCallDecl, RpcMcpDecl, RpcSurface, StoreKind, TranscriptUsage, UsageSurface,
 };
 pub use dialect::{
     adapt, CommandSurface, Dialect, ExtensionKind, HookSurface, McpSurface, PermissionSurface,
@@ -62,8 +63,9 @@ pub use mechanisms::{
 pub use model::{
     AgentEvent, AgentInfo, AgentSpec, BindingReceiptShape, Capabilities, CliLaneSpec, CommandSpec,
     LaneKind, LaneSpec, PromptChannel, RpcCallSpec, RpcCompletionSpec, RpcEnvelopeSpec,
-    RpcLaneSpec, RpcTransport, SelectorPhase, SelectorSupport, SelectorSupportSet, SessionConfig,
-    SessionRequest, SessionScope, StreamMode, TokenUsage, TurnOutcome,
+    RpcLaneSpec, RpcMcpConfig, RpcMcpToolApproval, RpcTransport, SelectorPhase, SelectorSupport,
+    SelectorSupportSet, SessionConfig, SessionRequest, SessionScope, StreamMode, TokenUsage,
+    TurnOutcome,
 };
 pub use native::{
     cell, parse_iso_date, AwpPrimitives, Cell, ConfigLocations, InteractionSurfaces, McpMechanism,
