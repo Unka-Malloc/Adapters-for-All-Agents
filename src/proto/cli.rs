@@ -483,7 +483,18 @@ impl CliLane {
                     biased;
                     _ = cancelled.changed() => {}
                     result = stdin.write_all(payload.as_bytes()) => {
-                        result.map_err(|error| AdapterError::io("agent_prompt_write_failed", "cli/stdin", error))?;
+                        match result {
+                            // The child already closed stdin — it exited
+                            // (or stopped listening) before the prompt
+                            // arrived. The prompt is undeliverable, and the
+                            // child's own exit outcome is the authoritative
+                            // verdict for this turn; keep collecting so the
+                            // real exit classification surfaces.
+                            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                            result => result.map_err(|error| {
+                                AdapterError::io("agent_prompt_write_failed", "cli/stdin", error)
+                            })?,
+                        }
                     }
                 }
             }
@@ -526,7 +537,21 @@ impl CliLane {
                     biased;
                     _ = cancelled.changed() => {}
                     result = writer.write(payload.as_bytes()) => {
-                        result.map_err(|error| AdapterError::io("agent_prompt_write_failed", "cli/pty", error))?;
+                        match result {
+                            // Same verdict as the stdio write: a dead slave
+                            // makes the master write fail with EIO — keep
+                            // collecting for the child's real exit outcome.
+                            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+                            result => {
+                                result.map_err(|error| {
+                                    AdapterError::io(
+                                        "agent_prompt_write_failed",
+                                        "cli/pty",
+                                        error,
+                                    )
+                                })?;
+                            }
+                        }
                     }
                 }
             }

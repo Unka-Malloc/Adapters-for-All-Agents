@@ -846,7 +846,8 @@ async fn cli_usage_limit_exit_is_quota_exhausted_not_error_outcome() {
         "sh",
         vec![
             "-c".into(),
-            "echo 'ActionRequiredError: You have hit your usage limit' >&2; exit 1".into(),
+            "exec 0<&-; echo 'ActionRequiredError: You have hit your usage limit' >&2; exit 1"
+                .into(),
         ],
         PromptChannel::Stdin,
         StreamMode::Stdio,
@@ -870,7 +871,7 @@ async fn cli_usage_limit_exit_is_quota_exhausted_not_error_outcome() {
 async fn cli_unclassified_nonzero_exit_stays_error_outcome() {
     let adapter = Adapter::new(cli_spec(
         "sh",
-        vec!["-c".into(), "echo boom >&2; exit 1".into()],
+        vec!["-c".into(), "exec 0<&-; echo boom >&2; exit 1".into()],
         PromptChannel::Stdin,
         StreamMode::Stdio,
         None,
