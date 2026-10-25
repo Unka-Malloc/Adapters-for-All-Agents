@@ -1,10 +1,11 @@
-//! Native-capability table for `dsh`. Last verified 2026-10-21.
+//! Native-capability table for `dsh`. Last verified 2026-10-24.
 //!
-//! Verdict vs the `dsh --profile sdk` lane: ACP is the richer conversation
-//! surface (durable resume, cancel, live `session/update` streaming). SDK
-//! RPC is a first-party JSON-RPC stdio carrier with model/effort on
-//! `initialize` but no live deltas and no cancel. ACP stays primary; SDK
-//! is the ordered alternate. Neither profile is an external plugin.
+//! Capability order puts SDK above ACP, so `dsh --profile sdk` is the card's
+//! primary lane: a first-party JSON-RPC stdio carrier with model/effort on
+//! `initialize` but no live deltas and no cancel. ACP is the ordered
+//! alternate and the richer conversation surface (durable resume, cancel,
+//! live `session/update` streaming, `session/new` catalog). Neither profile
+//! is an external plugin.
 
 use a4aa::native::{
     cell, AwpPrimitives, ConfigLocations, InteractionSurfaces, McpMechanism, McpRegistration,

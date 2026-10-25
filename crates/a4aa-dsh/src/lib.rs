@@ -111,51 +111,55 @@ static SDK_RPC: RpcSurface = RpcSurface {
     transport: RpcTransportDecl::Stdio,
     max_frame_bytes: None,
     usage_path: None,
+    failure_path: None,
+    failure_value: None,
+    failure_message_path: None,
     mcp: None,
 };
 
-/// The `dsh` agent card: `dsh acp` (Agent Client Protocol over stdio) is
-/// the primary lane — richer session lifecycle than the SDK RPC: durable
-/// `session/resume`, `session/cancel`, and `session/update` streaming.
+/// The `dsh` agent card: capability ordering ranks Serve, then SDK, then
+/// ACP or RPC, then CLI, so the auto-lane policy materializes the official
+/// SDK JSON-RPC stdio profile (`dsh --profile sdk`) as primary. The ACP
+/// profile (`dsh acp`) is the ordered alternate: it carries the richer
+/// session lifecycle — durable `session/resume`, `session/cancel`, live
+/// `session/update` streaming and the `session/new` catalog — but that is
+/// an alternate capability, never a reason to select a lower-ranked lane.
 /// Both profiles are first-party DSH (`~/.dsh/profiles/acp` and
 /// `~/.dsh/profiles/sdk`); neither is an external plugin.
 ///
-/// Protocol: `dsh <name>` abbreviates `dsh --profile <name>`, so `dsh acp`
-/// boots the shipped ACP profile — a headless, non-interactive stdio server
-/// that holds stdout for NDJSON JSON-RPC until disconnect. No extra flags:
-/// `--help` is the profile app's own help and would exit without serving.
-/// `initialize` advertises ACP v1 plus `session/list`, `session/resume`,
-/// `session/close`; `session/load` is unsupported, so resume uses
-/// `session/resume`. `session/new` returns the live catalog as grouped
-/// `configOptions` (provider/model choices plus `reasoning_effort` when the
-/// exact model declares one). Authentication is a no-op; DSH resolves
-/// credentials itself.
+/// SDK protocol: `dsh --profile sdk` is the official library-style stdio
+/// carrier a host drives in-process: model and reasoning effort on
+/// `initialize`, caller-created session ids on `session/prompt`, no live
+/// deltas and no cancel.
+///
+/// ACP alternate: `dsh <name>` abbreviates `dsh --profile <name>`, so
+/// `dsh acp` boots the shipped ACP profile — a headless, non-interactive
+/// stdio server that holds stdout for NDJSON JSON-RPC until disconnect. No
+/// extra flags: `--help` is the profile app's own help and would exit
+/// without serving. `initialize` advertises ACP v1 plus `session/list`,
+/// `session/resume`, `session/close`; `session/load` is unsupported, so
+/// resume uses `session/resume`. `session/new` returns the live catalog as
+/// grouped `configOptions` (provider/model choices plus
+/// `reasoning_effort` when the exact model declares one). Authentication is
+/// a no-op; DSH resolves credentials itself.
 ///
 /// Command Code is a hand-declared `@deepseek-ai/dsh-llm-pi-ai` route, not a
 /// shipped catalog entry. Hosts provision it once with `a4aa-dsh mount`
 /// ([`mount_command_code`]): the command reads only the
 /// `COMMAND_CODE_API_KEY` reference name from `$DSH_HOME/.credentials.yaml`,
-/// installs the route patch, and the next `session/new` advertises the
+/// installs the route patch, and the next ACP `session/new` advertises the
 /// `command-code` provider alongside the shipped ones.
-///
-/// The SDK JSON-RPC alternate (`dsh --profile sdk`) is the official
-/// library-style stdio carrier a host drives in-process: model and reasoning effort
-/// on `initialize`, caller-created session ids on `session/prompt`, no
-/// live deltas and no cancel. Capability ordering ranks Serve, then
-/// SDK, then ACP or RPC, then CLI. That ranking would put the SDK
-/// class above ACP, but the ACP profile is the richer conversation
-/// surface, so ACP stays primary and SDK is the ordered alternate.
 pub const AGENT: AgentCard = AgentCard {
     id: "dsh",
     label: "DeepSeek Harness",
     dialect: &DIALECT,
-    surface: AgentSurface::Acp {
-        prefer_load: false,
-        spawn_args: &["acp"],
-        auth_key: None,
-    },
+    surface: AgentSurface::Rpc(&SDK_RPC),
     alternates: &[AlternateLane {
-        surface: AgentSurface::Rpc(&SDK_RPC),
+        surface: AgentSurface::Acp {
+            prefer_load: false,
+            spawn_args: &["acp"],
+            auth_key: None,
+        },
         binary: None,
     }],
     detect: DetectSurface {
@@ -243,22 +247,26 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_the_acp_profile_lane() {
+    fn spec_materializes_the_sdk_rpc_lane() {
         let spec = spec();
         assert_eq!(spec.command.program, "dsh");
-        // `dsh acp` expands to `dsh --profile acp`: headless ACP stdio,
-        // no extra flags.
-        assert_eq!(spec.command.args, vec!["acp".to_string()]);
-        let a4aa::LaneSpec::Acp {
-            prefer_load,
-            auth_key,
-            ..
-        } = spec.lane
-        else {
-            panic!("dsh drives the acp lane")
+        // Capability order puts SDK above ACP, so the auto-lane primary is
+        // the official SDK stdio profile.
+        assert_eq!(
+            spec.command.args,
+            vec!["--profile".to_owned(), "sdk".to_owned()]
+        );
+        let a4aa::LaneSpec::Rpc(rpc) = &spec.lane else {
+            panic!("dsh's primary is the sdk rpc lane")
         };
-        assert!(!prefer_load);
-        assert!(auth_key.is_none());
+        assert_eq!(rpc.initialize.as_ref().unwrap().method, "initialize");
+        assert_eq!(rpc.prompt.method, "session/prompt");
+        assert_eq!(rpc.completion.as_ref().unwrap().method, "session.status");
+        assert_eq!(rpc.session_scope, a4aa::SessionScope::Process);
+        assert!(rpc.kill_on_cancel);
+        assert!(rpc.cancel.is_none());
+        // The ACP alternate still names the catalog and streaming surface;
+        // the SDK carrier receives model/effort on initialize.
         assert_eq!(
             AGENT.features.models,
             a4aa::ModelCatalog::RpcMethod("session/new")
@@ -270,7 +278,7 @@ mod card_tests {
     }
 
     #[test]
-    fn native_table_records_acp_primary_and_sdk_rpc() {
+    fn native_table_records_both_first_party_surfaces() {
         assert_eq!(NATIVE.last_verified, "2026-10-24");
         assert_eq!(NATIVE.surfaces.acp.status, a4aa::NativeStatus::Native);
         assert_eq!(NATIVE.surfaces.sdk.status, a4aa::NativeStatus::Native);
@@ -279,23 +287,23 @@ mod card_tests {
     }
 
     #[test]
-    fn spec_materializes_the_sdk_rpc_alternate() {
+    fn spec_materializes_the_acp_alternate() {
         let specs = AGENT.specs();
         assert_eq!(specs.len(), 2);
-        let a4aa::LaneSpec::Rpc(rpc) = &specs[1].lane else {
-            panic!("dsh's alternate is the sdk rpc")
-        };
+        // `dsh acp` expands to `dsh --profile acp`: headless ACP stdio,
+        // no extra flags.
         assert_eq!(specs[1].command.program, "dsh");
-        assert_eq!(
-            specs[1].command.args,
-            vec!["--profile".to_owned(), "sdk".to_owned()]
-        );
-        assert_eq!(rpc.initialize.as_ref().unwrap().method, "initialize");
-        assert_eq!(rpc.prompt.method, "session/prompt");
-        assert_eq!(rpc.completion.as_ref().unwrap().method, "session.status");
-        assert_eq!(rpc.session_scope, a4aa::SessionScope::Process);
-        assert!(rpc.kill_on_cancel);
-        assert!(rpc.cancel.is_none());
+        assert_eq!(specs[1].command.args, vec!["acp".to_string()]);
+        let a4aa::LaneSpec::Acp {
+            prefer_load,
+            auth_key,
+            ..
+        } = &specs[1].lane
+        else {
+            panic!("dsh's alternate is the acp lane")
+        };
+        assert!(!prefer_load);
+        assert!(auth_key.is_none());
     }
 
     #[test]

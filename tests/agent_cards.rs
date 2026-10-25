@@ -249,14 +249,19 @@ done
     spec
 }
 
-/// DeepSeek-Harness ACP surface: the production `dsh acp` lane with the
-/// crate's deterministic `fixture-agent` in place of the `dsh` binary.
+/// DeepSeek-Harness ACP surface: the production `dsh acp` alternate with
+/// the crate's deterministic `fixture-agent` in place of the `dsh` binary.
 /// `session/new` advertises `configOptions`; a turn streams
 /// `session/update` chunks and ends at `end_turn`. Resume uses
 /// `session/resume` (`prefer_load` is false — DSH does not implement
-/// `session/load`).
+/// `session/load`). SDK is the capability-ordered primary, so the ACP
+/// legacy surface is taken from the card's ordered alternates.
 fn dsh_like_spec() -> AgentSpec {
-    let mut spec = a4aa_dsh::spec();
+    let mut spec = a4aa_dsh::card()
+        .specs()
+        .into_iter()
+        .nth(1)
+        .expect("dsh declares the acp alternate");
     spec.command = CommandSpec {
         program: env!("CARGO_BIN_EXE_a4aa").into(),
         args: vec!["fixture-agent".into()],
@@ -620,25 +625,25 @@ fn registry_exposes_all_five_second_batch_cards() {
     let dsh = a4aa_dialects::card("dsh").unwrap();
     let spec = dsh.spec();
     assert_eq!(spec.command.program, "dsh");
-    assert_eq!(spec.command.args, vec!["acp".to_string()]);
-    assert!(matches!(
-        spec.lane,
-        LaneSpec::Acp {
-            prefer_load: false,
-            ..
-        }
-    ));
+    assert_eq!(
+        spec.command.args,
+        vec!["--profile".to_string(), "sdk".to_string()]
+    );
+    assert!(matches!(spec.lane, LaneSpec::Rpc(_)));
     assert_eq!(
         dsh.features.models,
         a4aa::ModelCatalog::RpcMethod("session/new")
     );
     let dsh_specs = dsh.specs();
     assert_eq!(dsh_specs.len(), 2);
-    assert_eq!(
-        dsh_specs[1].command.args,
-        vec!["--profile".to_string(), "sdk".to_string()]
-    );
-    assert!(matches!(dsh_specs[1].lane, LaneSpec::Rpc(_)));
+    assert_eq!(dsh_specs[1].command.args, vec!["acp".to_string()]);
+    assert!(matches!(
+        dsh_specs[1].lane,
+        LaneSpec::Acp {
+            prefer_load: false,
+            ..
+        }
+    ));
 
     let pi = a4aa_dialects::card("pi").unwrap();
     let pi_specs = pi.specs();

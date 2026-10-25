@@ -59,7 +59,7 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | commandcode | cli | `command-code --print --output-format json` | no ACP/SDK/serve |
 | cursor | cli | `cursor-agent --print` stream-json | no acp subcommand |
 | devin | acp | `devin acp` | CLI `-p` is an alternate |
-| dsh | acp | `dsh acp` | SDK `dsh --profile sdk` is the ordered rpc alternate |
+| dsh | rpc (sdk) | `dsh --profile sdk` | capability order ranks SDK above ACP; `dsh acp` is the ordered alternate with durable resume/cancel/streaming |
 | factory | acp | `droid exec --output-format acp` | first-party; daemon WebSocket and stream-jsonrpc are alternates |
 | grok | acp | `grok agent` stdio | CLI `-p` streaming-json is an alternate |
 | hermes | acp | `hermes acp` | no headless print lane |
