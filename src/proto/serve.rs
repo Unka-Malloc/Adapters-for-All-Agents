@@ -64,7 +64,7 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const OPENCODE_QUOTA_ERROR_TYPE: &str = "provider.quota";
 
 /// How a turn failure surfaces in the message feed's terminal record.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct IdleRecord {
     outcome: String,
     /// The server's typed error class when it supplies one
@@ -429,7 +429,7 @@ impl ServeLane {
             Ok(created) => created,
             Err(error) => {
                 let _ = child.terminate().await;
-                return Err(error);
+                return Err(admission_error(error));
             }
         };
         let session_id = created["data"]["id"]
@@ -525,7 +525,7 @@ impl ServeSession {
             .await
             .map_err(|mut error| {
                 error.stage = "session/set_model";
-                error
+                admission_error(error)
             })?;
         Ok(())
     }
@@ -545,7 +545,8 @@ impl ServeSession {
                 &format!("/api/session/{}/prompt", self.session_id),
                 Some(&json!({"text": request.text})),
             )
-            .await?;
+            .await
+            .map_err(admission_error)?;
         // Bound this turn by the prompt record's creation time, not its id:
         // the message feed paginates and the user record ages out of the
         // newest page on long turns.
@@ -585,7 +586,15 @@ impl ServeSession {
                         "session/prompt",
                     ));
                 }
-                Some(record) => return Err(turn_failure(record)),
+                Some(record) => {
+                    // An assistant record newer than the prompt marker
+                    // means the model already produced billable output.
+                    let served = messages.iter().any(|message| {
+                        created_ms(message) >= marker_ms
+                            && message["type"].as_str() == Some("assistant")
+                    });
+                    return Err(turn_failure(record, served));
+                }
                 None => {}
             }
         }
@@ -640,6 +649,17 @@ fn created_ms(message: &Value) -> u64 {
     message["time"]["created"].as_u64().unwrap_or(u64::MAX)
 }
 
+/// A quota refusal that answered an admission call — session create,
+/// model select or the prompt POST — refused before any turn could run.
+/// Clearing the effect doubt lets custody replay the request on the next
+/// candidate; every other error is returned unchanged.
+fn admission_error(mut error: AdapterError) -> AdapterError {
+    if error.code == "agent_quota_exhausted" {
+        error.uncertain_effect = false;
+    }
+    error
+}
+
 /// Whether a served turn's failure names a quota, capacity or
 /// model-availability refusal.
 ///
@@ -651,13 +671,15 @@ pub fn is_quota_refusal(error_type: Option<&str>, detail: &str) -> bool {
     error_type == Some(OPENCODE_QUOTA_ERROR_TYPE) || crate::error::quota_or_capacity_refusal(detail)
 }
 
-/// Build the typed error for a failed turn. A quota refusal is
-/// failover-eligible but stays uncertain-effect: text or a typed refusal
-/// cannot prove no billable work ran before the rejection surfaced, so
-/// custody must not blind-replay it. This adapter sends no retry of its
-/// own; the exhausted provider has already refused the turn, and any next
+/// Build the typed error for a failed turn. `served` says whether the
+/// turn produced assistant output before the terminal refusal: a typed or
+/// textual quota refusal with no output is an admission rejection —
+/// nothing ran, so custody may replay it on the next candidate. A refusal
+/// after output cannot prove no billable work ran, so it stays
+/// uncertain-effect. This adapter sends no retry of its own; the
+/// exhausted provider has already refused the turn, and any next
 /// candidate comes from the caller's configured chain.
-fn turn_failure(record: IdleRecord) -> AdapterError {
+fn turn_failure(record: IdleRecord, served: bool) -> AdapterError {
     let detail = match (record.error_type.as_deref(), record.error.as_deref()) {
         (Some(kind), Some(message)) if !message.is_empty() => format!("{kind}: {message}"),
         (Some(kind), _) => kind.to_owned(),
@@ -665,10 +687,13 @@ fn turn_failure(record: IdleRecord) -> AdapterError {
         (None, None) => "turn failed".to_owned(),
     };
     if is_quota_refusal(record.error_type.as_deref(), &detail) {
-        AdapterError::uncertain("agent_quota_exhausted", "session/prompt").with_detail(detail)
-    } else {
-        AdapterError::permanent("agent_protocol_failed", "session/prompt").with_detail(detail)
+        return if served {
+            AdapterError::uncertain("agent_quota_exhausted", "session/prompt").with_detail(detail)
+        } else {
+            AdapterError::retryable("agent_quota_exhausted", "session/prompt").with_detail(detail)
+        };
     }
+    AdapterError::permanent("agent_protocol_failed", "session/prompt").with_detail(detail)
 }
 
 /// The terminal `idle` record covering this turn, if it has arrived yet.
@@ -882,10 +907,16 @@ mod tests {
             record.error_type.as_deref(),
             Some(OPENCODE_QUOTA_ERROR_TYPE)
         );
-        let error = turn_failure(record);
+        // With no assistant output this turn, the refusal is an admission
+        // rejection: retryable and certain — custody replays it.
+        let error = turn_failure(record.clone(), false);
         assert_eq!(error.code, "agent_quota_exhausted");
         assert!(error.retryable);
-        assert!(error.uncertain_effect);
+        assert!(!error.uncertain_effect);
+        // After billable output the same refusal stays uncertain-effect.
+        let served = turn_failure(record, true);
+        assert_eq!(served.code, "agent_quota_exhausted");
+        assert!(served.uncertain_effect);
         assert!(error
             .detail
             .as_deref()
@@ -899,7 +930,7 @@ mod tests {
             "error": {"type": "provider.auth", "message": "This API key has expired."}
         })];
         let record = terminal(&messages, 0).unwrap();
-        let error = turn_failure(record);
+        let error = turn_failure(record, false);
         assert_eq!(error.code, "agent_protocol_failed");
         assert!(!error.retryable);
         assert!(!error.uncertain_effect);
@@ -912,7 +943,7 @@ mod tests {
             "error": {"message": "AI.Error: Free usage limit reached."}
         })];
         let record = terminal(&messages, 0).unwrap();
-        assert_eq!(turn_failure(record).code, "agent_quota_exhausted");
+        assert_eq!(turn_failure(record, false).code, "agent_quota_exhausted");
     }
 
     #[test]
@@ -926,7 +957,7 @@ mod tests {
         })];
         let record = terminal(&messages, 0).unwrap();
         assert_eq!(record.error_type.as_deref(), Some("AI.Error.QuotaExceeded"));
-        assert_eq!(turn_failure(record).code, "agent_quota_exhausted");
+        assert_eq!(turn_failure(record, false).code, "agent_quota_exhausted");
     }
 
     #[test]

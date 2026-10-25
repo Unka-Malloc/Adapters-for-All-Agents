@@ -205,6 +205,9 @@ struct TurnState {
     active: bool,
     dispatched: bool,
     cancelled: bool,
+    /// Any session/update admitted this turn — the provider did billable
+    /// work, so a refusal arriving now may have already had effect.
+    served: bool,
     remaining: Option<usize>,
     truncated: bool,
 }
@@ -253,6 +256,7 @@ impl OutputSink {
     // caller's explicit choice of unbounded output.
     fn deliver(&self, event: AgentEvent) -> Result<(), agent_client_protocol::Error> {
         let mut state = self.state.lock().unwrap();
+        state.served = true;
         let (event, clipped) = match event {
             AgentEvent::MessageChunk { text } => {
                 let prefix = bounds::bounded_prefix(&text, state.remaining);
@@ -781,7 +785,7 @@ async fn open_session(
         .send_request(initialize)
         .block_task()
         .await
-        .map_err(|error| protocol_failure("initialize", error))?;
+        .map_err(|error| protocol_failure("initialize", error, false))?;
     if initialized.protocol_version != ProtocolVersion::V1 {
         return Err(AdapterError::permanent(
             "agent_protocol_version_unsupported",
@@ -1015,14 +1019,14 @@ async fn call_with_auth_retry(
     if auth_methods.is_empty()
         || establish_error.code != agent_client_protocol::ErrorCode::AuthRequired
     {
-        return Err(protocol_failure(call.stage(), establish_error));
+        return Err(protocol_failure(call.stage(), establish_error, false));
     }
     if !authenticate(connection, auth_methods, api_key.as_deref()).await {
-        return Err(protocol_failure(call.stage(), establish_error));
+        return Err(protocol_failure(call.stage(), establish_error, false));
     }
     call.send(connection)
         .await
-        .map_err(|error| protocol_failure(call.stage(), error))
+        .map_err(|error| protocol_failure(call.stage(), error, false))
 }
 
 /// Apply the host's requested session configuration against the surfaces
@@ -1138,7 +1142,7 @@ async fn apply_mode(
                 ))
                 .block_task()
                 .await
-                .map_err(|error| protocol_failure("session/set_mode", error))?;
+                .map_err(|error| protocol_failure("session/set_mode", error, false))?;
             if let Some(meta) = response.meta {
                 state.meta = Some(Value::Object(meta));
             }
@@ -1195,7 +1199,7 @@ async fn set_config_option(
         ))
         .block_task()
         .await
-        .map_err(|error| protocol_failure("session/set_config_option", error))?;
+        .map_err(|error| protocol_failure("session/set_config_option", error, false))?;
     if let Some(meta) = response.meta {
         state.meta = Some(Value::Object(meta));
     }
@@ -1226,7 +1230,7 @@ async fn set_session_model(
         })
         .block_task()
         .await
-        .map_err(|error| protocol_failure("session/set_model", error))?;
+        .map_err(|error| protocol_failure("session/set_model", error, false))?;
     let setup = SessionSetup::parse(response).map_err(|mut error| {
         error.stage = "session/set_model";
         error
@@ -1408,10 +1412,10 @@ async fn run_prompt(
         control.dispatched = true;
         pending
     };
-    let response = pending
-        .block_task()
-        .await
-        .map_err(|error| protocol_failure("session/prompt", error))?;
+    let response = pending.block_task().await.map_err(|error| {
+        let served = control.lock().unwrap().served;
+        protocol_failure("session/prompt", error, served)
+    })?;
     Ok(TurnOutcome {
         stop_reason: stop_reason(&response.stop_reason).to_owned(),
         // The streamed text lives in `AgentEvent::MessageChunk`; consumers
@@ -1442,23 +1446,31 @@ fn cancelled_prompt() -> TurnOutcome {
     }
 }
 
-fn protocol_failure(stage: &'static str, error: agent_client_protocol::Error) -> AdapterError {
+fn protocol_failure(
+    stage: &'static str,
+    error: agent_client_protocol::Error,
+    served: bool,
+) -> AdapterError {
     // Quota, capacity and model-availability refusals are classified from
     // the refusal itself before the JSON-RPC code is considered. ACP uses
     // `AuthRequired` (-32000) for credential failures, but OpenCode emits
     // its exhausted free-usage refusal as `InternalError` (-32603); keying
     // on the code alone would leave that incident classified as a generic
-    // protocol failure. The refusal text cannot prove the turn had no
-    // billable effect — tools or tokens may already have been spent — so
-    // it settles as failover-eligible but uncertain-effect.
+    // protocol failure.
     //
-    // A credential-only `AuthRequired` is still a certain non-effect: the
-    // request was rejected before the agent served it, so another
-    // candidate may safely replay it. Everything else stays uncertain — a
-    // dropped connection mid-turn could already have done billable work.
+    // `served` carries the turn's own evidence: an explicit refusal that
+    // arrives before any session/update is an admission rejection — the
+    // provider answered "no" without running the request, so another
+    // candidate may safely replay it. A refusal after streamed work cannot
+    // prove nothing billable ran, so it stays uncertain-effect.
     if crate::error::quota_or_capacity_refusal(&error.to_string()) {
-        AdapterError::uncertain("agent_quota_exhausted", stage).with_detail(error.to_string())
-    } else if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+        return if served {
+            AdapterError::uncertain("agent_quota_exhausted", stage).with_detail(error.to_string())
+        } else {
+            AdapterError::retryable("agent_quota_exhausted", stage).with_detail(error.to_string())
+        };
+    }
+    if error.code == agent_client_protocol::ErrorCode::AuthRequired {
         AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
     } else {
         AdapterError::uncertain("agent_protocol_failed", stage).with_detail(error.to_string())
@@ -1610,7 +1622,21 @@ mod protocol_failure_tests {
     fn quota_rate_limit_is_retryable_quota_exhausted_not_auth() {
         let mut error = agent_client_protocol::Error::auth_required();
         error.message = "AI.Error: Rate limit exceeded. Please try again later.".into();
-        let mapped = protocol_failure("session/prompt", error);
+        // Refused before any turn output: an explicit "no" means nothing
+        // ran, so custody may replay the request on the next candidate.
+        let mapped = protocol_failure("session/prompt", error, false);
+        assert_eq!(mapped.code, "agent_quota_exhausted");
+        assert!(mapped.retryable);
+        assert!(!mapped.uncertain_effect);
+    }
+
+    #[test]
+    fn quota_refusal_after_turn_output_stays_uncertain() {
+        let mut error = agent_client_protocol::Error::auth_required();
+        error.message = "Rate limit exceeded".into();
+        // A refusal arriving after the turn already produced work cannot
+        // prove nothing billable ran — replaying it could double-charge.
+        let mapped = protocol_failure("session/prompt", error, true);
         assert_eq!(mapped.code, "agent_quota_exhausted");
         assert!(mapped.retryable);
         assert!(mapped.uncertain_effect);
@@ -1621,6 +1647,7 @@ mod protocol_failure_tests {
         let mapped = protocol_failure(
             "session/prompt",
             agent_client_protocol::Error::auth_required(),
+            false,
         );
         assert_eq!(mapped.code, "agent_auth_required");
     }
@@ -1648,10 +1675,13 @@ mod protocol_failure_tests {
         .data(serde_json::json!({
             "type": recorded["cause_type"].as_str().expect("cause type"),
         }));
-        let mapped = protocol_failure("session/prompt", error);
+        let mapped = protocol_failure("session/prompt", error, false);
         assert_eq!(mapped.code, "agent_quota_exhausted");
         assert!(mapped.retryable);
-        assert!(mapped.uncertain_effect);
+        assert!(
+            !mapped.uncertain_effect,
+            "an admission refusal had no billable effect — custody may replay it"
+        );
         assert!(
             mapped
                 .detail
@@ -1666,6 +1696,7 @@ mod protocol_failure_tests {
         let mapped = protocol_failure(
             "session/prompt",
             agent_client_protocol::Error::new(-32603, "Internal server error"),
+            false,
         );
         assert_eq!(mapped.code, "agent_protocol_failed");
         assert!(mapped.uncertain_effect);

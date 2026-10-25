@@ -730,11 +730,20 @@ impl CliLane {
                     .find(|line| !line.trim().is_empty())
                     .map(str::trim)
                     .unwrap_or("child exited non-zero");
-                // Text matching cannot prove the turn had no billable
-                // effect — partial work may already have run — so the
-                // failover-eligible refusal stays uncertain-effect.
-                return Err(AdapterError::uncertain("agent_quota_exhausted", "cli/turn")
-                    .with_detail(detail.to_string()));
+                // Any stdout the child produced before the refusal may
+                // reflect billable work — the effect stays uncertain. A
+                // refusal in stderr alone with empty stdout is an
+                // admission rejection: nothing ran, so custody may replay
+                // the request on the next candidate.
+                return Err(
+                    if state.result_text.is_some() || !state.output.trim().is_empty() {
+                        AdapterError::uncertain("agent_quota_exhausted", "cli/turn")
+                            .with_detail(detail.to_string())
+                    } else {
+                        AdapterError::retryable("agent_quota_exhausted", "cli/turn")
+                            .with_detail(detail.to_string())
+                    },
+                );
             }
         }
         Ok(TurnOutcome {

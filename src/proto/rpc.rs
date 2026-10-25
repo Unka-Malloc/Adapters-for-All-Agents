@@ -791,7 +791,7 @@ impl RpcState {
                 Err(_) if self.control.lock().unwrap().killed => {
                     return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
                 }
-                Err(error) => return Err(call_failure(error)),
+                Err(error) => return Err(call_failure(error, false)),
             }
             let cancelled = {
                 let control = self.control.lock().unwrap();
@@ -813,14 +813,18 @@ impl RpcState {
             let pending = self
                 .peer
                 .start_call(&self.spec.prompt.method, params)
-                .map_err(call_failure)?;
+                .map_err(|error| call_failure(error, false))?;
             control.dispatched = true;
             pending
         };
         if let Some(done) = &self.spec.completion {
             return self.await_completion(done, pending).await;
         }
-        let result = match pending.wait().await.map_err(call_failure) {
+        let result = match pending
+            .wait()
+            .await
+            .map_err(|error| call_failure(error, self.served()))
+        {
             Ok(result) => result,
             Err(_) if self.control.lock().unwrap().killed => {
                 return Ok(cancelled_outcome(String::new(), self.delivery.truncated()));
@@ -858,6 +862,12 @@ impl RpcState {
         })
     }
 
+    /// Whether this turn already delivered output events — billable work
+    /// may have run, so a refusal surfacing now stays uncertain-effect.
+    fn served(&self) -> bool {
+        self.delivery.state.lock().unwrap().issued > 0
+    }
+
     /// Await the acknowledgement and ingress-owned terminal state. Output
     /// callbacks run independently and drain before a successful turn returns.
     async fn await_completion(
@@ -865,7 +875,12 @@ impl RpcState {
         done: &crate::model::RpcCompletionSpec,
         pending: PendingCall,
     ) -> Result<TurnOutcome, AdapterError> {
-        let reply = async { pending.wait().await.map_err(call_failure) };
+        let reply = async {
+            pending
+                .wait()
+                .await
+                .map_err(|error| call_failure(error, self.served()))
+        };
         tokio::pin!(reply);
         let mut acknowledged = false;
         let mut turn_id = None;
@@ -1043,7 +1058,10 @@ impl RpcState {
                 "rpc/call",
             ));
         }
-        self.peer.call(method, params).await.map_err(call_failure)
+        self.peer
+            .call(method, params)
+            .await
+            .map_err(|error| call_failure(error, false))
     }
 
     pub async fn close(&self) -> Result<(), AdapterError> {
@@ -1094,7 +1112,9 @@ async fn call(
         return Err(AdapterError::permanent("agent_method_unset", "rpc/call"));
     }
     let params = substitute_resolved(&spec.params, vars, secrets).await;
-    peer.call(&spec.method, params).await.map_err(call_failure)
+    peer.call(&spec.method, params)
+        .await
+        .map_err(|error| call_failure(error, false))
 }
 
 /// Substitute a params template after resolving its `{secret:NAME}`
@@ -1134,15 +1154,20 @@ fn scoped_session_id(resume: Option<&str>) -> String {
     }
 }
 
-fn call_failure(failure: CallFailure) -> AdapterError {
+fn call_failure(failure: CallFailure, served: bool) -> AdapterError {
     match failure {
-        // An explicit quota/capacity refusal names the rejection, but the
-        // text cannot prove the turn had no billable effect: report the
-        // failover-eligible failure with its effect marked uncertain
-        // instead of a permanent remote error.
+        // `served` carries the turn's own evidence: an explicit quota or
+        // capacity refusal answering before any turn output is an
+        // admission rejection — nothing ran, so custody may replay it on
+        // the next candidate. A refusal after streamed output cannot
+        // prove no billable work ran, so it stays uncertain-effect.
         CallFailure::Remote(error) if crate::error::quota_or_capacity_refusal(&error.message) => {
-            AdapterError::uncertain("agent_quota_exhausted", "rpc/call")
-                .with_detail(format!("{} ({})", error.message, error.code))
+            let detail = format!("{} ({})", error.message, error.code);
+            if served {
+                AdapterError::uncertain("agent_quota_exhausted", "rpc/call").with_detail(detail)
+            } else {
+                AdapterError::retryable("agent_quota_exhausted", "rpc/call").with_detail(detail)
+            }
         }
         CallFailure::Remote(error) => AdapterError::permanent("agent_remote_error", "rpc/call")
             .with_detail(format!("{} ({})", error.message, error.code)),
@@ -1309,11 +1334,25 @@ mod call_failure_tests {
 
     #[test]
     fn explicit_quota_refusal_is_failover_eligible_failure() {
-        let error = call_failure(CallFailure::Remote(RpcErrorObject {
-            code: -32000,
-            message: "resource_exhausted: quota exceeded for this model".into(),
-            data: None,
-        }));
+        let refusal = |served| {
+            call_failure(
+                CallFailure::Remote(RpcErrorObject {
+                    code: -32000,
+                    message: "resource_exhausted: quota exceeded for this model".into(),
+                    data: None,
+                }),
+                served,
+            )
+        };
+        // Answered before any turn output: a certain non-effect — custody
+        // replays the request on the next candidate.
+        let error = refusal(false);
+        assert_eq!(error.code, "agent_quota_exhausted");
+        assert!(error.retryable);
+        assert!(!error.uncertain_effect);
+        // Answered after streamed output: billable work may already have
+        // run, so the effect stays uncertain and replay is refused.
+        let error = refusal(true);
         assert_eq!(error.code, "agent_quota_exhausted");
         assert!(error.retryable);
         assert!(error.uncertain_effect);
@@ -1321,11 +1360,14 @@ mod call_failure_tests {
 
     #[test]
     fn unclassified_remote_error_stays_permanent() {
-        let error = call_failure(CallFailure::Remote(RpcErrorObject {
-            code: -32000,
-            message: "the model refused the request shape".into(),
-            data: None,
-        }));
+        let error = call_failure(
+            CallFailure::Remote(RpcErrorObject {
+                code: -32000,
+                message: "the model refused the request shape".into(),
+                data: None,
+            }),
+            false,
+        );
         assert_eq!(error.code, "agent_remote_error");
         assert!(!error.retryable);
     }

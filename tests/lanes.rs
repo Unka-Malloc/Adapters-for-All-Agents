@@ -861,9 +861,34 @@ async fn cli_usage_limit_exit_is_quota_exhausted_not_error_outcome() {
         .open_session(SessionRequest::default(), tx)
         .await
         .expect("open");
-    // Quota text on a non-zero exit is failover-eligible, but text
-    // matching cannot prove the turn had no billable effect, so custody
-    // sees an uncertain-effect failure it may still replay.
+    // A refusal written to stderr with no stdout at all is an admission
+    // rejection: the child produced nothing, so the failure is a certain
+    // non-effect custody may replay on the next candidate.
+    let error = session.prompt(turn("probe")).await.expect_err("prompt");
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert!(error.retryable);
+    assert!(!error.uncertain_effect);
+}
+
+#[tokio::test]
+async fn cli_usage_limit_after_output_stays_uncertain_effect() {
+    let adapter = Adapter::new(cli_spec(
+        "sh",
+        vec![
+            "-c".into(),
+            "exec 0<&-; echo partial; echo 'usage limit reached' >&2; exit 1".into(),
+        ],
+        PromptChannel::Stdin,
+        StreamMode::Stdio,
+        None,
+    ));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = adapter
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .expect("open");
+    // Output before the refusal means billable work may already have run;
+    // custody may fail over but must not blind-replay.
     let error = session.prompt(turn("probe")).await.expect_err("prompt");
     assert_eq!(error.code, "agent_quota_exhausted");
     assert!(error.retryable);
