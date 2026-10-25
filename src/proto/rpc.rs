@@ -862,10 +862,17 @@ impl RpcState {
         })
     }
 
-    /// Whether this turn already delivered output events — billable work
-    /// may have run, so a refusal surfacing now stays uncertain-effect.
+    /// Whether this turn already produced billable evidence — streamed
+    /// text or a reported usage record. Bookkeeping notifications that
+    /// arrive raw (turn/session lifecycle markers) do not prove the
+    /// provider ran the request, so a refusal after only those is still
+    /// an admission rejection custody may replay.
     fn served(&self) -> bool {
-        self.delivery.state.lock().unwrap().issued > 0
+        let state = self.delivery.state.lock().unwrap();
+        state
+            .progress
+            .as_ref()
+            .is_some_and(|progress| !progress.text.is_empty() || progress.usage.is_some())
     }
 
     /// Await the acknowledgement and ingress-owned terminal state. Output

@@ -254,9 +254,16 @@ impl OutputSink {
     // before enqueueing, so callbacks cannot retain unbounded source payloads
     // or block response/configuration/permission processing. None is the
     // caller's explicit choice of unbounded output.
+    /// Mark that the turn produced billable evidence. Called only for
+    /// output-bearing session updates — bookkeeping updates such as
+    /// `AvailableCommandsUpdate` or `SessionInfoUpdate` do not prove the
+    /// provider ran the request.
+    fn mark_served(&self) {
+        self.state.lock().unwrap().served = true;
+    }
+
     fn deliver(&self, event: AgentEvent) -> Result<(), agent_client_protocol::Error> {
         let mut state = self.state.lock().unwrap();
-        state.served = true;
         let (event, clipped) = match event {
             AgentEvent::MessageChunk { text } => {
                 let prefix = bounds::bounded_prefix(&text, state.remaining);
@@ -652,6 +659,20 @@ async fn drive(
         .name(client_name)
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                // Session bookkeeping (command/mode/config/info echoes and
+                // the user's own chunk) is not billable work; everything
+                // else the agent produced — message, thought, tool call,
+                // plan, usage or an unknown update — may have been.
+                if !matches!(
+                    notification.update,
+                    SessionUpdate::UserMessageChunk(_)
+                        | SessionUpdate::AvailableCommandsUpdate(_)
+                        | SessionUpdate::CurrentModeUpdate(_)
+                        | SessionUpdate::ConfigOptionUpdate(_)
+                        | SessionUpdate::SessionInfoUpdate(_)
+                ) {
+                    notify_output.mark_served();
+                }
                 if let Some(event) = map_update(&notification.update) {
                     notify_output.deliver(event)?;
                 }
