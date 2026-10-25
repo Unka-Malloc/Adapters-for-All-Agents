@@ -1,7 +1,7 @@
 [package]
 name = "a4aa-dialects"
 description = "Convenience registry over the a4aa-<agent> dialect crates: name lookup and full enumeration for multi-agent hosts. Single-agent hosts should depend on the individual a4aa-<agent> crate directly instead."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
