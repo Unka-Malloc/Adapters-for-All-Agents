@@ -199,6 +199,51 @@ fn rpc_fixture(script: &str, limit: Option<usize>) -> a4aa::AgentSpec {
     }
 }
 
+/// Agents that report an errored turn inside a normal completion flow
+/// (pi's `message.stopReason:"error"` riding `message_end`/`turn_end`
+/// while `agent_settled` stays clean) must surface the stream-reported
+/// failure instead of returning an empty completed turn. A refusal
+/// before any output or nonzero usage is a certain non-effect — custody
+/// may replay it on the next candidate.
+#[tokio::test]
+async fn rpc_stream_reported_failure_fails_the_turn_replayable() {
+    let script = r#"
+import json,sys
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+    m=json.loads(line)
+    if m.get('method')=='prompt':
+        send({'jsonrpc':'2.0','id':m['id'],'result':{'id':'t'}})
+        send({'jsonrpc':'2.0','method':'message_end','params':{'message':{'role':'assistant','content':[],'stopReason':'error','errorMessage':'OpenAI API error (400): model_not_found','usage':{'input':0,'output':0,'totalTokens':0}}}})
+        send({'jsonrpc':'2.0','method':'done','params':{'turn':'t','status':'completed'}})
+"#;
+    let mut spec = rpc_fixture(script, None);
+    let LaneSpec::Rpc(rpc) = &mut spec.lane else {
+        panic!("fixture is rpc")
+    };
+    rpc.failure_path = Some("message.stopReason".into());
+    rpc.failure_value = Some("error".into());
+    rpc.failure_message_path = Some("message.errorMessage".into());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec)
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    let error = session
+        .prompt(TurnRequest {
+            text: "go".into(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("the stream-reported refusal must fail the turn");
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert!(error.retryable);
+    assert!(
+        !error.uncertain_effect,
+        "zero output and zero usage make the refusal a certain non-effect: {error}"
+    );
+}
+
 #[tokio::test]
 async fn rpc_preserves_text_and_completion_before_acknowledgement() {
     use serde_json::json;

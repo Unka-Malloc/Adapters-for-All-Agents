@@ -130,6 +130,10 @@ struct TurnProgress {
     /// queue so token accounting survives output-budget truncation the
     /// same way terminal records do.
     usage: Option<TokenUsage>,
+    /// Stream-level failure detail captured from a `failure_path` record —
+    /// for agents that report an errored turn inside a normal completion
+    /// flow, the settled outcome surfaces it instead of silently passing.
+    failure: Option<String>,
 }
 struct DeliveryState {
     remaining: Option<usize>,
@@ -240,6 +244,7 @@ impl TurnDelivery {
                         text_truncated: false,
                         expected: None,
                         usage: None,
+                        failure: None,
                         terminals: PendingTerminals::new(
                             self.limit
                                 .map(|limit| limit.max(crate::framing::DEFAULT_MAX_MESSAGE_BYTES)),
@@ -297,6 +302,23 @@ impl TurnDelivery {
                 .and_then(token_usage)
             {
                 progress.usage = Some(usage);
+            }
+            if let Some(path) = self.spec.failure_path.as_deref() {
+                if let Some(marker) = extract_text(&params, Some(path)) {
+                    if self
+                        .spec
+                        .failure_value
+                        .as_deref()
+                        .is_none_or(|want| marker == want)
+                    {
+                        progress.failure = self
+                            .spec
+                            .failure_message_path
+                            .as_deref()
+                            .and_then(|path| extract_text(&params, Some(path)))
+                            .or(Some(marker));
+                    }
+                }
             }
             if let Some(text) = &text {
                 if !progress.text_truncated {
@@ -863,16 +885,28 @@ impl RpcState {
     }
 
     /// Whether this turn already produced billable evidence — streamed
-    /// text or a reported usage record. Bookkeeping notifications that
-    /// arrive raw (turn/session lifecycle markers) do not prove the
-    /// provider ran the request, so a refusal after only those is still
-    /// an admission rejection custody may replay.
+    /// text or a usage record with a nonzero counter. Bookkeeping
+    /// notifications that arrive raw (turn/session lifecycle markers) and
+    /// all-zero usage records do not prove the provider ran the request,
+    /// so a refusal after only those is still an admission rejection
+    /// custody may replay.
     fn served(&self) -> bool {
         let state = self.delivery.state.lock().unwrap();
-        state
-            .progress
-            .as_ref()
-            .is_some_and(|progress| !progress.text.is_empty() || progress.usage.is_some())
+        state.progress.as_ref().is_some_and(|progress| {
+            !progress.text.is_empty()
+                || progress.usage.as_ref().is_some_and(|usage| {
+                    [
+                        usage.input,
+                        usage.cached_input,
+                        usage.cached_write,
+                        usage.output,
+                        usage.thought,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|tokens| tokens > 0)
+                })
+        })
     }
 
     /// Await the acknowledgement and ingress-owned terminal state. Output
@@ -923,6 +957,7 @@ impl RpcState {
                         truncated,
                         issued,
                         progress.usage.clone(),
+                        progress.failure.clone(),
                     )
                 });
                 if result.is_none() && acknowledged && state.closed {
@@ -939,8 +974,25 @@ impl RpcState {
                 }
                 result
             };
-            if let Some((status, text, truncated, fence, usage)) = terminal {
+            if let Some((status, text, truncated, fence, usage, failure)) = terminal {
                 self.delivery.fence(fence).await?;
+                // A stream-reported failure (for example a model the
+                // provider could not serve) settles as a failure, not an
+                // empty completed turn — custody can then fail the chain
+                // over to a live candidate.
+                if let Some(failure) = failure {
+                    let served = self.served();
+                    let code = if crate::error::quota_or_capacity_refusal(&failure) {
+                        "agent_quota_exhausted"
+                    } else {
+                        "agent_turn_failed"
+                    };
+                    return Err(if served {
+                        AdapterError::uncertain(code, "session/prompt").with_detail(failure)
+                    } else {
+                        AdapterError::retryable(code, "session/prompt").with_detail(failure)
+                    });
+                }
                 return Ok(TurnOutcome {
                     stop_reason: status,
                     text,

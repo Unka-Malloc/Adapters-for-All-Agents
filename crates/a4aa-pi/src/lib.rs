@@ -155,6 +155,12 @@ pub const AGENT: AgentCard = AgentCard {
         // frame - a real audit transcript is megabytes, not kilobytes.
         max_frame_bytes: Some(64 * 1024 * 1024),
         usage_path: Some("message.usage"),
+        // pi reports an errored turn inside the settled flow: the
+        // assistant record's stopReason and errorMessage ride
+        // `message_end`/`turn_end` while `agent_settled` stays clean.
+        failure_path: Some("message.stopReason"),
+        failure_value: Some("error"),
+        failure_message_path: Some("message.errorMessage"),
         mcp: None,
     }),
     alternates: &[AlternateLane {

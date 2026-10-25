@@ -28,6 +28,9 @@ fn rpc(mcp_servers: Vec<Value>, mcp_config: Option<RpcMcpConfig>) -> RpcLaneSpec
         transport: RpcTransport::Stdio,
         max_frame_bytes: None,
         usage_path: None,
+        failure_path: None,
+        failure_value: None,
+        failure_message_path: None,
         mcp_servers,
         mcp_config,
         initialize: Some(RpcCallSpec {

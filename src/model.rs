@@ -271,6 +271,20 @@ pub struct RpcLaneSpec {
     /// scanned instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_path: Option<String>,
+    /// Dotted path on any notification's params marking a failed turn —
+    /// for agents that report an errored turn inside a normal completion
+    /// flow (for example pi's `message.stopReason` on `message_end`/
+    /// `turn_end`). Absent disables stream-level failure detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_path: Option<String>,
+    /// Marker value `failure_path` reports for a failed turn (for
+    /// example `"error"`). Absent: any extracted marker means failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_value: Option<String>,
+    /// Dotted path to the failure's detail text (for example
+    /// `message.errorMessage`); landed on the error's detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message_path: Option<String>,
     /// MCP servers installed for every session, in the ACP declaration shape
     /// (`{name, command, args, env}`). A lane with no `mcp_config` refuses a
     /// non-empty list at open instead of silently running without tools.

@@ -103,6 +103,7 @@ pub(crate) fn quota_or_capacity_refusal(text: &str) -> bool {
         "capacity_exceeded",
         "model unavailable",
         "model not found",
+        "model_not_found",
         "no such model",
         "model does not exist",
         "unsupported model",

@@ -266,6 +266,9 @@ impl AgentCard {
                 },
                 max_frame_bytes: rpc.max_frame_bytes,
                 usage_path: rpc.usage_path.map(str::to_owned),
+                failure_path: rpc.failure_path.map(str::to_owned),
+                failure_value: rpc.failure_value.map(str::to_owned),
+                failure_message_path: rpc.failure_message_path.map(str::to_owned),
                 mcp_servers: Vec::new(),
                 mcp_config: rpc.mcp.map(|mcp| RpcMcpConfig {
                     flag: mcp.flag.to_owned(),
@@ -496,6 +499,16 @@ pub struct RpcSurface {
     /// `TurnOutcome::usage`. `None` scans the conventional carriers
     /// (`params.usage`, `params.message.usage`).
     pub usage_path: Option<&'static str>,
+    /// Dotted path on any notification's params marking a failed turn —
+    /// for agents that report an errored turn as a normal completion
+    /// record (for example pi's `message.stopReason`). `None` disables
+    /// stream-level failure detection.
+    pub failure_path: Option<&'static str>,
+    /// Marker value `failure_path` reports for a failed turn; `None`
+    /// treats any extracted marker as failure.
+    pub failure_value: Option<&'static str>,
+    /// Dotted path to the failure's detail text, landed on the error.
+    pub failure_message_path: Option<&'static str>,
     /// Native MCP registration surface; `None` means this rpc lane cannot
     /// install servers and must refuse a non-empty server list.
     pub mcp: Option<&'static RpcMcpDecl>,

@@ -161,6 +161,9 @@ pub const AGENT: AgentCard = AgentCard {
         transport: RpcTransportDecl::Stdio,
         max_frame_bytes: None,
         usage_path: None,
+        failure_path: None,
+        failure_value: None,
+        failure_message_path: None,
         mcp: Some(&RPC_MCP),
     }),
     alternates: &[AlternateLane {
