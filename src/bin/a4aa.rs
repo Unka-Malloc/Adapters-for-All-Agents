@@ -631,6 +631,9 @@ async fn serve(trust_host_env: bool) -> i32 {
 ///   `mode`, `thought_level`, `permissions`) and legacy `modes`/`models`
 ///   states. `A4AA_FIXTURE_LEGACY` drops the `model`/`mode` configOptions
 ///   so only the legacy surfaces carry those slots.
+///   `A4AA_FIXTURE_NO_PERMISSIONS` drops the `permissions` configOption:
+///   the fixture then advertises no permission selector at all, like an
+///   agent whose posture is locked by its launch configuration.
 /// - `session/set_config_option`, `session/set_mode`, `session/set_model`
 ///   update the fixture's advertised state and echo it back.
 /// - `A4AA_FIXTURE_AUTH` advertises auth method `fixture-auth` and fails
@@ -647,6 +650,7 @@ fn fixture_agent() -> i32 {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let legacy = std::env::var_os("A4AA_FIXTURE_LEGACY").is_some();
+    let no_permissions = std::env::var_os("A4AA_FIXTURE_NO_PERMISSIONS").is_some();
     let restore_unknown = std::env::var_os("A4AA_FIXTURE_RESTORE_UNKNOWN").is_some();
     let model_reply = std::env::var("A4AA_FIXTURE_MODEL_REPLY").unwrap_or_default();
     let require_auth = std::env::var_os("A4AA_FIXTURE_AUTH").is_some();
@@ -675,6 +679,9 @@ fn fixture_agent() -> i32 {
         let mut options = Vec::new();
         for slot in ["model", "mode", "thought_level", "permissions"] {
             if legacy && (slot == "model" || slot == "mode") {
+                continue;
+            }
+            if no_permissions && slot == "permissions" {
                 continue;
             }
             let values = option_values(slot)

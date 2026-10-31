@@ -510,6 +510,10 @@ pub struct AcpLane {
     /// Resolved lazily on an auth-required refusal and sent as
     /// `authenticate`'s `_meta.api_key`.
     pub auth_key: Option<crate::env::EnvSource>,
+    /// Permission preset the spec's own configuration already enforces;
+    /// satisfies a matching session request when the agent advertises no
+    /// `permissions` selector.
+    pub enforced_permission: Option<String>,
     pub client_name: String,
     pub secrets: Arc<dyn SecretResolver>,
     pub observer: SharedObserver,
@@ -567,6 +571,7 @@ impl AcpLane {
                 config: request.config,
                 output,
                 auth_key: self.auth_key.clone(),
+                enforced_permission: self.enforced_permission.clone(),
                 env,
                 secrets: self.secrets.clone(),
             },
@@ -630,6 +635,7 @@ struct ServeContext {
     config: SessionConfig,
     output: OutputSink,
     auth_key: Option<crate::env::EnvSource>,
+    enforced_permission: Option<String>,
     env: std::collections::BTreeMap<String, std::ffi::OsString>,
     secrets: Arc<dyn SecretResolver>,
 }
@@ -881,7 +887,14 @@ async fn open_session(
         })?,
     };
 
-    apply_session_config(connection, &session_id, &mut setup, &context.config).await?;
+    apply_session_config(
+        connection,
+        &session_id,
+        &mut setup,
+        &context.config,
+        context.enforced_permission.as_deref(),
+    )
+    .await?;
 
     Ok(Opened {
         connection: connection.clone(),
@@ -1057,7 +1070,8 @@ async fn call_with_auth_retry(
 ///   surfaces; a selectable option that lacks the requested value fails
 ///   closed rather than falling back.
 /// - On a fresh session every surface is treated as reported, so an
-///   unadvertised request fails.
+///   unadvertised request fails — except a permission preset the spec
+///   declares already enforced, which the declaration itself satisfies.
 /// - On a restored session an unreported surface stays unknown only when
 ///   the host did not request an override. Explicit selections must be
 ///   applied and confirmed, or session establishment fails closed.
@@ -1066,6 +1080,7 @@ async fn apply_session_config(
     session_id: &str,
     state: &mut SessionSetup,
     requested: &SessionConfig,
+    enforced_permission: Option<&str>,
 ) -> Result<(), AdapterError> {
     if let Some(model) = requested.model.as_deref() {
         apply_model(connection, session_id, state, model).await?;
@@ -1078,7 +1093,21 @@ async fn apply_session_config(
         ("permissions", requested.permission.as_deref()),
     ] {
         if let Some(value) = requested_value {
-            apply_config_value(connection, session_id, state, slot, value).await?;
+            // A spec whose own configuration already enforces the
+            // requested permission preset (a locked-down patch, an
+            // injected read-only config) needs no session selector:
+            // when the agent advertises none, the declared enforcement
+            // satisfies an exact match — anything else still fails
+            // closed below. An advertised selector always wins: its
+            // offer list verifies the value.
+            let advertised =
+                find_option(state.config_options.as_deref().unwrap_or(&[]), slot).is_some();
+            if !(advertised || slot == "permissions" && enforced_permission == Some(value)) {
+                return Err(config_unavailable(slot, value));
+            }
+            if advertised {
+                apply_config_value(connection, session_id, state, slot, value).await?;
+            }
         }
     }
     Ok(())

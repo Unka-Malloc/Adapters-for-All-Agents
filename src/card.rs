@@ -154,6 +154,7 @@ impl AgentCard {
                 mcp_servers: Vec::new(),
                 prefer_load: *prefer_load,
                 auth_key: auth_key.map(AcpAuthKey::source),
+                enforced_permission: None,
             },
             AgentSurface::Cli(cli) => LaneSpec::Cli(Box::new(CliLaneSpec {
                 args: {

@@ -36,6 +36,7 @@ fn acp_spec() -> AgentSpec {
             mcp_servers: vec![],
             prefer_load: false,
             auth_key: None,
+            enforced_permission: None,
         },
         command: fixture_command(),
         max_output_bytes: None,
@@ -1125,7 +1126,7 @@ else:
         send({'jsonrpc':'2.0','id':m['id'],'result':result})
 "#);
             let lane=match mode {
-                "acp"=>LaneSpec::Acp {mcp_servers:vec![],prefer_load:false,auth_key:None},
+                "acp"=>LaneSpec::Acp {mcp_servers:vec![],prefer_load:false,auth_key:None,enforced_permission:None},
                 "cli"|"pty"=>LaneSpec::Cli(Box::new(CliLaneSpec {args:vec!["{prompt}".into()],prompt_channel:PromptChannel::ArgOnly,
                     stream:if mode=="pty" {StreamMode::Pty}else{StreamMode::Stdio},..Default::default()})),
                 _=>LaneSpec::Rpc(Box::new(RpcLaneSpec {
@@ -1358,6 +1359,71 @@ async fn acp_session_options_unadvertised_fail_closed() {
         Err(error) => error,
     };
     assert_eq!(error.code, "agent_configuration_unavailable", "{error:?}");
+}
+
+#[tokio::test]
+async fn acp_spec_enforced_permission_satisfies_an_unadvertised_preset() {
+    // A spec declaring `enforced_permission` carries its posture in its own
+    // launch configuration (a locked-down patch, an injected read-only
+    // config). When the agent advertises no `permissions` selector a
+    // matching request is satisfied; anything else still fails closed.
+    let mut spec = acp_spec_with_env(&[("A4AA_FIXTURE_NO_PERMISSIONS", "1")]);
+    let LaneSpec::Acp {
+        enforced_permission,
+        ..
+    } = &mut spec.lane
+    else {
+        unreachable!()
+    };
+    *enforced_permission = Some("read-only".into());
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let session = Adapter::new(spec.clone())
+        .open_session(
+            SessionRequest {
+                config: options(None, None, None, Some("read-only")),
+                ..SessionRequest::default()
+            },
+            tx,
+        )
+        .await
+        .expect("spec-enforced permission opens without a selector");
+    session.close().await.unwrap();
+
+    for permission in ["open", "default"] {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = match Adapter::new(spec.clone())
+            .open_session(
+                SessionRequest {
+                    config: options(None, None, None, Some(permission)),
+                    ..SessionRequest::default()
+                },
+                tx,
+            )
+            .await
+        {
+            Ok(_) => panic!("a preset the spec does not enforce must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "agent_configuration_unavailable");
+    }
+
+    // Without the spec declaration the same request fails closed.
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let error = match Adapter::new(acp_spec_with_env(&[("A4AA_FIXTURE_NO_PERMISSIONS", "1")]))
+        .open_session(
+            SessionRequest {
+                config: options(None, None, None, Some("read-only")),
+                ..SessionRequest::default()
+            },
+            tx,
+        )
+        .await
+    {
+        Ok(_) => panic!("undeclared enforcement must not satisfy a preset"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "agent_configuration_unavailable");
 }
 
 #[tokio::test]
@@ -1749,6 +1815,7 @@ time.sleep(3600)
                     mcp_servers: vec![],
                     prefer_load: false,
                     auth_key: None,
+                    enforced_permission: None,
                 },
                 _ => LaneSpec::Rpc(Box::new(RpcLaneSpec {
                     transport: RpcTransport::Stdio,

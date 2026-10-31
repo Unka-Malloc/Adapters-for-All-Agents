@@ -487,6 +487,7 @@ impl Adapter {
                 mcp_servers,
                 prefer_load,
                 auth_key,
+                enforced_permission,
             } => {
                 struct Bridge {
                     events: mpsc::UnboundedSender<AgentEvent>,
@@ -513,6 +514,7 @@ impl Adapter {
                     mcp_servers: mcp_servers.clone(),
                     prefer_load: *prefer_load,
                     auth_key: auth_key.clone(),
+                    enforced_permission: enforced_permission.clone(),
                     client_name: self
                         .spec
                         .client_name

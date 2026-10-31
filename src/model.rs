@@ -503,6 +503,13 @@ pub enum LaneSpec {
         /// authenticate attempt.
         #[serde(default)]
         auth_key: Option<EnvSource>,
+        /// A permission preset the spec's own configuration already
+        /// enforces — a patch or injected config that locks the agent's
+        /// mutation surface. When the agent advertises no `permissions`
+        /// selector, a request for exactly this value is satisfied by the
+        /// declaration; any other preset still fails closed.
+        #[serde(default)]
+        enforced_permission: Option<String>,
     },
     Rpc(Box<RpcLaneSpec>),
     Cli(Box<CliLaneSpec>),
