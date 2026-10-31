@@ -32,10 +32,9 @@ use a4aa::card::{
     InstructionChannel, LiveUsage, ModelCatalog, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
-    SubagentSurface, Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
-use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
 
 pub use native::{native, NATIVE};
 
@@ -45,15 +44,7 @@ pub use native::{native, NATIVE};
 /// in any form the runtime enforces.
 pub const DIALECT: Dialect = Dialect {
     id: "kilocode",
-    hooks: HookSurface::Extension {
-        file: ".config/kilo/plugin/a4aa.js",
-        kind: ExtensionKind::OpenCode,
-        map: &[
-            (HookEvent::SessionStart, "session.created"),
-            (HookEvent::PreToolUse, "tool.execute.before"),
-            (HookEvent::PostToolUse, "tool.execute.after"),
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::KILO_CODE.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",

@@ -36,7 +36,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.kiro",
-        hooks: "IDE trigger hooks unmapped",
+        hooks: a4aa::hooks::harnesses::KIRO.config_path,
         permissions: "",
         model_catalog: "kiro-cli-chat chat --list-models",
     },
@@ -50,7 +50,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::NotOffered, "no permission selector"),
         skills: cell(NativeStatus::Native, ".kiro/skills"),
-        hooks: cell(NativeStatus::NotOffered, "IDE trigger hooks unmapped"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::KIRO),
         subagents: cell(NativeStatus::Native, ".kiro/agents JSON"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

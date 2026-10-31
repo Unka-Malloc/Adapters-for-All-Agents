@@ -22,7 +22,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.hermes/config.yaml",
-        hooks: "",
+        hooks: a4aa::hooks::harnesses::HERMES.config_path,
         permissions: "",
         model_catalog: "",
     },
@@ -39,7 +39,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::NotOffered, "no permission selector"),
         skills: cell(NativeStatus::Native, ".hermes/skills"),
-        hooks: cell(NativeStatus::NotOffered, "event-bus hooks unmapped"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::HERMES),
         subagents: cell(NativeStatus::NotOffered, "SubagentSurface::None"),
         plugins: cell(NativeStatus::Native, ".hermes/plugins/*.yaml"),
     },

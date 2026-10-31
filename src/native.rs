@@ -111,6 +111,18 @@ pub const fn cell(status: NativeStatus, note: &'static str) -> Cell {
     Cell { status, note }
 }
 
+pub const fn hook_cell(harness: ahe::install::Harness) -> Cell {
+    Cell {
+        status: match harness.native_status {
+            ahe::install::NativeStatus::Native => NativeStatus::Native,
+            ahe::install::NativeStatus::NotOffered => NativeStatus::NotOffered,
+            ahe::install::NativeStatus::Unadapted => NativeStatus::Unadapted,
+            ahe::install::NativeStatus::NonNative => NativeStatus::NonNative,
+        },
+        note: harness.native_note,
+    }
+}
+
 impl NativeCapability {
     /// `true` when `last_verified` is a `YYYY-MM-DD` calendar date.
     pub fn date_is_iso(&self) -> bool {

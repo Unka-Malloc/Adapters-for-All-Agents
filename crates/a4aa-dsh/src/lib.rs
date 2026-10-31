@@ -15,11 +15,11 @@ mod native;
 
 use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CompletionDecl, DetectSurface,
-    FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, RpcCallDecl,
+    FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, RpcCallDecl,
     RpcSurface, RpcTransportDecl, StoreKind, TranscriptUsage, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
 };
 use a4aa::{AdaptationPlan, AgentSpec, Dialect, MechanismSet, SessionScope};
 
@@ -36,7 +36,7 @@ pub use native::{native, NATIVE};
 /// The `dsh` dialect: DeepSeek Harness layered native profiles (cordis), skills.
 pub const DIALECT: Dialect = Dialect {
     id: "dsh",
-    hooks: HookSurface::None,
+    hooks: a4aa::hooks::harnesses::DSH.surface,
     rules: None,
     skills_dir: Some(".dsh/skills"),
     commands: CommandSurface::None,
@@ -149,6 +149,15 @@ static SDK_RPC: RpcSurface = RpcSurface {
 /// `COMMAND_CODE_API_KEY` reference name from `$DSH_HOME/.credentials.yaml`,
 /// installs the route patch, and the next ACP `session/new` advertises the
 /// `command-code` provider alongside the shipped ones.
+///
+/// Distributions: the npm CLI and the Electron desktop app ship the same
+/// harness — the macOS `DeepSeek Harness.app` bundles a full `dsh` CLI at
+/// `Contents/Resources/runtime/cli/bin/dsh` (an Electron-as-Node shim) that
+/// boots the same `~/.dsh` profiles and speaks the same protocol, so
+/// detection distinguishes the install forms (`binary_dirs`/`apps`) while
+/// the lanes stay shared. The desktop's GUI-level state lives in the
+/// Electron userData directory `Application Support/@deepseek-ai/dsh-desktop`,
+/// not in `$DSH_HOME`.
 pub const AGENT: AgentCard = AgentCard {
     id: "dsh",
     label: "DeepSeek Harness",
@@ -164,14 +173,37 @@ pub const AGENT: AgentCard = AgentCard {
     }],
     detect: DetectSurface {
         binaries: &["dsh"],
-        processes: &["dsh.exe", "dsh"],
-        binary_dirs: &[],
+        // The bundled CLI shim execs the app binary with
+        // `ELECTRON_RUN_AS_NODE`, so a running desktop-bundled `dsh` reports
+        // the Electron process name.
+        processes: &["dsh.exe", "dsh", "DeepSeek Harness"],
+        binary_dirs: &[
+            OsPath {
+                path: "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin",
+                oses: &["macos"],
+            },
+            OsPath {
+                path: "{home}/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin",
+                oses: &["macos"],
+            },
+        ],
         config: &[
             "{home}/.dsh/.credentials.yaml",
             "{home}/.dsh/profiles/acp/cordis.patch.yml",
+            // Desktop GUI prefs: Electron userData, separate from `$DSH_HOME`.
+            "{home}/Library/Application Support/@deepseek-ai/dsh-desktop/desktop/settings.json",
         ],
         detection: &["{home}/.dsh/sessions"],
-        apps: &[],
+        apps: &[
+            OsPath {
+                path: "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+                oses: &["macos"],
+            },
+            OsPath {
+                path: "{home}/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+                oses: &["macos"],
+            },
+        ],
     },
     features: FeatureSurface {
         instructions: InstructionChannel::Compose,
@@ -278,8 +310,30 @@ mod card_tests {
     }
 
     #[test]
+    fn detect_covers_the_desktop_distribution() {
+        assert!(AGENT
+            .detect
+            .binary_dirs
+            .iter()
+            .any(|dir| dir.path.ends_with("runtime/cli/bin") && dir.oses.contains(&"macos")));
+        assert!(AGENT
+            .detect
+            .apps
+            .iter()
+            .any(|app| app.path.ends_with("Contents/MacOS/DeepSeek Harness")));
+        // The bundled shim runs under Electron-as-Node: its process image
+        // is the app executable name.
+        assert!(AGENT.detect.processes.contains(&"DeepSeek Harness"));
+        assert!(AGENT
+            .detect
+            .config
+            .iter()
+            .any(|path| path.contains("Application Support/@deepseek-ai/dsh-desktop")));
+    }
+
+    #[test]
     fn native_table_records_both_first_party_surfaces() {
-        assert_eq!(NATIVE.last_verified, "2026-10-24");
+        assert_eq!(NATIVE.last_verified, "2026-10-26");
         assert_eq!(NATIVE.surfaces.acp.status, a4aa::NativeStatus::Native);
         assert_eq!(NATIVE.surfaces.sdk.status, a4aa::NativeStatus::Native);
         assert_eq!(NATIVE.surfaces.rpc.status, a4aa::NativeStatus::Native);

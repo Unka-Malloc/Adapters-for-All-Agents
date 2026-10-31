@@ -31,7 +31,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.claude/settings.json",
-        hooks: "{home}/.claude/settings.json hooks",
+        hooks: a4aa::hooks::harnesses::CLAUDE.config_path,
         permissions: "{home}/.claude/settings.json permissions.defaultMode",
         model_catalog: "",
     },
@@ -51,7 +51,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "--permission-mode default|manual|acceptEdits|plan|auto|dontAsk|bypassPermissions",
         ),
         skills: cell(NativeStatus::Native, ".claude/skills"),
-        hooks: cell(NativeStatus::Native, "Claude settings.json hooks"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::CLAUDE),
         subagents: cell(NativeStatus::Native, ".claude/agents"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

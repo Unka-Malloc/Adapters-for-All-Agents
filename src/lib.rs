@@ -44,6 +44,7 @@ mod template;
 pub mod transport;
 
 pub use adapter::{Adapter, AgentSession, BeforeTurn, LaneSession, PermissionHandler, TurnRequest};
+pub use ahe::install as hooks;
 pub use card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
     DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog,

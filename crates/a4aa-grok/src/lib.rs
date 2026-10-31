@@ -18,32 +18,17 @@ use a4aa::card::{
     UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
-use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
 
 pub use native::{native, NATIVE};
 
 /// The `grok` dialect: Grok per-file hook bundles, AGENTS.md, skills, commands, subagents.
 pub const DIALECT: Dialect = Dialect {
     id: "grok",
-    hooks: HookSurface::ClaudeBundle {
-        dir: ".grok/hooks",
-        events: &[
-            HookEvent::SessionStart,
-            HookEvent::SessionEnd,
-            HookEvent::UserPromptSubmit,
-            HookEvent::PreToolUse,
-            HookEvent::PostToolUse,
-            HookEvent::Stop,
-            HookEvent::SubagentStart,
-            HookEvent::SubagentStop,
-            HookEvent::PermissionRequest,
-            HookEvent::Notification,
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::GROK.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",

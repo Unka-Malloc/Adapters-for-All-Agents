@@ -34,7 +34,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.pi/agent/settings.json",
-        hooks: "{home}/.pi/agent/extensions/*.ts",
+        hooks: a4aa::hooks::harnesses::PI.config_path,
         permissions: "",
         model_catalog: "rpc get_available_models",
     },
@@ -57,7 +57,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::NotOffered, "no permission selector"),
         skills: cell(NativeStatus::Native, ".pi/agent/skills"),
-        hooks: cell(NativeStatus::Native, "Pi TS extensions, session_start"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::PI),
         subagents: cell(NativeStatus::NotOffered, "SubagentSurface::None"),
         plugins: cell(NativeStatus::Native, ".pi/agent/extensions/*.ts"),
     },

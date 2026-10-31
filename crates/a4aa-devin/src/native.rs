@@ -22,7 +22,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.config/devin/config.json",
-        hooks: "{home}/.config/devin/config.json hooks",
+        hooks: a4aa::hooks::harnesses::DEVIN.config_path,
         permissions: "{home}/.config/devin/config.json permissions; --permission-mode",
         model_catalog: "devin models",
     },
@@ -39,7 +39,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::Native, "auto|accept-edits|smart|dangerous"),
         skills: cell(NativeStatus::Native, ".config/devin/skills"),
-        hooks: cell(NativeStatus::Native, "Claude-shape config.json hooks"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::DEVIN),
         subagents: cell(NativeStatus::Native, ".config/devin/agents"),
         plugins: cell(
             NativeStatus::NotOffered,

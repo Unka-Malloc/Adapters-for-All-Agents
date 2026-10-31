@@ -25,7 +25,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.config/opencode/opencode.jsonc",
-        hooks: "{home}/.config/opencode/plugins/a4aa.js",
+        hooks: a4aa::hooks::harnesses::OPENCODE.config_path,
         permissions: "",
         model_catalog: "",
     },
@@ -42,7 +42,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::Native, "protocol-native permission requests"),
         skills: cell(NativeStatus::Native, ".opencode/skills"),
-        hooks: cell(NativeStatus::Native, "OpenCode JS plugin events"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::OPENCODE),
         subagents: cell(NativeStatus::Native, ".config/opencode/agents"),
         plugins: cell(
             NativeStatus::NotOffered,

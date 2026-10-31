@@ -587,13 +587,16 @@ impl ServeSession {
                     ));
                 }
                 Some(record) => {
-                    // An assistant record newer than the prompt marker
-                    // means the model already produced billable output.
-                    let served = messages.iter().any(|message| {
-                        created_ms(message) >= marker_ms
-                            && message["type"].as_str() == Some("assistant")
-                    });
-                    return Err(turn_failure(record, served));
+                    // Only an assistant record that actually carries output
+                    // or usage proves the model ran. The server creates an
+                    // empty assistant envelope when it accepts the prompt,
+                    // before a provider refusal can stop the turn, so
+                    // counting the envelope alone would mark every quota
+                    // refusal uncertain-effect and freeze the failover chain.
+                    return Err(turn_failure(
+                        record,
+                        turn_produced_output(&messages, marker_ms),
+                    ));
                 }
                 None => {}
             }
@@ -647,6 +650,58 @@ impl ServeSession {
 /// count as the newest so they stay visible.
 fn created_ms(message: &Value) -> u64 {
     message["time"]["created"].as_u64().unwrap_or(u64::MAX)
+}
+
+/// Whether a turn produced billable output before its terminal record.
+///
+/// The server opens an assistant envelope as soon as it accepts the prompt.
+/// A provider refusal can leave that envelope empty and without token usage:
+/// nothing was inferred, so it must not be read as a served turn. Replay
+/// safety depends on this distinction — `uncertain_effect` is only for a
+/// turn whose output may already exist.
+fn turn_produced_output(messages: &[Value], marker_ms: u64) -> bool {
+    messages.iter().any(|message| {
+        created_ms(message) >= marker_ms
+            && message["type"].as_str() == Some("assistant")
+            && assistant_carries_output(message)
+    })
+}
+
+/// One assistant record's evidence of work: a non-empty text part, a tool or
+/// reasoning part, or reported token usage. An empty text part and a null
+/// usage table are the refusal envelope, not a completed inference.
+fn assistant_carries_output(message: &Value) -> bool {
+    if let Some(text) = message["content"].as_str() {
+        if !text.is_empty() {
+            return true;
+        }
+    }
+    for part in message["content"].as_array().into_iter().flatten() {
+        match part["type"].as_str() {
+            Some("text") => {
+                if part["text"].as_str().is_some_and(|text| !text.is_empty()) {
+                    return true;
+                }
+            }
+            // Tool calls and any other non-text part are billable work even
+            // when the assistant produced no prose.
+            _ => return true,
+        }
+    }
+    let tokens = &message["tokens"];
+    if tokens.is_object() {
+        for key in ["input", "output", "reasoning", "total"] {
+            if tokens[key].as_u64().unwrap_or(0) > 0 {
+                return true;
+            }
+        }
+        for key in ["read", "write"] {
+            if tokens["cache"][key].as_u64().unwrap_or(0) > 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A quota refusal that answered an admission call — session create,
@@ -750,16 +805,10 @@ fn collect_output(messages: &[Value], marker_ms: u64) -> (String, Option<TokenUs
                 }
             }
         }
-        let tokens = &message["tokens"];
-        if tokens.is_object() {
-            usage = Some(TokenUsage {
-                input: tokens["input"].as_u64(),
-                cached_input: tokens["cache"]["read"].as_u64(),
-                cached_write: tokens["cache"]["write"].as_u64(),
-                output: tokens["output"].as_u64(),
-                thought: tokens["reasoning"].as_u64(),
-                total: None,
-            });
+        if let Some(reported) =
+            token_usage_detector::agent::from_opencode_tokens(&message["tokens"])
+        {
+            usage = Some(reported);
         }
     }
     (text, usage)
@@ -921,6 +970,71 @@ mod tests {
             .detail
             .as_deref()
             .is_some_and(|detail| detail.starts_with("provider.quota: ")));
+    }
+
+    #[test]
+    fn empty_assistant_envelope_keeps_a_quota_refusal_certain_and_retryable() {
+        // Captured shape: OpenCode's free tier accepts the prompt, creates an
+        // assistant envelope with no content and no usage, then posts the
+        // terminal idle record carrying the typed 429 refusal.
+        let marker = 1_793_006_888_649u64;
+        let messages = vec![
+            json!({
+                "type": "idle", "outcome": "failed",
+                "time": {"created": marker + 1495},
+                "error": {
+                    "type": "provider.quota",
+                    "message": "Free usage limit reached."
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "time": {"created": marker + 43},
+                "content": [],
+                "tokens": null,
+                "error": {
+                    "type": "provider.quota",
+                    "message": "Free usage limit reached."
+                }
+            }),
+            json!({"type": "user", "time": {"created": marker}}),
+        ];
+        assert!(!turn_produced_output(&messages, marker));
+        let record = terminal(&messages, marker).expect("terminal record");
+        let error = turn_failure(record, turn_produced_output(&messages, marker));
+        assert_eq!(error.code, "agent_quota_exhausted");
+        assert!(error.retryable, "custody must be allowed to replay");
+        assert!(!error.uncertain_effect, "nothing ran before the refusal");
+    }
+
+    #[test]
+    fn assistant_output_or_usage_still_marks_the_turn_served() {
+        let marker = 100u64;
+        let text = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "text", "text": "OK"}]
+        })];
+        assert!(turn_produced_output(&text, marker));
+        let tool = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "tool", "tool": "bash"}]
+        })];
+        assert!(turn_produced_output(&tool, marker));
+        let usage = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [], "tokens": {"input": 9, "output": 0}
+        })];
+        assert!(turn_produced_output(&usage, marker));
+        let empty_text = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "text", "text": ""}], "tokens": null
+        })];
+        assert!(!turn_produced_output(&empty_text, marker));
+        let before_marker = vec![json!({
+            "type": "assistant", "time": {"created": 90},
+            "content": [{"type": "text", "text": "earlier turn"}]
+        })];
+        assert!(!turn_produced_output(&before_marker, marker));
     }
 
     #[test]

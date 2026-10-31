@@ -31,7 +31,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.gemini/antigravity-cli/settings.json",
-        hooks: "{home}/.gemini/config/hooks.json",
+        hooks: a4aa::hooks::harnesses::ANTIGRAVITY.config_path,
         permissions: "",
         model_catalog: "agy models",
     },
@@ -48,10 +48,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "no per-request permission preset; --dangerously-skip-permissions is global",
         ),
         skills: cell(NativeStatus::Native, ".gemini/antigravity-cli/skills"),
-        hooks: cell(
-            NativeStatus::Native,
-            "named bundle SessionStart/PreToolUse/…",
-        ),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::ANTIGRAVITY),
         subagents: cell(NativeStatus::Native, ".gemini/config/agents"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

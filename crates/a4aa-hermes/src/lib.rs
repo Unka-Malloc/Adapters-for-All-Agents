@@ -17,7 +17,7 @@ use a4aa::card::{
     InstructionChannel, LiveUsage, ModelCatalog, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
 };
 use a4aa::{AdaptationPlan, AgentSpec, Dialect, MechanismSet};
 
@@ -26,7 +26,7 @@ pub use native::{native, NATIVE};
 /// The `hermes` dialect: Hermes skills and plugin.yaml manifests (event-bus hooks unmapped).
 pub const DIALECT: Dialect = Dialect {
     id: "hermes",
-    hooks: HookSurface::None,
+    hooks: a4aa::hooks::harnesses::HERMES.surface,
     rules: None,
     skills_dir: Some(".hermes/skills"),
     commands: CommandSurface::None,

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Extend the `dsh` card's detection surface to the Electron desktop
+  distribution: `DeepSeek Harness.app` bundles a working `dsh` CLI at
+  `Contents/Resources/runtime/cli/bin` (an Electron-as-Node shim over the
+  same `~/.dsh` home and lanes), detected via `binary_dirs`/`apps`; the
+  desktop's GUI-level settings marker joins `config`, and `processes` now
+  matches the bundled shim's `DeepSeek Harness` image name.
+- Fix the serve lane's served-turn detection: an assistant envelope that the
+  server creates before a provider refusal (empty content, no token usage) is
+  no longer mistaken for billable output. Typed quota refusals therefore stay
+  retryable and certain as documented, so custody fails over to the next
+  candidate instead of parking the host's work on a capacity refusal.
+
 ## 0.3.0
 
 A breaking update from 0.2.x: the lane rework adds required fields to

@@ -31,7 +31,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.codex/config.toml",
-        hooks: "{home}/.codex/hooks.json",
+        hooks: a4aa::hooks::harnesses::CODEX.config_path,
         permissions: "sandbox flags read-only|workspace-write|danger-full-access",
         model_catalog: "rpc model/list",
     },
@@ -54,7 +54,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "sandbox read-only|workspace-write|danger-full-access",
         ),
         skills: cell(NativeStatus::Native, ".codex/skills"),
-        hooks: cell(NativeStatus::Native, "Claude-shape hooks.json"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::CODEX),
         subagents: cell(NativeStatus::Native, ".codex/agents TOML"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

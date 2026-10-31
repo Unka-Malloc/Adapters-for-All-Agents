@@ -25,7 +25,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.kimi-code/config.toml",
-        hooks: "",
+        hooks: a4aa::hooks::harnesses::KIMI_CODE.config_path,
         permissions: "distinct flags --yolo/--auto/--plan, not a mode selector",
         model_catalog: "",
     },
@@ -45,7 +45,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "flags, not a mode-valued selector",
         ),
         skills: cell(NativeStatus::Native, ".kimi-code/skills"),
-        hooks: cell(NativeStatus::NotOffered, "HookSurface::None"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::KIMI_CODE),
         subagents: cell(NativeStatus::NotOffered, "SubagentSurface::None"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

@@ -90,6 +90,24 @@ impl Default for EnvPolicy {
     }
 }
 
+/// Temp-directory variable names a verbatim inherit may carry.
+const TEMP_DIR_VARS: &[&str] = &["TMPDIR", "TMP", "TEMP"];
+
+/// A `/dev/fd/N` (or `/proc/.../fd/N`) spelling names a descriptor inside the
+/// *parent's* fd table, not a traversable directory. Runtimes that open
+/// `$TMPDIR/child` fail on platforms without fd-relative path resolution
+/// (e.g. Darwin fdescfs), and a runtime that happens to hold the same fd
+/// number resolves it against an unrelated object. Mechanical inheritance
+/// drops the spelling instead of propagating a value the child cannot use;
+/// a host that genuinely means it declares an explicit `set` entry.
+fn inheritable_temp_dir(key: &str, value: &OsString) -> bool {
+    if !TEMP_DIR_VARS.contains(&key) {
+        return true;
+    }
+    let value = value.to_string_lossy();
+    !(value.starts_with("/dev/fd/") || value.starts_with("/proc/self/fd/"))
+}
+
 /// Resolves `{"secret": "ref"}` environment sources. Implemented by the host
 /// (keychain, vault, encrypted store); the adapter never reads secret stores
 /// itself.
@@ -122,7 +140,10 @@ pub async fn resolve(
                 .copied()
                 .chain(inherit.iter().map(String::as_str))
             {
-                if let Some(value) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+                if let Some(value) = std::env::var_os(key)
+                    .filter(|v| !v.is_empty())
+                    .filter(|v| inheritable_temp_dir(key, v))
+                {
                     resolved.insert(key.to_owned(), value);
                 }
             }
@@ -132,7 +153,10 @@ pub async fn resolve(
         }
         EnvPolicy::InheritAll { set } => {
             for (key, value) in std::env::vars_os() {
-                resolved.insert(key.into_string().unwrap_or_default(), value);
+                let key = key.into_string().unwrap_or_default();
+                if inheritable_temp_dir(&key, &value) {
+                    resolved.insert(key, value);
+                }
             }
             apply_set(&mut resolved, set, secrets).await?;
         }
@@ -175,14 +199,34 @@ mod tests {
         }
     }
 
-    fn spec_env(key: &str, value: &str) {
-        // SAFETY: tests run single-purpose env edits on unique keys.
-        unsafe { std::env::set_var(key, value) };
+    fn spec_env(test_name: &str, values: &[(&str, &str)]) -> bool {
+        // SAFETY: environment overrides apply only to an isolated test process.
+        if std::env::var("A4AA_ENV_TEST_CHILD").ok().as_deref() == Some(test_name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--test-threads=1"])
+            .env("A4AA_ENV_TEST_CHILD", test_name)
+            .envs(values.iter().copied())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated environment test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        true
     }
 
     #[tokio::test]
     async fn default_policy_excludes_unlisted_credential_markers() {
-        spec_env("A4AA_TEST_INHERIT_MARKER", "hidden");
+        if spec_env(
+            "env::tests::default_policy_excludes_unlisted_credential_markers",
+            &[("A4AA_TEST_INHERIT_MARKER", "hidden")],
+        ) {
+            return;
+        }
         let resolved = resolve(&EnvPolicy::default(), &BTreeMap::new(), &NoSecrets)
             .await
             .unwrap();
@@ -192,7 +236,12 @@ mod tests {
 
     #[tokio::test]
     async fn sanitized_never_inherits_unlisted_host_variables() {
-        spec_env("A4AA_TEST_SECRET_MARKER", "leak-check");
+        if spec_env(
+            "env::tests::sanitized_never_inherits_unlisted_host_variables",
+            &[("A4AA_TEST_SECRET_MARKER", "leak-check")],
+        ) {
+            return;
+        }
         let policy = EnvPolicy::Sanitized {
             inherit: Vec::new(),
             set: BTreeMap::new(),
@@ -201,6 +250,43 @@ mod tests {
             .await
             .unwrap();
         assert!(!resolved.contains_key("A4AA_TEST_SECRET_MARKER"));
+    }
+
+    #[tokio::test]
+    async fn descriptor_temp_spelling_is_not_inherited() {
+        if spec_env(
+            "env::tests::descriptor_temp_spelling_is_not_inherited",
+            &[
+                ("TMPDIR", "/dev/fd/300"),
+                ("A4AA_TEST_TMPDIR_SENTINEL", "/var/tmp/x"),
+            ],
+        ) {
+            return;
+        }
+        let resolved = resolve(&EnvPolicy::default(), &BTreeMap::new(), &NoSecrets)
+            .await
+            .unwrap();
+        assert!(!resolved.contains_key("TMPDIR"));
+    }
+
+    #[tokio::test]
+    async fn explicit_set_still_injects_literal_tmpdir() {
+        if spec_env(
+            "env::tests::explicit_set_still_injects_literal_tmpdir",
+            &[("TMPDIR", "/dev/fd/300")],
+        ) {
+            return;
+        }
+        let mut set = BTreeMap::new();
+        set.insert("TMPDIR".to_owned(), EnvValue::Literal("/dev/fd/300".into()));
+        let policy = EnvPolicy::Sanitized {
+            inherit: Vec::new(),
+            set,
+        };
+        let resolved = resolve(&policy, &BTreeMap::new(), &NoSecrets)
+            .await
+            .unwrap();
+        assert_eq!(resolved.get("TMPDIR").unwrap(), "/dev/fd/300");
     }
 
     #[tokio::test]

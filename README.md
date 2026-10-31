@@ -30,6 +30,15 @@ servers, native-profile selection) is translated into an agent-native
 `AdaptationPlan` — the concrete config fragments to write plus a per-item
 `native | adapted | unsupported` report.
 
+Hook installation is owned by the Agent Hook Engine crate
+(`ahe::install`, re-exported as `a4aa::hooks`): the `HookDecl`/`HookEvent`
+declaration contract, the `HookSurface` store descriptors, the lowering
+engine and the `a4aa::hooks::harnesses` per-agent constants all live
+there. `Dialect::adapt` projects the returned `InstallationPlan` into the
+`AdaptationPlan` unchanged — artifacts stay user-home relative.
+
+Agent token counters and vendor-shaped usage normalization are provided by token-usage-detector from Agent-Statistics. A4AA acquires protocol records and forwards the reported counters; it does not aggregate charges or own a usage ledger.
+
 Agent knowledge does not live in this crate. Each agent owns one small
 descriptor crate under `crates/`, which depends only on `a4aa`:
 
@@ -44,8 +53,8 @@ let plan = a4aa_pi::adapt(&mechanisms); // or a4aa::adapt(a4aa_pi::dialect(), &s
 
 | Crate | Agent knowledge it owns |
 | --- | --- |
-| `a4aa` (this crate) | Shared vocabulary only: `MechanismSet`, `Dialect`/`HookSurface`/surface types, the `adapt` engine, `Dialect::generic()` |
-| `crates/a4aa-<agent>` × 16 | That agent's `Dialect` const: hook-store shape, skills/commands/subagents paths, permission/MCP config surfaces |
+| `a4aa` (this crate) | Shared vocabulary only: `MechanismSet`, `Dialect`/surface types, the `adapt` engine, `Dialect::generic()`; hook surfaces and the hook-installation engine come from `a4aa::hooks` (`ahe::install`) |
+| `crates/a4aa-<agent>` | That agent's `Dialect` const: skills/commands/subagents paths, permission/MCP config surfaces, and a reference to its AHE-owned hook descriptor |
 | `crates/a4aa-dialects` | Optional name→`Dialect` registry for multi-agent hosts. Pulls in all adapters; single-agent hosts should not use it |
 
 Every adapter crate is independently installable and independently

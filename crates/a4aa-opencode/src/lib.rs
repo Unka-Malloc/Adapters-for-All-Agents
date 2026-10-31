@@ -17,10 +17,9 @@ use a4aa::card::{
     HistoryRoot, InstructionChannel, ModelCatalog, OsPath, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
-    SubagentSurface, Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
-use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
 
 pub use native::{native, NATIVE};
 
@@ -40,15 +39,7 @@ pub const QUOTA_REFUSAL_ERROR_TYPES: &[&str] = &["provider.quota"];
 /// The `opencode` dialect: OpenCode JS plugin hooks, AGENTS.md, skills, commands, subagents, opencode.json MCP.
 pub const DIALECT: Dialect = Dialect {
     id: "opencode",
-    hooks: HookSurface::Extension {
-        file: ".config/opencode/plugins/a4aa.js",
-        kind: ExtensionKind::OpenCode,
-        map: &[
-            (HookEvent::SessionStart, "session.created"),
-            (HookEvent::PreToolUse, "tool.execute.before"),
-            (HookEvent::PostToolUse, "tool.execute.after"),
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::OPENCODE.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",

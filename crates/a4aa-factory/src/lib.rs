@@ -18,8 +18,7 @@ use a4aa::card::{
     LiveUsage, ModelCatalog, RpcCallDecl, RpcSurface, RpcTransportDecl, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
@@ -29,7 +28,7 @@ pub use native::{native, NATIVE};
 /// The `factory` dialect: Factory Droid AGENTS.md, skills, commands, droid subagents, settings MCP.
 pub const DIALECT: Dialect = Dialect {
     id: "factory",
-    hooks: HookSurface::None,
+    hooks: a4aa::hooks::harnesses::FACTORY.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",

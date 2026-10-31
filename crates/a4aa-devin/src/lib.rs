@@ -19,11 +19,10 @@ use a4aa::card::{
     OsPath, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
-use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
 
 pub use native::{native, NATIVE};
 
@@ -31,23 +30,7 @@ pub use native::{native, NATIVE};
 /// skill-form commands, markdown subagents, `permissions`, mcp_config.
 pub const DIALECT: Dialect = Dialect {
     id: "devin",
-    // `~/.config/devin/config.json` `hooks` — the Claude-dialect store.
-    // Devin fires eight events; `SubagentStart`, `SubagentStop` and
-    // `Notification` have no native counterpart and report unsupported.
-    hooks: HookSurface::Claude {
-        file: ".config/devin/config.json",
-        at: "hooks",
-        events: &[
-            HookEvent::SessionStart,
-            HookEvent::SessionEnd,
-            HookEvent::UserPromptSubmit,
-            HookEvent::PreToolUse,
-            HookEvent::PostToolUse,
-            HookEvent::Stop,
-            HookEvent::PermissionRequest,
-            HookEvent::PostCompaction,
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::DEVIN.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",
@@ -256,7 +239,7 @@ pub fn spec() -> AgentSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a4aa::{HookDecl, HookIntent, PermissionDecl, SubagentDecl, Support};
+    use a4aa::{HookDecl, HookEvent, HookIntent, PermissionDecl, SubagentDecl, Support};
     use std::path::Path;
 
     fn hook(event: HookEvent, command: &str) -> HookDecl {

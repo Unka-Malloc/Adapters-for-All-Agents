@@ -586,149 +586,51 @@ fn adaptation_plan_serializes_for_foreign_hosts() {
 }
 
 #[test]
-fn generated_observers_never_claim_enforcement_or_injection() {
-    for dialect in [
-        a4aa_dialects::dialect("kilocode").unwrap(),
-        a4aa_opencode::dialect(),
-        a4aa_pi::dialect(),
-    ] {
-        for intent in [HookIntent::Enforce, HookIntent::Inject, HookIntent::Rewrite] {
-            let plan = dialect.adapt(&MechanismSet {
-                hooks: vec![
-                    HookDecl {
-                        intent,
-                        ..hook(HookEvent::SessionStart, "guard.sh")
-                    },
-                    HookDecl {
-                        intent,
-                        ..hook(HookEvent::PreToolUse, "guard.sh")
-                    },
-                ],
-                ..Default::default()
-            });
-            assert!(plan.artifacts.is_empty(), "{}", dialect.id);
-            assert!(plan
-                .report
-                .iter()
-                .all(|entry| entry.support == Support::Unsupported));
-        }
-    }
-}
-
-#[test]
-fn generated_observers_report_failures_to_the_host_log_without_vetoing() {
-    for (dialect, native_event) in [
-        (a4aa_pi::dialect(), "session_start"),
-        (a4aa_opencode::dialect(), "session.created"),
-        (
-            a4aa_dialects::dialect("kilocode").unwrap(),
-            "session.created",
-        ),
-    ] {
-        let set = MechanismSet {
-            hooks: vec![HookDecl {
-                intent: HookIntent::Notify,
-                ..hook(HookEvent::SessionStart, "exit-7.sh")
-            }],
-            ..Default::default()
-        };
-        let plan = dialect.adapt(&set);
-        // Observer admission stays non-veto: the hook is emitted, not refused.
-        assert_eq!(
-            support(&plan, "hooks.session-start"),
-            Some(Support::Adapted),
-            "{}",
-            dialect.id
-        );
-        let artifact = plan
-            .artifacts
-            .iter()
-            .find(|a| a.content.contains("exit-7.sh"))
-            .expect("observer artifact");
-        let line = artifact
-            .content
-            .lines()
-            .find(|line| line.contains("exit-7.sh"))
-            .unwrap();
-        // A failing hook command is reported with the event, the command
-        // and the failure reason on the host's diagnostic channel — the
-        // observer never rethrows, never impersonates Enforce.
-        assert!(line.contains("catch (error)"), "{line}");
-        assert!(
-            line.contains("console.error('[a4aa] observer hook failed'"),
-            "{line}"
-        );
-        assert!(line.contains(&format!("event: '{native_event}'")), "{line}");
-        assert!(line.contains(r#"command: "exit-7.sh""#), "{line}");
-        assert!(line.contains("reason: String(error)"), "{line}");
-        assert!(!artifact.content.contains("catch (_) {}"), "{}", dialect.id);
-    }
-}
-
-#[test]
-fn extension_admission_reports_identical_outcomes_across_rendering_paths() {
-    // Mixed intents and events: admission outcomes and their order are one
-    // dialect-neutral policy; only the rendering format branches.
+fn ahe_install_plan_projects_into_the_mixed_adaptation_plan() {
     let set = MechanismSet {
         hooks: vec![
-            HookDecl {
-                intent: HookIntent::Notify,
-                ..hook(HookEvent::SessionStart, "start.sh")
-            },
-            HookDecl {
-                intent: HookIntent::Enforce,
-                ..hook(HookEvent::SessionEnd, "guard.sh")
-            },
-            HookDecl {
-                intent: HookIntent::Notify,
-                ..hook(HookEvent::SubagentStart, "sub.sh")
-            },
+            hook(HookEvent::SessionStart, "start.sh"),
+            hook(HookEvent::SessionEnd, "unsupported.sh"),
         ],
+        rules: vec![RuleDecl {
+            name: "core".into(),
+            content: "Rules text.".into(),
+        }],
         ..Default::default()
     };
-    let pi = a4aa_pi::dialect().adapt(&set);
-    let opencode = a4aa_opencode::dialect().adapt(&set);
-    let outcomes = |plan: &AdaptationPlan| {
-        plan.report
+    let installation = a4aa::hooks::adapt(&a4aa::hooks::harnesses::CODEX.surface, &set.hooks);
+    let plan = a4aa_codex::adapt(&set);
+    for artifact in &installation.artifacts {
+        let projected = plan
+            .artifacts
             .iter()
-            .map(|entry| (entry.item.clone(), entry.support))
-            .collect::<Vec<_>>()
-    };
-    // Same admission verdicts in declaration order on both renderers.
-    assert_eq!(outcomes(&pi), outcomes(&opencode));
-    assert_eq!(
-        outcomes(&pi),
-        vec![
-            ("hooks.session-start".to_owned(), Support::Adapted),
-            ("hooks.session-end".to_owned(), Support::Unsupported),
-            ("hooks.subagent-start".to_owned(), Support::Unsupported),
-        ]
-    );
-    // Reporting detail stays per-dialect, byte-identical to before the
-    // unification.
-    assert_eq!(
-        pi.report[0].note.as_deref(),
-        Some("emitted as a generated pi extension")
-    );
-    assert_eq!(
-        opencode.report[0].note.as_deref(),
-        Some("emitted inside a generated opencode plugin")
-    );
-    assert_eq!(
-        pi.report[2].note.as_deref(),
-        Some("no pi extension event equivalent")
-    );
-    assert_eq!(
-        opencode.report[2].note.as_deref(),
-        Some("no opencode plugin event equivalent")
-    );
-    // The intent refusal is the shared policy message on both paths.
-    for plan in [&pi, &opencode] {
-        assert_eq!(
-            plan.report[1].note.as_deref(),
-            Some("generated event observers support Notify only; no veto or output injection")
-        );
+            .find(|a| a.path == artifact.path)
+            .expect("install artifact projected into the mixed plan");
+        assert_eq!(projected.scope, ArtifactScope::UserHome);
+        assert_eq!(projected.content, artifact.content);
+        let mode = match &artifact.mode {
+            a4aa::hooks::WriteMode::Create => WriteMode::Create,
+            a4aa::hooks::WriteMode::JsonMerge { at } => WriteMode::JsonMerge { at: at.clone() },
+        };
+        assert_eq!(projected.mode, mode);
     }
+    for entry in &installation.report {
+        let support = match entry.support {
+            a4aa::hooks::Support::Native => Support::Native,
+            a4aa::hooks::Support::Adapted => Support::Adapted,
+            a4aa::hooks::Support::Unsupported => Support::Unsupported,
+        };
+        let projected = plan
+            .report
+            .iter()
+            .find(|e| e.item == entry.item)
+            .expect("install verdict projected into the mixed plan");
+        assert_eq!(projected.support, support);
+        assert_eq!(projected.note.as_deref(), entry.note.as_deref());
+    }
+    // Non-hook emitters still contribute their artifacts and report items.
+    assert!(plan.artifacts.iter().any(|a| a.path.ends_with("AGENTS.md")));
+    assert_eq!(support(&plan, "rules.core"), Some(Support::Native));
 }
 
 #[test]

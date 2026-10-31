@@ -18,22 +18,17 @@ use a4aa::card::{
     RpcCallDecl, RpcSurface, RpcTransportDecl, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, ExtensionKind, HookSurface, McpSurface, PermissionSurface, PluginSurface,
-    SubagentSurface,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
-use a4aa::{AdaptationPlan, AgentSpec, Dialect, HookEvent, MechanismSet, SessionScope};
+use a4aa::{AdaptationPlan, AgentSpec, Dialect, MechanismSet, SessionScope};
 
 pub use native::{native, NATIVE};
 
 /// The `pi` dialect: Pi TS extension hooks, skills, .ts extension plugins.
 pub const DIALECT: Dialect = Dialect {
     id: "pi",
-    hooks: HookSurface::Extension {
-        file: ".pi/agent/extensions/a4aa.ts",
-        kind: ExtensionKind::Pi,
-        map: &[(HookEvent::SessionStart, "session_start")],
-    },
+    hooks: a4aa::hooks::harnesses::PI.surface,
     rules: None,
     skills_dir: Some(".pi/agent/skills"),
     commands: CommandSurface::None,

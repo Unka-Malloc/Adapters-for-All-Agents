@@ -25,7 +25,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.commandcode/config.json",
-        hooks: "{home}/.commandcode/settings.json hooks",
+        hooks: a4aa::hooks::harnesses::COMMAND_CODE.config_path,
         permissions: "--permission-mode standard|plan|auto-accept",
         model_catalog: "command-code --list-models",
     },
@@ -39,7 +39,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::Native, "standard|plan|auto-accept"),
         skills: cell(NativeStatus::Native, ".commandcode/skills"),
-        hooks: cell(NativeStatus::Native, "Claude-shape settings.json hooks"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::COMMAND_CODE),
         subagents: cell(NativeStatus::NotOffered, "SubagentSurface::None"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

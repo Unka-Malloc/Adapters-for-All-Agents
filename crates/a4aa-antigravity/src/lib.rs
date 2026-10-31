@@ -17,10 +17,9 @@ use a4aa::card::{
     HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
-use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
 use a4aa::{PromptChannel, StreamMode};
 
 pub use native::{native, NATIVE};
@@ -28,15 +27,7 @@ pub use native::{native, NATIVE};
 /// The Antigravity CLI's managed customization surfaces.
 pub const DIALECT: Dialect = Dialect {
     id: "antigravity",
-    hooks: HookSurface::NamedBundle {
-        file: ".gemini/config/hooks.json",
-        map: &[
-            (HookEvent::SessionStart, "SessionStart"),
-            (HookEvent::PreToolUse, "PreToolUse"),
-            (HookEvent::PostToolUse, "PostToolUse"),
-            (HookEvent::Stop, "Stop"),
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::ANTIGRAVITY.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "GEMINI.md",

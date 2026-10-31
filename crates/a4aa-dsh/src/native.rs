@@ -1,4 +1,5 @@
-//! Native-capability table for `dsh`. Last verified 2026-10-24.
+//! Native-capability table for `dsh`. Last verified 2026-10-26 against the
+//! 0.2.1-rc.3 runtime bundled inside `DeepSeek Harness.app`.
 //!
 //! Capability order puts SDK above ACP, so `dsh --profile sdk` is the card's
 //! primary lane: a first-party JSON-RPC stdio carrier with model/effort on
@@ -14,7 +15,7 @@ use a4aa::native::{
 
 /// Native surfaces and AwP primitives for DeepSeek Harness.
 pub const NATIVE: NativeCapability = NativeCapability {
-    last_verified: "2026-10-24",
+    last_verified: "2026-10-26",
     surfaces: InteractionSurfaces {
         serve: cell(NativeStatus::NotOffered, "no first-party HTTP serve"),
         sdk: cell(
@@ -44,7 +45,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.dsh/.credentials.yaml",
-        hooks: "",
+        hooks: a4aa::hooks::harnesses::DSH.config_path,
         permissions: "",
         model_catalog: "ACP session/new configOptions (shipped providers plus a Command Code route provisioned by `a4aa-dsh mount`); SDK initialize provider/model",
     },
@@ -76,7 +77,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::NotOffered, "no permission selector"),
         skills: cell(NativeStatus::Native, ".dsh/skills"),
-        hooks: cell(NativeStatus::NotOffered, "HookSurface::None"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::DSH),
         subagents: cell(NativeStatus::NotOffered, "SubagentSurface::None"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

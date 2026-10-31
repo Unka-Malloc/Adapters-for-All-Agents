@@ -31,7 +31,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.cursor/cli-config.json",
-        hooks: "{home}/.cursor/hooks.json",
+        hooks: a4aa::hooks::harnesses::CURSOR.config_path,
         permissions: "{home}/.cursor/cli-config.json permissions",
         model_catalog: "effort encoded in model id suffix",
     },
@@ -51,7 +51,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "no per-turn permission selector on CLI",
         ),
         skills: cell(NativeStatus::Native, ".cursor/skills"),
-        hooks: cell(NativeStatus::Native, "flat hooks.json beforeSubmitPrompt"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::CURSOR),
         subagents: cell(NativeStatus::Native, ".cursor/agents"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

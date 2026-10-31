@@ -31,7 +31,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.factory/settings.json",
-        hooks: "",
+        hooks: a4aa::hooks::harnesses::FACTORY.config_path,
         permissions: "--auto autonomy low|medium|high",
         model_catalog: "droid.list_models passthrough; no catalog verb on CLI",
     },
@@ -54,7 +54,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::Native, "autonomy low|medium|high"),
         skills: cell(NativeStatus::Native, ".factory/skills"),
-        hooks: cell(NativeStatus::NotOffered, "HookSurface::None"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::FACTORY),
         subagents: cell(NativeStatus::Native, ".factory/droids"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

@@ -37,7 +37,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.config/kilo/kilo.json",
-        hooks: "{home}/.config/kilo/plugin/a4aa.js (native plugin dir)",
+        hooks: a4aa::hooks::harnesses::KILO_CODE.config_path,
         permissions: "OpenCode per-tool permission object is inexpressible; fail closed",
         model_catalog: "kilo models; --variant carries effort",
     },
@@ -60,10 +60,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "generic allow/deny lists have no enforced OpenCode shape",
         ),
         skills: cell(NativeStatus::Native, ".kilo/skills"),
-        hooks: cell(
-            NativeStatus::Native,
-            "OpenCode plugin events in .config/kilo/plugin",
-        ),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::KILO_CODE),
         subagents: cell(NativeStatus::Native, ".config/kilo/agents"),
         plugins: cell(NativeStatus::Native, ".config/kilo/plugin/*.ts"),
     },

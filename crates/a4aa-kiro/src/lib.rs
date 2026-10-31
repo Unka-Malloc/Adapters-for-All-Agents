@@ -18,8 +18,7 @@ use a4aa::card::{
     UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
@@ -29,7 +28,7 @@ pub use native::{native, NATIVE};
 /// The `kiro` dialect: Kiro steering rules, skills, JSON agents, mcp.json (IDE trigger hooks unmapped).
 pub const DIALECT: Dialect = Dialect {
     id: "kiro",
-    hooks: HookSurface::None,
+    hooks: a4aa::hooks::harnesses::KIRO.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: ".kiro/steering/a4aa-rules.md",

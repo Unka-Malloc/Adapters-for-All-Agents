@@ -156,25 +156,39 @@ async fn terminate_kills_the_whole_process_tree() {
 
 #[tokio::test]
 async fn interrupt_sends_sigint_before_killing() {
-    // Trap INT and exit 42 — proves the graceful path ran. The trailing
-    // statement keeps `sh -c` from exec'ing `sleep`, which would discard the
-    // trap and let SIGINT kill the process outright. The marker file proves
-    // the trap is installed before we signal.
-    let dir = std::env::temp_dir().join(format!("a4aa-test-int-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let marker = dir.join("trap-installed");
-    let _ = std::fs::remove_file(&marker);
+    // Install the SIGINT handler before publishing readiness, then wait
+    // without spawning foreground children. The ready line proves the
+    // handler is installed before we signal; exiting 42 proves the
+    // graceful interrupt path ran without relying on shell job timing.
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let mut command = shell(&format!(
-        "trap 'exit 42' INT; touch {}; sleep 60; exit 1",
-        marker.display()
-    ));
-    let mut child = SupervisedChild::spawn(&mut command, NULL_IO).unwrap();
-    let deadline = Instant::now() + test_settings::WAIT_BUDGET;
-    while !marker.exists() && Instant::now() < deadline {
-        tokio::time::sleep(test_settings::REAP_POLL_INTERVAL).await;
-    }
-    assert!(marker.exists(), "child never installed its trap");
+    let mut command = Command::new("python3");
+    command.args([
+        "-u",
+        "-c",
+        r#"
+import signal, sys
+signal.signal(signal.SIGINT, lambda *_: sys.exit(42))
+print("ready", flush=True)
+while True:
+    signal.pause()
+"#,
+    ]);
+    let mut child = SupervisedChild::spawn(
+        &mut command,
+        IoPlan {
+            stdout: StdioKind::Piped,
+            ..NULL_IO
+        },
+    )
+    .unwrap();
+    let mut output = BufReader::new(child.stdout().unwrap());
+    let mut ready = String::new();
+    tokio::time::timeout(test_settings::WAIT_BUDGET, output.read_line(&mut ready))
+        .await
+        .expect("child never installed its handler")
+        .unwrap();
+    assert_eq!(ready, "ready\n");
     let status = child
         .interrupt(Duration::from_secs(3))
         .await

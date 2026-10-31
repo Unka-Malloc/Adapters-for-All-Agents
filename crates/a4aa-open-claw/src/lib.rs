@@ -17,8 +17,7 @@ use a4aa::card::{
     FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
 use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
@@ -28,7 +27,7 @@ pub use native::{native, NATIVE};
 /// The `openclaw` dialect: OpenClaw AGENTS.md, skills, agents.
 pub const DIALECT: Dialect = Dialect {
     id: "openclaw",
-    hooks: HookSurface::None,
+    hooks: a4aa::hooks::harnesses::OPEN_CLAW.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",

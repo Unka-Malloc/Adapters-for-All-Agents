@@ -13,9 +13,10 @@
 //! `.agents/skills`) for hosts driving an agent with no dedicated crate.
 
 use crate::mechanisms::{
-    AdaptationPlan, ArtifactScope, CommandDecl, HookDecl, HookEvent, HookIntent, MechanismSet,
-    SubagentDecl, Support, WriteMode,
+    AdaptationPlan, ArtifactScope, CommandDecl, MechanismSet, SubagentDecl, Support, WriteMode,
 };
+
+pub use ahe::install::{ExtensionKind, HookSurface};
 
 // ----------------------------- descriptor ---------------------------------
 
@@ -53,57 +54,6 @@ pub struct Dialect {
 pub struct Target {
     pub scope: ArtifactScope,
     pub path: &'static str,
-}
-
-/// How an agent stores lifecycle hooks.
-#[derive(Clone, Copy, Debug)]
-pub enum HookSurface {
-    /// No hook store — every hook reports unsupported.
-    None,
-    /// Claude dialect: a JSON document deep-merged at `at` with
-    /// `{"Event":[{matcher?,hooks:[{type:command,command,timeout}]}]}`.
-    /// `events` are the semantic events the store accepts (native names
-    /// match 1:1). Used by Claude Code, Codex, Devin and Command Code.
-    Claude {
-        file: &'static str,
-        at: &'static str,
-        events: &'static [HookEvent],
-    },
-    /// Grok's variant: one whole file per hook owner in `dir`, containing
-    /// the same Claude-shape fragment.
-    ClaudeBundle {
-        dir: &'static str,
-        events: &'static [HookEvent],
-    },
-    /// Gemini/Antigravity named bundles merged into one document:
-    /// `{"a4aa":{"Event":[{command,timeout,type}],"enabled":true}}`.
-    /// `map` translates semantic events to native names.
-    NamedBundle {
-        file: &'static str,
-        map: &'static [(HookEvent, &'static str)],
-    },
-    /// Cursor's flat store: `{version:1,hooks:{<event>:[{command}]}}`
-    /// merged at the document root. `map` translates event names.
-    Flat {
-        file: &'static str,
-        map: &'static [(HookEvent, &'static str)],
-    },
-    /// Code-extension agents: hooks are generated code units (Pi
-    /// extensions, OpenCode plugins), not config.
-    Extension {
-        file: &'static str,
-        kind: ExtensionKind,
-        map: &'static [(HookEvent, &'static str)],
-    },
-}
-
-/// Generated-code dialects for [`HookSurface::Extension`].
-#[derive(Clone, Copy, Debug)]
-pub enum ExtensionKind {
-    /// `~/.pi/agent/extensions/*.ts`: `pi.on('<event>', …)`.
-    Pi,
-    /// `~/.config/opencode/plugins/*.js`: plugin event handlers.
-    OpenCode,
 }
 
 /// How custom slash commands are declared.
@@ -182,7 +132,7 @@ impl Dialect {
     pub const fn generic() -> Dialect {
         Dialect {
             id: "generic",
-            hooks: HookSurface::None,
+            hooks: ahe::install::harnesses::GENERIC.surface,
             rules: Some(Target {
                 scope: ArtifactScope::Project,
                 path: "AGENTS.md",
@@ -204,7 +154,27 @@ impl Dialect {
             dialect: self.id.to_owned(),
             ..Default::default()
         };
-        emit_hooks(self, set, &mut plan);
+        let installation = ahe::install::adapt(&self.hooks, &set.hooks);
+        for artifact in installation.artifacts {
+            let mode = match artifact.mode {
+                ahe::install::WriteMode::Create => WriteMode::Create,
+                ahe::install::WriteMode::JsonMerge { at } => WriteMode::JsonMerge { at },
+            };
+            plan.push(
+                ArtifactScope::UserHome,
+                &artifact.path.to_string_lossy(),
+                artifact.content,
+                mode,
+            );
+        }
+        for entry in installation.report {
+            let support = match entry.support {
+                ahe::install::Support::Native => Support::Native,
+                ahe::install::Support::Adapted => Support::Adapted,
+                ahe::install::Support::Unsupported => Support::Unsupported,
+            };
+            plan.report(entry.item, support, entry.note.as_deref());
+        }
         emit_rules(self, set, &mut plan);
         emit_skills(self, set, &mut plan);
         emit_commands(self, set, &mut plan);
@@ -230,256 +200,6 @@ impl Dialect {
 /// Free-function form: `a4aa::adapt(&a4aa_codex::DIALECT, &set)`.
 pub fn adapt(dialect: &Dialect, set: &MechanismSet) -> AdaptationPlan {
     dialect.adapt(set)
-}
-
-// ------------------------------- hooks ------------------------------------
-
-fn emit_hooks(dialect: &Dialect, set: &MechanismSet, plan: &mut AdaptationPlan) {
-    let item = |hook: &HookDecl| format!("hooks.{}", hook.event.kebab_name());
-    match &dialect.hooks {
-        HookSurface::None => {
-            for hook in &set.hooks {
-                plan.report(
-                    item(hook),
-                    Support::Unsupported,
-                    Some("no hook surface for this dialect"),
-                );
-            }
-        }
-        HookSurface::Claude { file, at, events } => {
-            let (emit, missing): (Vec<_>, Vec<_>) =
-                set.hooks.iter().partition(|h| events.contains(&h.event));
-            for hook in missing {
-                plan.report(
-                    item(hook),
-                    Support::Unsupported,
-                    Some("event not exposed by this agent's hook store"),
-                );
-            }
-            for hook in &emit {
-                plan.report(item(hook), Support::Native, None);
-            }
-            if !emit.is_empty() {
-                plan.push(
-                    ArtifactScope::UserHome,
-                    file,
-                    serde_json::to_string_pretty(&claude_hook_fragment(&emit)["hooks"])
-                        .unwrap_or_default(),
-                    WriteMode::JsonMerge { at: at.to_string() },
-                );
-            }
-        }
-        HookSurface::ClaudeBundle { dir, events } => {
-            let (emit, missing): (Vec<_>, Vec<_>) =
-                set.hooks.iter().partition(|h| events.contains(&h.event));
-            for hook in missing {
-                plan.report(
-                    item(hook),
-                    Support::Unsupported,
-                    Some("event not exposed by this agent's hook store"),
-                );
-            }
-            for hook in &emit {
-                plan.report(item(hook), Support::Native, None);
-            }
-            if !emit.is_empty() {
-                plan.push(
-                    ArtifactScope::UserHome,
-                    &format!("{dir}/a4aa.json"),
-                    serde_json::to_string_pretty(&claude_hook_fragment(&emit)).unwrap_or_default(),
-                    WriteMode::Create,
-                );
-            }
-        }
-        HookSurface::NamedBundle { file, map } => {
-            let mut bundle = serde_json::Map::new();
-            let mut any = false;
-            for hook in &set.hooks {
-                match map.iter().find(|(event, _)| *event == hook.event) {
-                    Some((_, name)) => {
-                        any = true;
-                        let mut entry = serde_json::json!({
-                            "command": hook.command,
-                            "type": "command",
-                        });
-                        if let Some(timeout) = hook.timeout {
-                            entry["timeout"] = serde_json::json!(timeout);
-                        }
-                        bundle
-                            .entry(name.to_string())
-                            .or_insert_with(|| serde_json::json!([]))
-                            .as_array_mut()
-                            .expect("bundle list")
-                            .push(entry);
-                        plan.report(item(hook), Support::Adapted, None);
-                    }
-                    None => plan.report(
-                        item(hook),
-                        Support::Unsupported,
-                        Some("no bundle event equivalent"),
-                    ),
-                }
-            }
-            if any {
-                bundle.insert("enabled".to_owned(), serde_json::json!(true));
-                plan.push(
-                    ArtifactScope::UserHome,
-                    file,
-                    serde_json::to_string_pretty(&serde_json::json!({"a4aa": bundle}))
-                        .unwrap_or_default(),
-                    WriteMode::JsonMerge { at: String::new() },
-                );
-            }
-        }
-        HookSurface::Flat { file, map } => {
-            let mut hooks = serde_json::Map::new();
-            let mut any = false;
-            for hook in &set.hooks {
-                match map.iter().find(|(event, _)| *event == hook.event) {
-                    Some((_, name)) => {
-                        any = true;
-                        hooks
-                            .entry(name.to_string())
-                            .or_insert_with(|| serde_json::json!([]))
-                            .as_array_mut()
-                            .expect("event list")
-                            .push(serde_json::json!({ "command": hook.command }));
-                        plan.report(item(hook), Support::Adapted, None);
-                    }
-                    None => plan.report(
-                        item(hook),
-                        Support::Unsupported,
-                        Some("no flat-store event equivalent"),
-                    ),
-                }
-            }
-            if any {
-                plan.push(
-                    ArtifactScope::UserHome,
-                    file,
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({ "version": 1, "hooks": hooks }),
-                    )
-                    .unwrap_or_default(),
-                    WriteMode::JsonMerge { at: String::new() },
-                );
-            }
-        }
-        HookSurface::Extension { file, kind, map } => {
-            // One admission pass for generated-code observers: intent
-            // support and event mapping are dialect-neutral policy with a
-            // single authoritative implementation; only the rendering
-            // format branches per extension kind.
-            let (surface, adapted_note) = match kind {
-                ExtensionKind::Pi => ("pi extension", "emitted as a generated pi extension"),
-                ExtensionKind::OpenCode => (
-                    "opencode plugin",
-                    "emitted inside a generated opencode plugin",
-                ),
-            };
-            let mut emitted = Vec::new();
-            for hook in &set.hooks {
-                if hook.intent != HookIntent::Notify {
-                    plan.report(item(hook), Support::Unsupported,
-                        Some("generated event observers support Notify only; no veto or output injection"));
-                    continue;
-                }
-                match map.iter().find(|(event, _)| *event == hook.event) {
-                    Some((_, event)) => {
-                        emitted.push((*event, hook));
-                        plan.report(item(hook), Support::Adapted, Some(adapted_note));
-                    }
-                    None => plan.report(
-                        item(hook),
-                        Support::Unsupported,
-                        Some(&format!("no {surface} event equivalent")),
-                    ),
-                }
-            }
-            if !emitted.is_empty() {
-                let body = match kind {
-                    ExtensionKind::Pi => pi_extension_body(&emitted),
-                    ExtensionKind::OpenCode => opencode_plugin_body(&emitted),
-                };
-                plan.push(ArtifactScope::UserHome, file, body, WriteMode::Create);
-            }
-        }
-    }
-}
-
-/// Pi extension body: one `pi.on` observer per admitted hook. Observers
-/// never veto — a failed command reports the event, command and reason to
-/// the host log (`console.error`, the extension host's diagnostic channel)
-/// and is never rethrown.
-fn pi_extension_body(emitted: &[(&str, &HookDecl)]) -> String {
-    let mut body = String::from("// @a4aa-managed\nexport default function (pi) {\n");
-    for (event, hook) in emitted {
-        let command = serde_json::to_string(&hook.command).unwrap_or_default();
-        body.push_str(&format!(
-            "  pi.on('{event}', async () => {{ const {{ execSync }} = await import('node:child_process'); try {{ execSync({command}, {{ stdio: 'pipe' }}) }} catch (error) {{ console.error('[a4aa] observer hook failed', {{ event: '{event}', command: {command}, reason: String(error) }}) }} }})\n"
-        ));
-    }
-    body.push_str("}\n");
-    body
-}
-
-/// OpenCode plugin body: one event dispatcher per admitted hook, same
-/// fail-open diagnostic contract as [`pi_extension_body`].
-fn opencode_plugin_body(emitted: &[(&str, &HookDecl)]) -> String {
-    let mut body = String::from(
-        "// @a4aa-managed\nexport const a4aaHooks = async () => ({\n  event: async ({ event }) => {\n",
-    );
-    for (event, hook) in emitted {
-        let command = serde_json::to_string(&hook.command).unwrap_or_default();
-        body.push_str(&format!(
-            "    if (event.type === '{event}') {{ const {{ execSync }} = await import('node:child_process'); try {{ execSync({command}) }} catch (error) {{ console.error('[a4aa] observer hook failed', {{ event: '{event}', command: {command}, reason: String(error) }}) }} }}\n"
-        ));
-    }
-    body.push_str("  },\n})\n");
-    body
-}
-
-/// Claude-dialect hook fragment: `{"hooks":{"Event":[{matcher?,hooks:
-/// [{type:command,command,timeout}]}]}}` grouped per event.
-fn claude_hook_fragment(hooks: &[&HookDecl]) -> serde_json::Value {
-    let mut events = serde_json::Map::new();
-    for hook in hooks {
-        let mut command = serde_json::json!({
-            "type": "command",
-            "command": hook.command,
-        });
-        if let Some(timeout) = hook.timeout {
-            command["timeout"] = serde_json::json!(timeout);
-        }
-        let mut entry = serde_json::json!({ "hooks": [command] });
-        if let Some(matcher) = &hook.matcher {
-            entry["matcher"] = serde_json::json!(matcher);
-        }
-        events
-            .entry(claude_event_name(hook.event))
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .expect("event list")
-            .push(entry);
-    }
-    serde_json::json!({ "hooks": events })
-}
-
-fn claude_event_name(event: HookEvent) -> String {
-    match event {
-        HookEvent::SessionStart => "SessionStart",
-        HookEvent::SessionEnd => "SessionEnd",
-        HookEvent::UserPromptSubmit => "UserPromptSubmit",
-        HookEvent::PreToolUse => "PreToolUse",
-        HookEvent::PostToolUse => "PostToolUse",
-        HookEvent::Stop => "Stop",
-        HookEvent::SubagentStart => "SubagentStart",
-        HookEvent::SubagentStop => "SubagentStop",
-        HookEvent::PermissionRequest => "PermissionRequest",
-        HookEvent::Notification => "Notification",
-        HookEvent::PostCompaction => "PostCompaction",
-    }
-    .to_owned()
 }
 
 // ------------------------------ rules --------------------------------------

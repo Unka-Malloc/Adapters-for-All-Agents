@@ -34,7 +34,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.openclaw",
-        hooks: "",
+        hooks: a4aa::hooks::harnesses::OPEN_CLAW.config_path,
         permissions: "",
         model_catalog: "openclaw models",
     },
@@ -57,7 +57,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
         instruction_channel: cell(NativeStatus::Native, "compose into prompt"),
         permission_modes: cell(NativeStatus::NotOffered, "no permission selector"),
         skills: cell(NativeStatus::Native, ".openclaw/skills"),
-        hooks: cell(NativeStatus::NotOffered, "HookSurface::None"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::OPEN_CLAW),
         subagents: cell(NativeStatus::Native, ".openclaw/agents"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

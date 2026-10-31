@@ -28,59 +28,7 @@ use crate::error::AdapterError;
 
 // ------------------------- semantic declarations -------------------------
 
-/// Semantic lifecycle event a hook attaches to. Hosts write these names;
-/// each dialect emitter maps them onto the agent's native event names or
-/// reports the item unsupported.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HookEvent {
-    SessionStart,
-    SessionEnd,
-    UserPromptSubmit,
-    PreToolUse,
-    PostToolUse,
-    Stop,
-    SubagentStart,
-    SubagentStop,
-    PermissionRequest,
-    Notification,
-    /// After context compaction completes (Devin `PostCompaction`).
-    PostCompaction,
-}
-
-/// What a hook is for. Dialects that cannot implement the requested intent
-/// report `Unsupported`; generated extension observers accept only `Notify`.
-/// An observation-only callback must never claim to enforce or rewrite.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HookIntent {
-    /// Block or veto (e.g. deny a tool call, keep the agent working).
-    #[default]
-    Enforce,
-    /// Feed hook output back into the agent's context.
-    Inject,
-    /// Rewrite what the model sees after the event.
-    Rewrite,
-    /// Observe only; never affects the run.
-    Notify,
-}
-
-/// One lifecycle hook: a shell command the agent's hook store invokes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HookDecl {
-    pub event: HookEvent,
-    /// Shell command executed by the agent's hook runner.
-    pub command: String,
-    #[serde(default)]
-    pub intent: HookIntent,
-    /// Tool-name/pattern filter where the dialect supports matchers.
-    #[serde(default)]
-    pub matcher: Option<String>,
-    /// Seconds the agent should allow the hook to run.
-    #[serde(default)]
-    pub timeout: Option<u64>,
-}
+pub use ahe::install::{HookDecl, HookEvent, HookIntent};
 
 /// Standing rules materialized into the agent's rules/instructions file.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -197,17 +145,6 @@ pub struct MechanismSet {
     pub native_profile: Option<String>,
 }
 
-impl HookEvent {
-    /// Kebab-case name — the report item suffix and the wire form. Derived
-    /// from the serde `kebab-case` rename so the two can never drift.
-    pub fn kebab_name(self) -> String {
-        match serde_json::to_value(self) {
-            Ok(serde_json::Value::String(name)) => name,
-            _ => unreachable!("unit variant serializes to its rename string"),
-        }
-    }
-}
-
 impl MechanismSet {
     /// Layered merge: named lists merge by `name`/`id` (later wins),
     /// hooks merge by `(event, command, matcher)`, permissions and
@@ -218,13 +155,7 @@ impl MechanismSet {
         merge_named(&mut self.commands, other.commands, |d| &d.name);
         merge_named(&mut self.subagents, other.subagents, |d| &d.name);
         merge_named(&mut self.plugins, other.plugins, |d| &d.id);
-        for hook in other.hooks {
-            if !self.hooks.iter().any(|h| {
-                h.event == hook.event && h.command == hook.command && h.matcher == hook.matcher
-            }) {
-                self.hooks.push(hook);
-            }
-        }
+        ahe::install::merge(&mut self.hooks, other.hooks);
         if let Some(permissions) = other.permissions {
             self.permissions = Some(permissions);
         }
@@ -313,10 +244,8 @@ impl MechanismSet {
                 return Err(malformed("duplicate plugin id"));
             }
         }
-        for hook in &self.hooks {
-            if hook.command.trim().is_empty() {
-                return Err(malformed("hook requires a non-empty command"));
-            }
+        if let Err(item) = ahe::install::validate(&self.hooks) {
+            return Err(malformed(item));
         }
         for name in self.mcp_servers.keys() {
             if name.trim().is_empty() {

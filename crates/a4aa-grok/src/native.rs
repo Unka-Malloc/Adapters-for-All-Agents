@@ -25,7 +25,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
     },
     config: ConfigLocations {
         settings: "{home}/.grok/config.toml",
-        hooks: "{home}/.grok/hooks",
+        hooks: a4aa::hooks::harnesses::GROK.config_path,
         permissions: "--permission-mode values the CLI accepts",
         model_catalog: "grok models",
     },
@@ -48,7 +48,7 @@ pub const NATIVE: NativeCapability = NativeCapability {
             "default|acceptEdits|auto|dontAsk|bypassPermissions|plan",
         ),
         skills: cell(NativeStatus::Native, ".grok/skills"),
-        hooks: cell(NativeStatus::Native, "Claude-bundle per-file hooks"),
+        hooks: a4aa::native::hook_cell(a4aa::hooks::harnesses::GROK),
         subagents: cell(NativeStatus::Native, ".grok/agents"),
         plugins: cell(NativeStatus::NotOffered, "PluginSurface::None"),
     },

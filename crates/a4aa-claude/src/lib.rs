@@ -18,12 +18,10 @@ use a4aa::card::{
     UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::{
-    AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet, PromptChannel,
-    StreamMode,
+    AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet, PromptChannel, StreamMode,
 };
 
 pub use native::{native, NATIVE};
@@ -31,22 +29,7 @@ pub use native::{native, NATIVE};
 /// The `claude` dialect: Claude Code settings.json hooks, CLAUDE.md, skills, commands, subagents, permissions, .mcp.json.
 pub const DIALECT: Dialect = Dialect {
     id: "claude",
-    hooks: HookSurface::Claude {
-        file: ".claude/settings.json",
-        at: "hooks",
-        events: &[
-            HookEvent::SessionStart,
-            HookEvent::SessionEnd,
-            HookEvent::UserPromptSubmit,
-            HookEvent::PreToolUse,
-            HookEvent::PostToolUse,
-            HookEvent::Stop,
-            HookEvent::SubagentStart,
-            HookEvent::SubagentStop,
-            HookEvent::PermissionRequest,
-            HookEvent::Notification,
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::CLAUDE.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "CLAUDE.md",

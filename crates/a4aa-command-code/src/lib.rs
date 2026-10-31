@@ -17,27 +17,17 @@ use a4aa::card::{
     HistoryRoot, InstructionChannel, ModelCatalog, StoreKind, UsageSurface,
 };
 use a4aa::dialect::{
-    CommandSurface, HookSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface,
-    Target,
+    CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
 };
 use a4aa::model::{BindingReceiptShape, PromptChannel, StreamMode};
-use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, HookEvent, MechanismSet};
+use a4aa::{AdaptationPlan, AgentSpec, ArtifactScope, Dialect, MechanismSet};
 
 pub use native::{native, NATIVE};
 
 /// The `commandcode` dialect: Command Code settings.json hooks, AGENTS.md, skills.
 pub const DIALECT: Dialect = Dialect {
     id: "commandcode",
-    hooks: HookSurface::Claude {
-        file: ".commandcode/settings.json",
-        at: "hooks",
-        events: &[
-            HookEvent::SessionStart,
-            HookEvent::PreToolUse,
-            HookEvent::PostToolUse,
-            HookEvent::Stop,
-        ],
-    },
+    hooks: a4aa::hooks::harnesses::COMMAND_CODE.surface,
     rules: Some(Target {
         scope: ArtifactScope::Project,
         path: "AGENTS.md",
