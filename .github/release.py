@@ -372,13 +372,23 @@ def choose_version(
         return requested, False
     return (manifest if base is None else max(bump(base, level), manifest)), False
 
+def cargo_metadata(repo: pathlib.Path) -> dict:
+    """Workspace manifest data only: cargo runs from an empty directory with
+    --manifest-path so a checkout's .cargo/config.toml — a credential
+    provider is executable — can never load beside the release identity.
+    --no-deps suffices: member manifests carry their own dependencies."""
+    done = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps",
+         "--manifest-path", str(repo / "Cargo.toml")],
+        cwd=tempfile.mkdtemp(), capture_output=True, text=True, check=True,
+    )
+    return json.loads(done.stdout)
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     slug = os.environ.get("GITHUB_REPOSITORY", "")
     kind = os.environ.get("RELEASE_KIND", "train")
-    metadata = json.loads(subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-        capture_output=True, text=True, check=True,
-    ).stdout)
+    metadata = cargo_metadata(pathlib.Path.cwd())
     members = set(metadata["workspace_members"])
     packages = [p for p in metadata["packages"] if p["id"] in members]
     publishable = [p for p in packages if p["publish"] is None or "crates-io" in p["publish"]]
@@ -463,10 +473,7 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 def publishable_members() -> dict[str, dict]:
-    metadata = json.loads(subprocess.run(
-        ["cargo", "metadata", "--format-version", "1"],
-        capture_output=True, text=True, check=True,
-    ).stdout)
+    metadata = cargo_metadata(pathlib.Path.cwd())
     members = set(metadata["workspace_members"])
     packages = {p["name"]: p for p in metadata["packages"] if p["id"] in members}
     return {n: p for n, p in packages.items()

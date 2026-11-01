@@ -64,6 +64,12 @@ concurrency:
 
 jobs:
   verify:
+    # The job name is rendered by GitHub from this workflow file, outside the
+    # reach of anything a step executes: it is the signature the publish gate
+    # binds the release decision to — the train's declared schedule mode and,
+    # for dispatches, the rehearsal flag and version inputs. The gate refuses
+    # any run whose signed name does not parse.
+    name: verify-train | sched=dry-run | rehearse=${{ inputs.rehearse }} | version=${{ inputs.version || '-' }} | level=${{ inputs.level }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -83,7 +89,7 @@ jobs:
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_LEVEL: ${{ inputs.level }}
-      SIBLINGS: '[]'
+      SIBLINGS: '[{"dir":"Hook-Engine","slug":"Unka-Malloc/Agent-Hook-Engine","crates":["ahe"]},{"dir":"Metera","slug":"Unka-Malloc/Metera","crates":["agent-statistics","collection-store","balance-detector","token-usage-detector"]}]'
     defaults:
       run:
         shell: bash
@@ -122,6 +128,24 @@ jobs:
       - name: Wait for cross-repository dependencies
         id: deps
         run: python3 "$RUNNER_TEMP/release.py" deps --wait-minutes=150
+
+      - name: Check out Hook-Engine at its resolved release
+        if: steps.deps.outputs.ready == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Unka-Malloc/Agent-Hook-Engine
+          ref: ${{ steps.deps.outputs.ref_0 }}
+          path: Hook-Engine
+          persist-credentials: false
+
+      - name: Check out Metera at its resolved release
+        if: steps.deps.outputs.ready == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Unka-Malloc/Metera
+          ref: ${{ steps.deps.outputs.ref_1 }}
+          path: Metera
+          persist-credentials: false
 
       - name: Compute the release version
         id: version
@@ -165,12 +189,15 @@ jobs:
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
           cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
 
-      # The release train (default branch) reads this data-only file to
-      # learn the candidate, the version decision and the kind of run; it
-      # lands for every trigger so the gate job can short-circuit cleanly
-      # on rehearsals and unqualified candidates. Kind and mode expand from
-      # immutable run metadata inline — never from a variable candidate
-      # code could have persisted through $GITHUB_ENV.
+      # The release train (default branch) reads this data-only file for the
+      # candidate and a skip pre-filter; it lands for every trigger so the
+      # gate can short-circuit cleanly on unqualified candidates. Nothing
+      # here authorizes a publish: the gate derives kind and mode from
+      # GitHub-minted run metadata (the event and this job's signed name),
+      # and the release job recomputes the version decision from the bound
+      # commit. Values still expand from immutable run metadata inline —
+      # never from a variable candidate code could persist through
+      # $GITHUB_ENV.
       - name: Record the release inputs
         if: always()
         run: |
