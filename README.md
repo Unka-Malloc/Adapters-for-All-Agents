@@ -39,6 +39,14 @@ there. `Dialect::adapt` projects the returned `InstallationPlan` into the
 
 Agent token counters and vendor-shaped usage normalization are provided by token-usage-detector from Agent-Statistics. A4AA acquires protocol records and forwards the reported counters; it does not aggregate charges or own a usage ledger.
 
+Produced-artifact operators are owned by the Agent Context Operators
+crate (re-exported as `a4aa::context`): the canonical conversation model,
+the `Codec` contract and capability matrix, and the search / export /
+transform / import / edit / snapshot engines over session stores. The
+per-agent `aco-<agent>` codec crates live in that repository and project
+each `a4aa-<agent>` card's `history` roots into ACO's `HistoryRoot`
+vocabulary — the card stays the single authority for store locations.
+
 Agent knowledge does not live in this crate. Each agent owns one small
 descriptor crate under `crates/`, which depends only on `a4aa`:
 

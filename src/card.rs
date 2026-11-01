@@ -22,8 +22,6 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
 use crate::dialect::Dialect;
 use crate::env::{EnvPolicy, EnvSource};
 use crate::model::{
@@ -630,26 +628,12 @@ pub struct OsPath {
     pub oses: &'static [&'static str],
 }
 
-/// One session-store or history location.
-pub struct HistoryRoot {
-    /// `{home}`-relative path template.
-    pub path: &'static str,
-    /// Stable kind label a host reports (`"claude-project-transcripts"`,
-    /// `"codex-session-store"`, …).
-    pub kind: &'static str,
-    pub store: StoreKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum StoreKind {
-    JsonlFile,
-    JsonlDir,
-    SqliteDb,
-    MarkdownFile,
-    Directory,
-    Other,
-}
+// Artifact-store vocabulary lives in Agent Context Operators — cards are
+// the *data* authority (each `a4aa-<agent>` declares its own locations);
+// `aco::store` is the *type* authority so context operators and cards
+// speak one vocabulary. Re-exported here so `AgentCard` stays the single
+// aggregate descriptor.
+pub use aco::store::{HistoryRoot, StoreKind, TranscriptUsage};
 
 /// Token-accounting locations. Declared facts only — a counter the agent
 /// does not report stays absent everywhere downstream.
@@ -672,27 +656,6 @@ pub struct LiveUsage {
     pub event: &'static str,
     /// Dotted path to the counter object inside the event.
     pub path: &'static str,
-}
-
-/// Usage inside a session-store record.
-pub struct TranscriptUsage {
-    /// `HistoryRoot::kind` holding token records.
-    pub root: &'static str,
-    /// Record discriminator `(dotted path, equals value)` — only matching
-    /// records carry counters. `None`: any record bearing `container` is a
-    /// usage record (for stores that mark usage by presence, not type).
-    pub record: Option<(&'static str, &'static str)>,
-    /// Dotted path to the counter object inside a matching record.
-    pub container: &'static str,
-    /// Field names read as input/prompt tokens; first present wins.
-    pub input: &'static [&'static str],
-    /// Field names read as cached input tokens.
-    pub cached: &'static [&'static str],
-    /// Field names read as output/completion tokens.
-    pub output: &'static [&'static str],
-    /// Field names read as a reported total; empty where the store has
-    /// none — the host sums, the adapter never invents a total.
-    pub total: &'static [&'static str],
 }
 
 /// Natively supported features — declared facts, not negotiated state.

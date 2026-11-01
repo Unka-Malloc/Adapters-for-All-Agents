@@ -1,7 +1,7 @@
 [package]
 name = "a4aa"
 description = "Adapter-For-All-Agents — unified agent client adapter: process supervision, stdio/PTY transports, JSON-RPC and ACP lanes, CLI drivers, and a stdio sidecar for hosts in other languages."
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -20,6 +20,9 @@ path = "src/bin/a4aa.rs"
 
 [dependencies]
 ahe = { path = "../Hook-Engine/crates/ahe", version = "0.1.2" }
+# Agent Context Operators: produced-artifact operators (search, export,
+# transform, import, edit, snapshot) re-exported as `a4aa::context`.
+aco = { path = "../Agent-Context-Operators/crates/aco", version = "0.1.0" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
