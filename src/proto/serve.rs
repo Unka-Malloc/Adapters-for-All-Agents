@@ -681,15 +681,17 @@ fn assistant_carries_output(message: &Value) -> bool {
     }
     for part in message["content"].as_array().into_iter().flatten() {
         match part["type"].as_str() {
-            Some("text") if part["text"].as_str().is_some_and(|text| !text.is_empty()) => {
-                return true;
-            }
-            // Tool calls and reasoning are billable work even when the
-            // assistant produced no prose.
-            Some("tool") | Some("reasoning") => return true,
             // Step markers and other bookkeeping parts are not evidence on
             // their own — a marker-only envelope is the refusal shape.
-            _ => {}
+            Some("step-start") | Some("step-finish") => {}
+            // An empty text part carries no output either.
+            Some("text") if part["text"].as_str().is_none_or(|text| text.is_empty()) => {}
+            // Every other part type (tool, reasoning, patch, file, agent,
+            // subtask, or one this build does not know) is evidence by
+            // default: treating produced work as "no output" would let
+            // custody replay a request over real side effects.
+            Some(_) => return true,
+            None => {}
         }
         // Any part the server attached reported usage to is evidence.
         if token_usage_detector::agent::from_opencode_tokens(&part["tokens"]).is_some() {
@@ -1029,6 +1031,14 @@ mod tests {
             "tokens": null
         })];
         assert!(!turn_produced_output(&markers, marker));
+        // A part type this build does not enumerate (patch, snapshot,
+        // file, agent, subtask, …) is evidence by default — assuming "no
+        // output" would let custody replay over real side effects.
+        let patch_only = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "patch", "patch": "@@"}], "tokens": null
+        })];
+        assert!(turn_produced_output(&patch_only, marker));
         // A part the server attached reported usage to is evidence
         // whatever its type — the detector owns the token shape.
         let part_usage = vec![json!({
