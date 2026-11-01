@@ -43,7 +43,7 @@ Produced-artifact operators are owned by the Agent Context Operators
 crate (re-exported as `a4aa::context`): the canonical conversation model,
 the `Codec` contract and capability matrix, and the search / export /
 transform / import / edit / snapshot engines over session stores. The
-per-agent `aco-<agent>` codec crates live in that repository and project
+per-agent `acop-<agent>` codec crates live in that repository and project
 each `a4aa-<agent>` card's `history` roots into ACO's `HistoryRoot`
 vocabulary — the card stays the single authority for store locations.
 

@@ -15,7 +15,7 @@ dependencies = [
  "a4aa-factory",
  "a4aa-opencode",
  "a4aa-pi",
- "aco",
+ "acop",
  "agent-client-protocol",
  "ahe",
  "async-trait",
@@ -171,8 +171,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "aco"
-version = "0.1.0"
+name = "acop"
+version = "0.1.2"
 dependencies = [
  "regex",
  "rusqlite",

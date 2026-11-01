@@ -22,7 +22,7 @@ path = "src/bin/a4aa.rs"
 ahe = { path = "../Hook-Engine/crates/ahe", version = "0.1.2" }
 # Agent Context Operators: produced-artifact operators (search, export,
 # transform, import, edit, snapshot) re-exported as `a4aa::context`.
-aco = { path = "../Agent-Context-Operators/crates/aco", version = "0.1.0" }
+acop = { path = "../Agent-Context-Operators/crates/aco", version = "0.1.2" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
