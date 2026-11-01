@@ -585,6 +585,91 @@ fn adaptation_plan_serializes_for_foreign_hosts() {
     assert_eq!(value["report"][0]["support"], "native");
 }
 
+// The generated-observer renderer is AHE-owned (`ahe::install`), but the
+// security half of the hook contract is the dialect-facing meaning these
+// tests assert: veto-capable intents are never emitted, and a failing
+// observer fails open instead of impersonating Enforce.
+
+#[test]
+fn generated_observers_never_claim_enforcement_or_injection() {
+    for dialect in [
+        a4aa_dialects::dialect("kilocode").unwrap(),
+        a4aa_opencode::dialect(),
+        a4aa_pi::dialect(),
+    ] {
+        for intent in [HookIntent::Enforce, HookIntent::Inject, HookIntent::Rewrite] {
+            let plan = dialect.adapt(&MechanismSet {
+                hooks: vec![
+                    HookDecl {
+                        intent,
+                        ..hook(HookEvent::SessionStart, "guard.sh")
+                    },
+                    HookDecl {
+                        intent,
+                        ..hook(HookEvent::PreToolUse, "guard.sh")
+                    },
+                ],
+                ..Default::default()
+            });
+            assert!(plan.artifacts.is_empty(), "{}", dialect.id);
+            assert!(plan
+                .report
+                .iter()
+                .all(|entry| entry.support == Support::Unsupported));
+        }
+    }
+}
+
+#[test]
+fn generated_observers_report_failures_to_the_host_log_without_vetoing() {
+    for (dialect, native_event) in [
+        (a4aa_pi::dialect(), "session_start"),
+        (a4aa_opencode::dialect(), "session.created"),
+        (
+            a4aa_dialects::dialect("kilocode").unwrap(),
+            "session.created",
+        ),
+    ] {
+        let set = MechanismSet {
+            hooks: vec![HookDecl {
+                intent: HookIntent::Notify,
+                ..hook(HookEvent::SessionStart, "exit-7.sh")
+            }],
+            ..Default::default()
+        };
+        let plan = dialect.adapt(&set);
+        // Observer admission stays non-veto: the hook is emitted, not refused.
+        assert_eq!(
+            support(&plan, "hooks.session-start"),
+            Some(Support::Adapted),
+            "{}",
+            dialect.id
+        );
+        let artifact = plan
+            .artifacts
+            .iter()
+            .find(|a| a.content.contains("exit-7.sh"))
+            .expect("observer artifact");
+        let line = artifact
+            .content
+            .lines()
+            .find(|line| line.contains("exit-7.sh"))
+            .unwrap();
+        // A failing hook command is reported with the event, the command
+        // and the failure reason on the host's diagnostic channel — the
+        // observer never rethrows, never impersonates Enforce.
+        assert!(line.contains("catch (error)"), "{line}");
+        assert!(
+            line.contains("console.error('[a4aa] observer hook failed'"),
+            "{line}"
+        );
+        assert!(line.contains(&format!("event: '{native_event}'")), "{line}");
+        assert!(line.contains(r#"command: "exit-7.sh""#), "{line}");
+        assert!(line.contains("reason: String(error)"), "{line}");
+        assert!(!artifact.content.contains("catch (_) {}"), "{}", dialect.id);
+    }
+}
+
 #[test]
 fn ahe_install_plan_projects_into_the_mixed_adaptation_plan() {
     let set = MechanismSet {

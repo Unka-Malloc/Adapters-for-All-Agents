@@ -557,7 +557,3 @@ fn toml_string(text: &str) -> String {
     out.push('"');
     out
 }
-
-// Re-exported for the dialect descriptor crates' convenience when they
-// declare hook event lists.
-pub use crate::mechanisms::HookEvent as Event;

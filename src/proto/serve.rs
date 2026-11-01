@@ -667,9 +667,12 @@ fn turn_produced_output(messages: &[Value], marker_ms: u64) -> bool {
     })
 }
 
-/// One assistant record's evidence of work: a non-empty text part, a tool or
-/// reasoning part, or reported token usage. An empty text part and a null
-/// usage table are the refusal envelope, not a completed inference.
+/// One assistant record's evidence of work: a non-empty text part, a tool
+/// or reasoning part, or reported token usage — on the record or on any of
+/// its parts. The detector owns OpenCode's token shape, so a present usage
+/// object counts as reported usage. An empty text part, a null usage table
+/// and bookkeeping parts such as `step-start`/`step-finish` markers are the
+/// refusal envelope, not a completed inference.
 fn assistant_carries_output(message: &Value) -> bool {
     if let Some(text) = message["content"].as_str() {
         if !text.is_empty() {
@@ -678,30 +681,22 @@ fn assistant_carries_output(message: &Value) -> bool {
     }
     for part in message["content"].as_array().into_iter().flatten() {
         match part["type"].as_str() {
-            Some("text") => {
-                if part["text"].as_str().is_some_and(|text| !text.is_empty()) {
-                    return true;
-                }
-            }
-            // Tool calls and any other non-text part are billable work even
-            // when the assistant produced no prose.
-            _ => return true,
-        }
-    }
-    let tokens = &message["tokens"];
-    if tokens.is_object() {
-        for key in ["input", "output", "reasoning", "total"] {
-            if tokens[key].as_u64().unwrap_or(0) > 0 {
+            Some("text") if part["text"].as_str().is_some_and(|text| !text.is_empty()) => {
                 return true;
             }
+            // Tool calls and reasoning are billable work even when the
+            // assistant produced no prose.
+            Some("tool") | Some("reasoning") => return true,
+            // Step markers and other bookkeeping parts are not evidence on
+            // their own — a marker-only envelope is the refusal shape.
+            _ => {}
         }
-        for key in ["read", "write"] {
-            if tokens["cache"][key].as_u64().unwrap_or(0) > 0 {
-                return true;
-            }
+        // Any part the server attached reported usage to is evidence.
+        if token_usage_detector::agent::from_opencode_tokens(&part["tokens"]).is_some() {
+            return true;
         }
     }
-    false
+    token_usage_detector::agent::from_opencode_tokens(&message["tokens"]).is_some()
 }
 
 /// A quota refusal that answered an admission call — session create,
@@ -1025,6 +1020,22 @@ mod tests {
             "content": [], "tokens": {"input": 9, "output": 0}
         })];
         assert!(turn_produced_output(&usage, marker));
+        // Step markers and other bookkeeping parts are not output: an
+        // envelope the server populates with step bookkeeping before a
+        // provider refusal must not read as a served turn.
+        let markers = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "step-start"}, {"type": "step-finish"}],
+            "tokens": null
+        })];
+        assert!(!turn_produced_output(&markers, marker));
+        // A part the server attached reported usage to is evidence
+        // whatever its type — the detector owns the token shape.
+        let part_usage = vec![json!({
+            "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "step-finish", "tokens": {"input": 9}}]
+        })];
+        assert!(turn_produced_output(&part_usage, marker));
         let empty_text = vec![json!({
             "type": "assistant", "time": {"created": 110},
             "content": [{"type": "text", "text": ""}], "tokens": null

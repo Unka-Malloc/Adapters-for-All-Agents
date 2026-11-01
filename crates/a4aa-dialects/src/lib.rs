@@ -221,6 +221,40 @@ mod tests {
                 doc.contains(&surfaces),
                 "interaction-surface row missing or stale: {surfaces}"
             );
+            // The hook cells are AHE-owned text now (`config.hooks` is the
+            // harness's `config_path`; `primitives.hooks` is its native
+            // status) — pin both the way the surface row is pinned so a
+            // moved source cannot drift silently.
+            let config_row = doc_row(
+                doc,
+                "## MCP registration and config locations",
+                &format!("| {name} | {} |", table.last_verified),
+            );
+            let hooks_cell = config_row
+                .split('|')
+                .nth(6)
+                .map(|cell| cell.trim().replace('`', ""))
+                .unwrap_or_default();
+            assert_eq!(
+                hooks_cell,
+                doc_cell(table.config.hooks),
+                "config-location row's hooks cell drifted for {name}: {config_row}"
+            );
+            let primitives_row = doc_row(
+                doc,
+                "## AwP primitives",
+                &format!("| {name} | {} |", table.last_verified),
+            );
+            let hooks_cell = primitives_row
+                .split('|')
+                .nth(12)
+                .map(str::trim)
+                .unwrap_or("");
+            assert_eq!(
+                hooks_cell,
+                status_cell(table.primitives.hooks.status),
+                "primitives row's hooks cell drifted for {name}: {primitives_row}"
+            );
         }
         assert!(
             doc.contains("python3 .github/release.py freshness"),
@@ -234,6 +268,29 @@ mod tests {
             a4aa::NativeStatus::NotOffered => "not-offered",
             a4aa::NativeStatus::Unadapted => "unadapted",
             a4aa::NativeStatus::NonNative => "non-native",
+        }
+    }
+
+    /// One table row's source line inside the doc section headed
+    /// `section`, selected by its `| name | date |` prefix.
+    fn doc_row<'a>(doc: &'a str, section: &str, prefix: &str) -> &'a str {
+        let start = doc
+            .find(section)
+            .unwrap_or_else(|| panic!("docs/native-capability.md is missing {section:?}"));
+        let body = &doc[start..];
+        let end = body.find("\n## ").unwrap_or(body.len());
+        body[..end]
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("row {prefix:?} missing in section {section:?}"))
+    }
+
+    /// The doc renders an absent config location as an em dash.
+    fn doc_cell(text: &str) -> &str {
+        if text.is_empty() {
+            "—"
+        } else {
+            text
         }
     }
 }

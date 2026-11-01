@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Breaking relative to the published 0.4.x line: hook installation and
+usage detection moved to their owning crates, and `LaneSpec::Acp` gains a
+field — update dependent crates together.
+
+- Move hook installation ownership to AHE: `HookDecl`, `HookEvent`,
+  `HookIntent`, `HookSurface`, `ExtensionKind` and the install-plan types
+  (`InstallationPlan`, `Artifact`, `WriteMode`, `Support`) now come from
+  `ahe::install`, re-exported as `a4aa::hooks`; each dialect's hook store
+  resolves through `a4aa::hooks::harnesses`. `HookEvent::kebab_name`
+  moved with the type, and the unused `a4aa::dialect::Event` alias is
+  removed — `HookEvent` stays reachable as `a4aa::HookEvent` and
+  `a4aa::hooks::HookEvent`.
+- Route usage detection through Metera: `a4aa::TokenUsage` re-exports
+  `token_usage_detector::TokenUsage`, and the vendor-alias and OpenCode
+  usage shapes are extracted by `token_usage_detector::agent`
+  (`from_aliases`, `from_opencode_tokens`).
+- Add `enforced_permission` to `LaneSpec::Acp` (and `AcpLane`): a
+  permission preset the spec's own configuration already enforces — a
+  patch or injected config that locks the agent's mutation surface —
+  satisfies an identical session request when the agent advertises no
+  `permissions` selector; any other preset still fails closed.
 - Extend the `dsh` card's detection surface to the Electron desktop
   distribution: `DeepSeek Harness.app` bundles a working `dsh` CLI at
   `Contents/Resources/runtime/cli/bin` (an Electron-as-Node shim over the
@@ -9,10 +30,55 @@
   desktop's GUI-level settings marker joins `config`, and `processes` now
   matches the bundled shim's `DeepSeek Harness` image name.
 - Fix the serve lane's served-turn detection: an assistant envelope that the
-  server creates before a provider refusal (empty content, no token usage) is
-  no longer mistaken for billable output. Typed quota refusals therefore stay
-  retryable and certain as documented, so custody fails over to the next
-  candidate instead of parking the host's work on a capacity refusal.
+  server creates before a provider refusal (empty or marker-only content,
+  no token usage) is no longer mistaken for billable output. Typed quota
+  refusals therefore stay retryable and certain as documented, so custody
+  fails over to the next candidate instead of parking the host's work on a
+  capacity refusal.
+
+## 0.4.1
+
+Published 2026-10-25. Carries a source-breaking change as a patch:
+`RpcSurface` gains stream-failure capture fields, so a 0.4.0 adapter
+constructing the struct literally no longer compiles against a4aa 0.4.1 —
+the whole a4aa-* family shipped in lockstep. Update dependent crates
+together.
+
+- Surface stream-reported turn failures on RPC lanes.
+- Order dsh's SDK RPC lane primary over the ACP alternate.
+- Tighten the ACP and RPC lanes' served evidence to output-bearing
+  signals only.
+- Classify admission-time quota refusals as certain non-effects so
+  custody can replay the request on the next candidate.
+
+## 0.4.0
+
+Published 2026-10-24. A breaking update from 0.3.x: lane specs carry
+required `mcp_servers`/`mcp_config` fields — update dependent crates
+together.
+
+- Deliver host MCP servers natively: rpc and acp lanes install declared
+  servers, serve passes them at `session/new`, and the cli lane refuses a
+  non-empty list instead of running without the tools.
+- Install codex app-server MCP servers through `-c mcp_servers.*` with
+  tool pre-approval limited to hosts' `toolsApprovalServers`.
+- Add the `a4aa-dsh mount` binary provisioning the Command Code route —
+  canonical endpoint plus an opt-in custom endpoint; private and
+  IPv4-mapped hosts are refused, and HTTPS backslashes count as
+  separators.
+- Surface opencode's synthetic quota refusals as quota outcomes.
+- Harden the trust boundary: card specs materialize a sanitized
+  environment by default with host-environment fidelity behind explicit
+  opt-in, the serve password is redacted from every observed line,
+  artifact paths escaping their declared scope are refused, sidecar
+  ingress is bounded separately, the read-only session boundary is proven
+  before the server exists, and the ambient-auth fallback and mutable
+  release-mode channel are closed.
+- Let an instantly-exiting CLI agent's own exit stand.
+- Regenerate the release train: the verify train runs in `verify.yml`,
+  `publish.yml` keeps the OIDC job rebuilding artifacts inside the
+  workflow, and the publish gate binds to real release tags under a
+  provenance lock.
 
 ## 0.3.0
 

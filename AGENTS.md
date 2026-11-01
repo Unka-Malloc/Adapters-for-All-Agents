@@ -65,3 +65,14 @@ policy is confined to the inert allowlist plus resolved literals.
 ## Verify
 
 `scripts/verify.sh` — fmt + clippy + tests across the workspace.
+
+The workspace builds against two sibling checkouts — Cargo path
+dependencies resolve them at the versions `Cargo.toml` declares:
+
+| Path | Repository | Provides |
+| --- | --- | --- |
+| `../Hook-Engine` | `Unka-Malloc/Agent-Hook-Engine` | `ahe` |
+| `../Metera` | `Unka-Malloc/Metera` | `token-usage-detector` |
+
+Clone them beside this repository before building; a fresh clone without
+them cannot compile.

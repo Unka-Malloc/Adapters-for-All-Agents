@@ -84,7 +84,7 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | factory | 2026-10-21 | config-key | `.factory/settings.json mcp` | `{home}/.factory/settings.json` | — | `--auto` autonomy | `droid.list_models` |
 | grok | 2026-10-21 | protocol | ACP mcp http/sse | `{home}/.grok/config.toml` | `{home}/.grok/hooks` | `--permission-mode` | `grok models` |
 | hermes | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.hermes/config.yaml` | — | — | — |
-| kilocode | 2026-10-21 | config-key | `.config/kilo/kilo.json mcp` | `{home}/.config/kilo/kilo.json` | `{home}/.config/kilo/plugin` | OpenCode per-tool object inexpressible | `kilo models` |
+| kilocode | 2026-10-21 | config-key | `.config/kilo/kilo.json mcp` | `{home}/.config/kilo/kilo.json` | `{home}/.config/kilo/plugin/a4aa.js` (native plugin dir) | OpenCode per-tool object inexpressible | `kilo models` |
 | kimicode | 2026-10-21 | protocol | ACP mcp http/sse | `{home}/.kimi-code/config.toml` | — | distinct flags, not a selector | — |
 | kiro | 2026-10-21 | config-key | `.kiro/settings/mcp.json mcpServers` | `{home}/.kiro` | IDE trigger hooks unmapped | — | `kiro-cli-chat chat --list-models` |
 | openclaw | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.openclaw` | — | — | `openclaw models` |

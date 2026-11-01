@@ -146,6 +146,13 @@ fail closed to `cancelled`. The full method table is
 scripts/verify.sh   # fmt + clippy + cargo test --all-targets
 ```
 
+The workspace builds against two sibling checkouts — Cargo path
+dependencies resolve to `../Hook-Engine` (the
+`Unka-Malloc/Agent-Hook-Engine` repository, providing `ahe`) and
+`../Metera` (the `Unka-Malloc/Metera` repository, providing
+`token-usage-detector`) at the versions `Cargo.toml` declares. Clone them
+beside this checkout before building.
+
 ## Status
 
 The crate is named `a4aa` (Apache-2.0); the sidecar protocol is versioned
