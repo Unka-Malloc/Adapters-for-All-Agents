@@ -633,7 +633,7 @@ pub struct OsPath {
 // `acop::store` is the *type* authority so context operators and cards
 // speak one vocabulary. Re-exported here so `AgentCard` stays the single
 // aggregate descriptor.
-pub use acop::store::{HistoryRoot, StoreKind, TranscriptUsage};
+pub use acop::store::{HistoryRoot, StoreKind, TranscriptUsage, UsageTemporality};
 
 /// Token-accounting locations. Declared facts only — a counter the agent
 /// does not report stays absent everywhere downstream.

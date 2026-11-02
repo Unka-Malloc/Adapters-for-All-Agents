@@ -15,7 +15,7 @@ mod native;
 use a4aa::card::{
     AgentCard, AgentSurface, AttachmentSupport, CliSurface, DetectSurface, FeatureSurface,
     HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog, OsPath, StoreKind, TranscriptUsage,
-    UsageSurface,
+    UsageSurface, UsageTemporality,
 };
 use a4aa::dialect::{
     CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
@@ -168,6 +168,7 @@ pub const AGENT: AgentCard = AgentCard {
             cached: &["cache_read_input_tokens", "cache_creation_input_tokens"],
             output: &["output_tokens"],
             total: &[],
+            temporality: UsageTemporality::Delta,
         }),
         hosted: None,
     },

@@ -16,7 +16,7 @@ use a4aa::card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
     DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, ModelCatalog, OsPath,
     RpcCallDecl, RpcMcpDecl, RpcSurface, RpcTransportDecl, StoreKind, TranscriptUsage,
-    UsageSurface,
+    UsageSurface, UsageTemporality,
 };
 use a4aa::dialect::{
     CommandSurface, McpSurface, PermissionSurface, PluginSurface, SubagentSurface, Target,
@@ -241,12 +241,16 @@ pub const AGENT: AgentCard = AgentCard {
         live: None,
         transcript: Some(TranscriptUsage {
             root: "codex-session-store",
-            record: Some(("payload.type", "token_count")),
+            // The outer line type, not `payload.type`: `event_msg` mirror
+            // lines carry the same `token_count` payload and would double
+            // count every turn.
+            record: Some(("type", "token_usage_record")),
             container: "payload.info.last_token_usage",
             input: &["input_tokens"],
             cached: &["cached_input_tokens"],
             output: &["output_tokens"],
             total: &[],
+            temporality: UsageTemporality::Delta,
         }),
         // Token accounting is local-first: `last_token_usage` on session
         // transcript records; `account/rateLimits/read` is the quota route.
@@ -378,6 +382,10 @@ mod tests {
     fn transcript_usage_names_the_token_count_record() {
         let usage = AGENT.usage.transcript.as_ref().unwrap();
         assert_eq!(usage.root, "codex-session-store");
-        assert_eq!(usage.record, Some(("payload.type", "token_count")));
+        // The outer line type pins `token_usage_record`: `event_msg`
+        // mirrors carry the same `token_count` payload and must not
+        // match, or every turn would count twice.
+        assert_eq!(usage.record, Some(("type", "token_usage_record")));
+        assert_eq!(usage.temporality, UsageTemporality::Delta);
     }
 }
