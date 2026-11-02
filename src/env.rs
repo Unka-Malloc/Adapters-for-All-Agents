@@ -108,6 +108,17 @@ fn inheritable_temp_dir(key: &str, value: &OsString) -> bool {
     !(value.starts_with("/dev/fd/") || value.starts_with("/proc/self/fd/"))
 }
 
+/// Variables that bind a spawned process's lifetime to a foreign host pid —
+/// IDE integrations export their extension-host pid so processes *they*
+/// spawned can shut down when the host dies. A custody-spawned agent is not
+/// that host's child: inheriting the binding lets an unrelated editor
+/// restart kill every live session. Mechanical inheritance drops the
+/// binding like descriptor TMPDIR spellings; a host that genuinely means it
+/// declares an explicit `set` entry.
+fn inheritable_host_binding(key: &str) -> bool {
+    !key.ends_with("_EXT_HOST_PID")
+}
+
 /// Resolves `{"secret": "ref"}` environment sources. Implemented by the host
 /// (keychain, vault, encrypted store); the adapter never reads secret stores
 /// itself.
@@ -154,7 +165,7 @@ pub async fn resolve(
         EnvPolicy::InheritAll { set } => {
             for (key, value) in std::env::vars_os() {
                 let key = key.into_string().unwrap_or_default();
-                if inheritable_temp_dir(&key, &value) {
+                if inheritable_temp_dir(&key, &value) && inheritable_host_binding(&key) {
                     resolved.insert(key, value);
                 }
             }
@@ -250,6 +261,49 @@ mod tests {
             .await
             .unwrap();
         assert!(!resolved.contains_key("A4AA_TEST_SECRET_MARKER"));
+    }
+
+    #[tokio::test]
+    async fn inherit_all_drops_foreign_host_pid_binding() {
+        if spec_env(
+            "env::tests::inherit_all_drops_foreign_host_pid_binding",
+            &[
+                ("WINDSURF_EXT_HOST_PID", "4242"),
+                ("A4AA_TEST_HOST_MARKER", "kept"),
+            ],
+        ) {
+            return;
+        }
+        let resolved = resolve(
+            &EnvPolicy::InheritAll {
+                set: BTreeMap::new(),
+            },
+            &BTreeMap::new(),
+            &NoSecrets,
+        )
+        .await
+        .unwrap();
+        assert!(!resolved.contains_key("WINDSURF_EXT_HOST_PID"));
+        assert_eq!(resolved.get("A4AA_TEST_HOST_MARKER").unwrap(), "kept");
+    }
+
+    #[tokio::test]
+    async fn explicit_set_can_still_declare_host_pid_binding() {
+        if spec_env(
+            "env::tests::explicit_set_can_still_declare_host_pid_binding",
+            &[("WINDSURF_EXT_HOST_PID", "4242")],
+        ) {
+            return;
+        }
+        let mut set = BTreeMap::new();
+        set.insert(
+            "WINDSURF_EXT_HOST_PID".to_owned(),
+            EnvValue::Literal("4242".into()),
+        );
+        let resolved = resolve(&EnvPolicy::InheritAll { set }, &BTreeMap::new(), &NoSecrets)
+            .await
+            .unwrap();
+        assert_eq!(resolved.get("WINDSURF_EXT_HOST_PID").unwrap(), "4242");
     }
 
     #[tokio::test]
