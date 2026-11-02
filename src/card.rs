@@ -630,10 +630,10 @@ pub struct OsPath {
 
 // Artifact-store vocabulary lives in Agent Context Operators — cards are
 // the *data* authority (each `a4aa-<agent>` declares its own locations);
-// `aco::store` is the *type* authority so context operators and cards
+// `acop::store` is the *type* authority so context operators and cards
 // speak one vocabulary. Re-exported here so `AgentCard` stays the single
 // aggregate descriptor.
-pub use aco::store::{HistoryRoot, StoreKind, TranscriptUsage};
+pub use acop::store::{HistoryRoot, StoreKind, TranscriptUsage};
 
 /// Token-accounting locations. Declared facts only — a counter the agent
 /// does not report stays absent everywhere downstream.

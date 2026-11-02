@@ -72,7 +72,7 @@ dependencies resolve them at the versions `Cargo.toml` declares:
 | Path | Repository | Provides |
 | --- | --- | --- |
 | `../Hook-Engine` | `Unka-Malloc/Agent-Hook-Engine` | `ahe` |
-| `../Agent-Context-Operators` | `Unka-Malloc/Agent-Context-Operators` | `acop` |
+| `../ACOP` | `Unka-Malloc/ACOP` | `acop` |
 | `../Metera` | `Unka-Malloc/Metera` | `token-usage-detector` |
 
 Clone them beside this repository before building; a fresh clone without

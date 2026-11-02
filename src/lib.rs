@@ -43,7 +43,7 @@ pub mod supervision;
 mod template;
 pub mod transport;
 
-pub use aco as context;
+pub use acop as context;
 pub use adapter::{Adapter, AgentSession, BeforeTurn, LaneSession, PermissionHandler, TurnRequest};
 pub use ahe::install as hooks;
 pub use card::{
