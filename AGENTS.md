@@ -66,7 +66,7 @@ policy is confined to the inert allowlist plus resolved literals.
 
 `scripts/verify.sh` — fmt + clippy + tests across the workspace.
 
-The workspace builds against two sibling checkouts — Cargo path
+The workspace builds against three sibling checkouts — Cargo path
 dependencies resolve them at the versions `Cargo.toml` declares:
 
 | Path | Repository | Provides |

@@ -7,12 +7,8 @@ match.
 
 `last_verified` is an ISO date (`YYYY-MM-DD`) and a **release gate**, not
 a per-commit lint. Refresh every dialect table against the installed
-binary and vendor docs before a release. The train refuses a candidate
-whose dates fall outside the freshness window:
-
-```
-python3 .github/release.py freshness --window-days=14
-```
+binary and vendor docs before a release. Release tooling refuses a
+candidate whose dates fall outside the freshness window.
 
 Cell vocabulary (matches `a4aa::NativeStatus` kebab-case):
 

@@ -257,8 +257,8 @@ mod tests {
             );
         }
         assert!(
-            doc.contains("python3 .github/release.py freshness"),
-            "master table must name the release freshness command"
+            doc.contains("release gate"),
+            "master table must describe the last_verified release gate"
         );
     }
 

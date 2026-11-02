@@ -50,6 +50,7 @@ pub use card::{
     AgentCard, AgentSurface, AlternateLane, AttachmentSupport, CliSurface, CompletionDecl,
     DetectSurface, FeatureSurface, HistoryRoot, InstructionChannel, LiveUsage, ModelCatalog,
     OsPath, RpcCallDecl, RpcMcpDecl, RpcSurface, StoreKind, TranscriptUsage, UsageSurface,
+    UsageTemporality,
 };
 pub use dialect::{
     adapt, CommandSurface, Dialect, ExtensionKind, HookSurface, McpSurface, PermissionSurface,

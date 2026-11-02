@@ -4,7 +4,7 @@
 //!
 //! Every `a4aa-<agent>` crate publishes one [`NativeCapability`] constant.
 //! [`a4aa-dialects`] aggregates them. `last_verified` is a `YYYY-MM-DD`
-//! date that the release train refuses to ship stale — freshness is a
+//! date that release tooling refuses to ship stale — freshness is a
 //! release gate, not a per-commit lint.
 
 use serde::Serialize;
@@ -97,7 +97,7 @@ pub struct AwpPrimitives {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeCapability {
     /// ISO date (`YYYY-MM-DD`) this table was last checked against the
-    /// installed binary and vendor docs. The release train refuses a
+    /// installed binary and vendor docs. Release tooling refuses a
     /// candidate whose tables are older than the freshness window.
     pub last_verified: &'static str,
     pub surfaces: InteractionSurfaces,

@@ -3,8 +3,10 @@
 ## Unreleased
 
 Breaking relative to the published 0.4.x line: hook installation and
-usage detection moved to their owning crates, and `LaneSpec::Acp` gains a
-field — update dependent crates together.
+usage detection moved to their owning crates, the conversation-context
+dependency is renamed `acop` and resolved from the `../ACOP` sibling,
+`TranscriptUsage` gains a required `temporality` field, and
+`LaneSpec::Acp` gains a field — update dependent crates together.
 
 - Move hook installation ownership to AHE: `HookDecl`, `HookEvent`,
   `HookIntent`, `HookSurface`, `ExtensionKind` and the install-plan types
@@ -18,6 +20,23 @@ field — update dependent crates together.
   `token_usage_detector::TokenUsage`, and the vendor-alias and OpenCode
   usage shapes are extracted by `token_usage_detector::agent`
   (`from_aliases`, `from_opencode_tokens`).
+- Rename the context dependency to ACOP: `a4aa::context` re-exports the
+  `acop` crate (repository `Unka-Malloc/ACOP`), and the card types —
+  `HistoryRoot`, `StoreKind`, `TranscriptUsage`, `UsageTemporality` —
+  re-export through `a4aa::card` as before. The path dependency resolves
+  `../ACOP/crates/acop`; clone `Unka-Malloc/ACOP` beside this checkout.
+- `TranscriptUsage` gains `temporality: UsageTemporality`: each card
+  declares whether its persisted counters are per-record `Delta`s (all
+  current cards) or `Cumulative` totals. Struct literals in dependent
+  crates need the new field.
+- Tighten the codex transcript-usage discriminator to
+  `("type", "token_usage_record")`: `("payload.type", "token_count")`
+  also matched `event_msg` mirror records and could count one turn's
+  counters twice; the rollout's canonical usage envelope is the
+  top-level `token_usage_record` record.
+- Remove the generated release train from the tree (`.github` workflows,
+  `release.py`, `release.lock`): freshness and publish gates are
+  enforced by maintainer-side release tooling outside this checkout.
 - Add `enforced_permission` to `LaneSpec::Acp` (and `AcpLane`): a
   permission preset the spec's own configuration already enforces — a
   patch or injected config that locks the agent's mutation surface —

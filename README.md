@@ -75,8 +75,8 @@ Each adapter crate also publishes a dated native-capability table
 (`NATIVE` in `crates/a4aa-<agent>/src/native.rs`) covering interaction
 surfaces, MCP registration, config locations, and AwP primitives.
 [`docs/native-capability.md`](docs/native-capability.md) is the aggregated
-master table. `last_verified` is a release gate
-(`python3 .github/release.py freshness`).
+master table. `last_verified` is a freshness gate enforced by release
+tooling before a release ships.
 
 ## Invariants
 
@@ -154,12 +154,13 @@ fail closed to `cancelled`. The full method table is
 scripts/verify.sh   # fmt + clippy + cargo test --all-targets
 ```
 
-The workspace builds against two sibling checkouts — Cargo path
+The workspace builds against three sibling checkouts — Cargo path
 dependencies resolve to `../Hook-Engine` (the
-`Unka-Malloc/Agent-Hook-Engine` repository, providing `ahe`) and
-`../Metera` (the `Unka-Malloc/Metera` repository, providing
-`token-usage-detector`) at the versions `Cargo.toml` declares. Clone them
-beside this checkout before building.
+`Unka-Malloc/Agent-Hook-Engine` repository, providing `ahe`), `../ACOP`
+(the `Unka-Malloc/ACOP` repository, providing `acop`) and `../Metera`
+(the `Unka-Malloc/Metera` repository, providing `token-usage-detector`)
+at the versions `Cargo.toml` declares. Clone them beside this checkout
+before building.
 
 ## Status
 
