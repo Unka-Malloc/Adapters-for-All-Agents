@@ -3,11 +3,15 @@
 //! `stdio` attaches lanes to piped stdin/stdout (NDJSON / JSON-RPC lanes and
 //! plain CLI pipes). `pty` attaches the child to a raw-mode pseudo-terminal
 //! slave for agents that only behave correctly on a TTY (`isatty` probes,
-//! TUI-aware rendering). stderr always stays a real pipe: keeping it off the
-//! terminal preserves both drain semantics and clean stdout framing.
+//! TUI-aware rendering). `ssh` reaches an agent that runs on another host:
+//! a validated destination and a batch-only `ssh` command the caller spawns
+//! like a local child. `ws` attaches to an agent's own WebSocket endpoint.
+//! stderr always stays a real pipe: keeping it off the terminal preserves
+//! both drain semantics and clean stdout framing.
 
 #[cfg(unix)]
 pub mod pty;
+pub mod ssh;
 pub mod stdio;
 pub mod ws;
 

@@ -13,9 +13,11 @@ both directions:
   lane's internals. Shared machinery lives in lane-neutral modules —
   `template` (spec placeholders and value selectors), `model`, `env`,
   `error`, `bounds`, `transport`, `framing`, `rpc` (the NDJSON peer, not
-  the lane), `supervision`, `observe`. When two lanes need the same
-  helper, move it out of the lane into a shared module instead of
-  importing across lanes.
+  the lane), `supervision`, `observe`, `discovery` (allowlisted machine
+  scan), `hostenv` (login-shell environment), `runtime` (host-neutral
+  runtime ports) and `protocol_selector` (evidence-pinned lane
+  selection). When two lanes need the same helper, move it out of the
+  lane into a shared module instead of importing across lanes.
 - **Development**: work on one lane must not require changes to a sibling
   lane. Extending or breaking one lane never obligates touching another;
   capabilities are declared per lane via `capabilities()`, never
