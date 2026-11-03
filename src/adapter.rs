@@ -14,7 +14,7 @@ use crate::env::SecretResolver;
 use crate::error::AdapterError;
 use crate::model::{
     AgentEvent, AgentSpec, Capabilities, LaneSpec, SelectorPhase, SelectorSupport,
-    SelectorSupportSet, SessionRequest, TurnOutcome,
+    SelectorSupportSet, SessionConfig, SessionRequest, TurnOutcome,
 };
 use crate::observe::SharedObserver;
 use crate::proto::acp::{AcpLane, AcpSession, PermissionDecision, SessionDelegate};
@@ -344,6 +344,33 @@ fn validate_session_config(spec: &AgentSpec, request: &SessionRequest) -> Result
     Ok(())
 }
 
+/// When the host process is already inside an OS sandbox that refuses a
+/// nested apply, a preset that makes the agent apply a sandbox profile of
+/// its own can never launch — `sandbox_apply` answers EPERM on macOS. A
+/// spec declaring `seatbelted_permission` swaps in the preset whose
+/// confinement is "inherit the ambient sandbox"; the substituted value
+/// then faces the same allowlist validation as any requested mode.
+fn project_seatbelted_permission(spec: &AgentSpec, config: &mut SessionConfig) {
+    project_seatbelted_permission_when(spec, config, crate::hostenv::restrictive_seatbelt());
+}
+
+fn project_seatbelted_permission_when(
+    spec: &AgentSpec,
+    config: &mut SessionConfig,
+    seatbelted: bool,
+) {
+    let Some(fallback) = &spec.seatbelted_permission else {
+        return;
+    };
+    if config.permission.is_none() || config.permission.as_deref() == Some(fallback) {
+        return;
+    }
+    if !seatbelted {
+        return;
+    }
+    config.permission = Some(fallback.clone());
+}
+
 fn validate_session_selector(
     value: Option<&str>,
     support: SelectorSupport,
@@ -467,9 +494,10 @@ impl Adapter {
     /// `events`.
     pub async fn open_session(
         &self,
-        request: SessionRequest,
+        mut request: SessionRequest,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<AgentSession, AdapterError> {
+        project_seatbelted_permission(&self.spec, &mut request.config);
         validate_session_config(&self.spec, &request)?;
         if request
             .resume
@@ -616,5 +644,94 @@ impl Adapter {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{project_seatbelted_permission_when, AgentSpec, LaneSpec, SessionConfig};
+    use crate::env::EnvPolicy;
+    use crate::model::CommandSpec;
+
+    fn spec(seatbelted: Option<&str>) -> AgentSpec {
+        AgentSpec {
+            id: "agent".to_owned(),
+            client_name: None,
+            lane: LaneSpec::Acp {
+                mcp_servers: Vec::new(),
+                prefer_load: false,
+                auth_key: None,
+                enforced_permission: None,
+            },
+            command: CommandSpec {
+                program: "agent".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: EnvPolicy::default(),
+            },
+            max_output_bytes: None,
+            seatbelted_permission: seatbelted.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn an_inherited_sandbox_projects_the_declared_fallback_preset() {
+        let mut config = SessionConfig {
+            permission: Some("read-only".to_owned()),
+            ..SessionConfig::default()
+        };
+        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut config, true);
+        assert_eq!(config.permission.as_deref(), Some("danger-full-access"));
+    }
+
+    #[test]
+    fn without_an_inherited_sandbox_the_preset_reaches_the_lane_verbatim() {
+        let mut config = SessionConfig {
+            permission: Some("read-only".to_owned()),
+            ..SessionConfig::default()
+        };
+        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut config, false);
+        assert_eq!(config.permission.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn a_spec_without_a_fallback_keeps_the_requested_preset() {
+        let mut config = SessionConfig {
+            permission: Some("read-only".to_owned()),
+            ..SessionConfig::default()
+        };
+        project_seatbelted_permission_when(&spec(None), &mut config, true);
+        assert_eq!(config.permission.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn the_fallback_field_round_trips_the_serialized_spec() {
+        let raw = serde_json::to_value(spec(Some("danger-full-access"))).unwrap();
+        assert_eq!(
+            raw["seatbeltedPermission"].as_str(),
+            Some("danger-full-access")
+        );
+        let parsed = serde_json::from_value::<AgentSpec>(raw).unwrap();
+        assert_eq!(
+            parsed.seatbelted_permission.as_deref(),
+            Some("danger-full-access")
+        );
+        // Specs that never self-sandbox write no key at all, so documents
+        // authored before the field existed deserialize identically.
+        let raw = serde_json::to_value(spec(None)).unwrap();
+        assert!(raw.get("seatbeltedPermission").is_none());
+    }
+
+    #[test]
+    fn unset_permission_and_already_fallback_values_stay_untouched() {
+        let mut unset = SessionConfig::default();
+        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut unset, true);
+        assert!(unset.permission.is_none());
+        let mut settled = SessionConfig {
+            permission: Some("danger-full-access".to_owned()),
+            ..SessionConfig::default()
+        };
+        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut settled, true);
+        assert_eq!(settled.permission.as_deref(), Some("danger-full-access"));
     }
 }

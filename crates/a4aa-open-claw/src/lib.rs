@@ -125,6 +125,7 @@ pub const AGENT: AgentCard = AgentCard {
         execution_modes: &[],
         permission_modes: &[],
         permission_default: None,
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         // `--thinking off|…|ultra`.
         effort: true,

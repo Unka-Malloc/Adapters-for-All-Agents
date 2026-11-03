@@ -134,6 +134,7 @@ pub const AGENT: AgentCard = AgentCard {
         execution_modes: &["spec"],
         permission_modes: &[],
         permission_default: None,
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         // `--effort low|medium|high|xhigh|max` (spawn-time on `acp`).
         effort: true,

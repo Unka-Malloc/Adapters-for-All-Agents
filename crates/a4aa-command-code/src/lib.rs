@@ -108,6 +108,7 @@ pub const AGENT: AgentCard = AgentCard {
         execution_modes: &["plan"],
         permission_modes: &["standard", "plan", "auto-accept"],
         permission_default: Some("standard"),
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         // `--effort <level>`.
         effort: true,

@@ -102,6 +102,7 @@ fn fixture(script: &str, cwd: &std::path::Path, limit: Option<usize>) -> Adapter
         id: "acp-fixture".into(),
         client_name: None,
         max_output_bytes: limit,
+        seatbelted_permission: None,
         command: CommandSpec {
             program: "python3".into(),
             args: vec!["-u".into(), "-c".into(), script.into()],

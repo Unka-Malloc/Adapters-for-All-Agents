@@ -130,6 +130,7 @@ pub const AGENT: AgentCard = AgentCard {
             "plan",
         ],
         permission_default: Some("default"),
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         // `--reasoning-effort` / `--effort`.
         effort: true,

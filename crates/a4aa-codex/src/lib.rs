@@ -230,6 +230,7 @@ pub const AGENT: AgentCard = AgentCard {
         execution_modes: &[],
         permission_modes: &["read-only", "workspace-write", "danger-full-access"],
         permission_default: None,
+        seatbelted_permission: Some("danger-full-access"),
         attachments: AttachmentSupport::LocalImages,
         effort: true,
         steer: true,
@@ -328,6 +329,13 @@ mod tests {
     fn spec_materializes_the_app_server_lane() {
         let spec = spec();
         assert_eq!(spec.command.program, "codex");
+        // Every preset `read-only`/`workspace-write` self-applies a seatbelt
+        // profile, which fails inside an already-sandboxed host process; the
+        // spec declares the inherit-ambient mode for that environment.
+        assert_eq!(
+            spec.seatbelted_permission.as_deref(),
+            Some("danger-full-access")
+        );
         assert_eq!(
             spec.command.args,
             vec!["app-server".to_string(), "--stdio".to_string()]

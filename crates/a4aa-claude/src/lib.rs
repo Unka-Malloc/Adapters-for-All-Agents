@@ -150,6 +150,7 @@ pub const AGENT: AgentCard = AgentCard {
             "bypassPermissions",
         ],
         permission_default: None,
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         effort: true,
         steer: false,

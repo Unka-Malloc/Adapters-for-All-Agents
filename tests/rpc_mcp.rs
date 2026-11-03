@@ -125,6 +125,7 @@ fn spec(directory: &std::path::Path, lane: RpcLaneSpec) -> AgentSpec {
         lane: LaneSpec::Rpc(Box::new(lane)),
         command: script(directory),
         max_output_bytes: None,
+        seatbelted_permission: None,
     }
 }
 

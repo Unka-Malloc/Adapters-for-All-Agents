@@ -122,6 +122,7 @@ pub const AGENT: AgentCard = AgentCard {
         // not a mode-valued selector — ACP mode negotiation carries them.
         permission_modes: &[],
         permission_default: None,
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         effort: false,
         steer: false,

@@ -121,6 +121,7 @@ pub const AGENT: AgentCard = AgentCard {
         // approving every tool with `--dangerously-skip-permissions`.
         permission_modes: &[],
         permission_default: None,
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         effort: true,
         steer: false,

@@ -32,6 +32,7 @@ fn acp_spec() -> AgentSpec {
     AgentSpec {
         id: "fixture-acp".into(),
         client_name: Some("a4aa-test".into()),
+        seatbelted_permission: None,
         lane: LaneSpec::Acp {
             mcp_servers: vec![],
             prefer_load: false,
@@ -47,6 +48,7 @@ fn rpc_spec() -> AgentSpec {
     AgentSpec {
         id: "fixture-rpc".into(),
         client_name: None,
+        seatbelted_permission: None,
         lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
             transport: RpcTransport::Stdio,
             max_frame_bytes: None,
@@ -324,6 +326,7 @@ fn cli_spec(
     AgentSpec {
         id: "fixture-cli".into(),
         client_name: None,
+        seatbelted_permission: None,
         lane: LaneSpec::Cli(Box::new(CliLaneSpec {
             args,
             prompt_channel: channel,
@@ -1135,7 +1138,7 @@ else:
             usage_path: None,prompt:RpcCallSpec {method:"prompt".into(),params:json!({"text":"{prompt}"})},
                     text_event_method:Some("ready".into()),text_path:Some("text".into()),..Default::default()})),
             };
-            let spec=AgentSpec {id:mode.into(),client_name:None,max_output_bytes:Some(1024),lane,
+            let spec=AgentSpec {id:mode.into(),client_name:None,max_output_bytes:Some(1024),seatbelted_permission:None,lane,
                 command:CommandSpec {program:"python3".into(),args:vec!["-u".into(),"-c".into(),script],cwd:None,env:EnvPolicy::default()}};
             let opened=peer.call("session/open",json!({"spec":spec})).await.unwrap();
             let id=opened["sessionId"].as_str().unwrap();
@@ -1676,6 +1679,7 @@ async fn sidecar_rejects_an_over_limit_frame_bound() {
     let spec = AgentSpec {
         id: "oversized".into(),
         client_name: None,
+        seatbelted_permission: None,
         max_output_bytes: None,
         lane,
         command: CommandSpec {
@@ -1835,6 +1839,7 @@ time.sleep(3600)
             let spec = AgentSpec {
                 id: format!("establishing-{mode}"),
                 client_name: None,
+                seatbelted_permission: None,
                 max_output_bytes: Some(1024),
                 lane,
                 command: CommandSpec {
@@ -1984,6 +1989,7 @@ signal.pause()
         let spec = AgentSpec {
             id: "gated-handoff".into(),
             client_name: None,
+            seatbelted_permission: None,
             max_output_bytes: Some(1024),
             lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
                 transport: RpcTransport::Stdio,
@@ -2106,6 +2112,7 @@ signal.pause()
             let spec = AgentSpec {
                 id: "gated-handoff-race".into(),
                 client_name: None,
+                seatbelted_permission: None,
                 max_output_bytes: Some(1024),
                 lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
                     transport: RpcTransport::Stdio,
@@ -2209,6 +2216,7 @@ for line in sys.stdin:
         let spec = AgentSpec {
             id: "notify-cancel".into(),
             client_name: None,
+            seatbelted_permission: None,
             max_output_bytes: Some(1024),
             lane: LaneSpec::Rpc(Box::new(RpcLaneSpec {
             transport: RpcTransport::Stdio,

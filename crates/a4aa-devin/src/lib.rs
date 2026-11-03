@@ -181,6 +181,7 @@ pub const AGENT: AgentCard = AgentCard {
         // modes (`accept-edits`, `smart`, `bypass`).
         permission_modes: &["auto", "accept-edits", "smart", "dangerous"],
         permission_default: Some("auto"),
+        seatbelted_permission: None,
         // Image prompts are protocol-native over ACP.
         attachments: AttachmentSupport::None,
         effort: false,

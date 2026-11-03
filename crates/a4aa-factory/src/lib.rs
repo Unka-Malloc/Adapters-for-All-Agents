@@ -331,6 +331,7 @@ pub const AGENT: AgentCard = AgentCard {
         // `--auto` autonomy tiers (the default is read-only).
         permission_modes: &["low", "medium", "high"],
         permission_default: None,
+        seatbelted_permission: None,
         attachments: AttachmentSupport::None,
         // `--reasoning-effort`.
         effort: true,

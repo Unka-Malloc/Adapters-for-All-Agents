@@ -17,6 +17,7 @@ fn cli(script: &str, stream: StreamMode, input: bool) -> a4aa::AgentSpec {
         id: "fixture".into(),
         client_name: None,
         max_output_bytes: None,
+        seatbelted_permission: None,
         command: CommandSpec {
             program: "sh".into(),
             args: vec!["-c".into(), script.into(), "sh".into()],
@@ -174,6 +175,7 @@ fn rpc_fixture(script: &str, limit: Option<usize>) -> a4aa::AgentSpec {
         id: "rpc-barrier".into(),
         client_name: None,
         max_output_bytes: limit,
+        seatbelted_permission: None,
         command: CommandSpec {
             program: "python3".into(),
             args: vec!["-u".into(), "-c".into(), script.into()],

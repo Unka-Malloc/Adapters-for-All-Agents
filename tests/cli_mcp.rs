@@ -49,6 +49,7 @@ fn spec(directory: &std::path::Path, servers: Vec<Value>) -> AgentSpec {
         })),
         command: marker_command(directory, &directory.join("spawned")),
         max_output_bytes: None,
+        seatbelted_permission: None,
     }
 }
 
