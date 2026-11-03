@@ -51,6 +51,7 @@ pub mod mcp;
 pub mod mechanisms;
 pub mod model;
 pub mod native;
+pub mod route;
 pub mod observe;
 pub mod proto;
 pub mod protocol_selector;
