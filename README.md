@@ -52,7 +52,7 @@ descriptor crate under `crates/`, which depends only on `a4aa`:
 
 ```toml
 # A host that drives only Pi installs exactly one adapter.
-a4aa-pi = "0.2"
+a4aa-pi = "0.5"
 ```
 
 ```rust
@@ -111,6 +111,7 @@ let spec = AgentSpec {
         ..Default::default()
     },
     max_output_bytes: None,
+    seatbelted_permission: None,
 };
 let adapter = Adapter::new(spec);
 let (events, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
