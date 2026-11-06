@@ -328,7 +328,7 @@ while [ $# -gt 0 ]; do
 done
 sid="agy-9"
 printf '{"event":"init","conversation_id":"%s","init":{"permission_mode":"request-review"}}\n' "$sid"
-printf '{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"turn text\\n"}}\n'
+printf '{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"turn text"}}\n'
 response="model=$model;effort=$effort;mode=$mode;resume=$resume"
 printf '{"event":"result","result":{"conversation_id":"%s","status":"SUCCESS","response":"%s","usage":{"input_tokens":10,"cache_read_tokens":2,"output_tokens":5,"total_tokens":17}}}\n' "$sid" "$response"
 "#;
@@ -452,10 +452,12 @@ async fn antigravity_stream_json_captures_config_session_usage_and_resumes() {
     assert_eq!(usage.cached_input, Some(2));
     assert_eq!(usage.output, Some(5));
     assert_eq!(usage.total, Some(17));
-    let raw_lines = std::iter::from_fn(|| events.try_recv().ok())
+    let received: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    let raw_lines = received
+        .iter()
         .filter(|event| matches!(event, AgentEvent::Raw { .. }))
         .count();
-    assert_eq!(raw_lines, 3);
+    assert_eq!(raw_lines, 3, "received events: {received:?}");
 
     // The next process resumes the durable id while preserving profile config.
     let mut second_turn = turn("again");
@@ -917,6 +919,10 @@ async fn factory_daemon_websocket_lane() {
 /// `item.completed` agent_message text is the reply, `turn.completed`
 /// carries usage. A resume request reorders argv to
 /// `exec resume <id>` — verified as argv, not just intent.
+///
+/// The fixture is a shebang script spawned directly as the program, which
+/// only a unix exec resolves; on Windows there is no equivalent carrier.
+#[cfg(unix)]
 #[tokio::test]
 async fn codex_exec_resume_reorders_argv() {
     // The fixture is a real executable: `resume_spawn_args` replaces the

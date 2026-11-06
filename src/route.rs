@@ -284,7 +284,8 @@ pub fn resolve_dsh_route(provider: &str, lane: Option<&str>) -> Option<ResolvedR
     if let Some(lane) = lane {
         route.lanes.retain(|l| l == lane);
     }
-    let has_patch = !route.lanes.is_empty() || route.base_url.is_some() || !route.catalog.is_empty();
+    let has_patch =
+        !route.lanes.is_empty() || route.base_url.is_some() || !route.catalog.is_empty();
     let patched_base = route.base_url.clone();
     let patched_catalog = route.catalog.clone();
     bundled_catalog(provider, &mut route);
@@ -293,7 +294,11 @@ pub fn resolve_dsh_route(provider: &str, lane: Option<&str>) -> Option<ResolvedR
     } else {
         None
     };
-    if route.lanes.is_empty() && route.catalog.is_empty() && builtin_pkg.is_none() && route.base_url.is_none() {
+    if route.lanes.is_empty()
+        && route.catalog.is_empty()
+        && builtin_pkg.is_none()
+        && route.base_url.is_none()
+    {
         return None;
     }
     // Patch-declared fields win over bundled/builtin-derived ones.
@@ -307,15 +312,11 @@ pub fn resolve_dsh_route(provider: &str, lane: Option<&str>) -> Option<ResolvedR
     if let Some(env) = &route.api_key_env {
         route.credential = credential(env).map(Credential::ApiKey);
     } else if let Some(pkg) = &builtin_pkg {
-        let variant = std::fs::read_to_string(
-            dsh_plugins().join(format!("{pkg}/lib/index.js")),
-        )
-        .unwrap_or_default();
+        let variant = std::fs::read_to_string(dsh_plugins().join(format!("{pkg}/lib/index.js")))
+            .unwrap_or_default();
         if variant.contains("x-dsh-auth-token") {
-            route.credential = account_token(
-                provider.strip_suffix("-account").unwrap_or(provider),
-            )
-            .map(Credential::SessionToken);
+            route.credential = account_token(provider.strip_suffix("-account").unwrap_or(provider))
+                .map(Credential::SessionToken);
         }
     }
     Some(route)
