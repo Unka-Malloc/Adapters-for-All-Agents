@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
-Breaking relative to the published 0.4.x line: hook installation and
-usage detection moved to their owning crates, the conversation-context
-dependency is renamed `acop` and resolved from the `../ACOP` sibling,
-`TranscriptUsage` gains a required `temporality` field, and
-`LaneSpec::Acp` gains a field — update dependent crates together.
+Unreleased. Breaking relative to the published 0.4.x line: hook
+installation and usage detection moved to their owning crates, the
+conversation-context dependency is renamed `acop` and resolved from the
+`../ACOP` sibling, `TranscriptUsage` gains a required `temporality`
+field, and `LaneSpec::Acp`, `AgentSpec` and `FeatureSurface` gain fields
+— the whole a4aa-* family moves to 0.5.0 in lockstep; update dependent
+crates together.
 
 - Move hook installation ownership to AHE: `HookDecl`, `HookEvent`,
   `HookIntent`, `HookSurface`, `ExtensionKind` and the install-plan types
@@ -21,10 +23,11 @@ dependency is renamed `acop` and resolved from the `../ACOP` sibling,
   usage shapes are extracted by `token_usage_detector::agent`
   (`from_aliases`, `from_opencode_tokens`).
 - Rename the context dependency to ACOP: `a4aa::context` re-exports the
-  `acop` crate (repository `Unka-Malloc/ACOP`), and the card types —
-  `HistoryRoot`, `StoreKind`, `TranscriptUsage`, `UsageTemporality` —
-  re-export through `a4aa::card` as before. The path dependency resolves
-  `../ACOP/crates/acop`; clone `Unka-Malloc/ACOP` beside this checkout.
+  `acop` crate (repository `Unka-Malloc/Agent-Context-Operators`), and
+  the card types — `HistoryRoot`, `StoreKind`, `TranscriptUsage`,
+  `UsageTemporality`, `SqliteUsageSpec` — re-export through `a4aa::card`.
+  The path dependency resolves `../ACOP/crates/acop`; clone
+  `Unka-Malloc/Agent-Context-Operators` beside this checkout.
 - `TranscriptUsage` gains `temporality: UsageTemporality`: each card
   declares whether its persisted counters are per-record `Delta`s (all
   current cards) or `Cumulative` totals. Struct literals in dependent
@@ -35,8 +38,27 @@ dependency is renamed `acop` and resolved from the `../ACOP` sibling,
   counters twice; the rollout's canonical usage envelope is the
   top-level `token_usage_record` record.
 - Remove the generated release train from the tree (`.github` workflows,
-  `release.py`, `release.lock`): freshness and publish gates are
-  enforced by maintainer-side release tooling outside this checkout.
+  `release.py`, `release.lock`): freshness gates are enforced by
+  maintainer-side release tooling outside this checkout. A single
+  `.github/workflows/publish.yml` publishes one crate per pushed
+  `<crate>-v<version>` tag through crates.io Trusted Publishing.
+- Add `discovery` (allowlisted machine scan), `hostenv` (login-shell
+  environment), `runtime` (host-neutral runtime ports),
+  `protocol_selector` (evidence-pinned lane selection) and an SSH
+  transport.
+- Add `seatbelted_permission` to `AgentSpec` and the card's
+  `FeatureSurface`: when the host already runs inside a restrictive OS
+  sandbox, a requested preset that would apply a nested sandbox is
+  swapped for the declared inherit-the-ambient-sandbox preset, then
+  validated like any requested mode.
+- Add `a4aa::route`: resolve a provider's model route (catalog, endpoint,
+  credential) from the installed supplier configuration, and probe its
+  reachability.
+- Drop foreign `*_EXT_HOST_PID` bindings from verbatim environment
+  inheritance, so an unrelated editor extension-host restart no longer
+  terminates custody-spawned agents.
+- `a4aa-hermes` declares the Hermes profile store's SQLite usage surface
+  (`stored_usage()`), separate from transcript records.
 - Add `enforced_permission` to `LaneSpec::Acp` (and `AcpLane`): a
   permission preset the spec's own configuration already enforces — a
   patch or injected config that locks the agent's mutation surface —

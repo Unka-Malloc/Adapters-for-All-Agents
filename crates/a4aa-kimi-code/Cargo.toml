@@ -1,11 +1,11 @@
 [package]
 name = "a4aa-kimi-code"
 description = "a4aa dialect adapter: the `kimicode` mechanism descriptor (hooks, rules, skills, commands, subagents, plugins, permissions, MCP) for a4aa's adaptation engine."
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/Unka-Malloc/Adapter-For-All-Agents"
+repository = "https://github.com/Unka-Malloc/Adapters-for-All-Agents"
 keywords = ["a4aa", "agent", "kimicode", "dialect", "profile"]
 categories = ["development-tools"]
 
@@ -14,4 +14,4 @@ name = "a4aa_kimi_code"
 path = "src/lib.rs"
 
 [dependencies]
-a4aa = { path = "../..", version = "0.4.0" }
+a4aa = { path = "../..", version = "0.5.0" }
