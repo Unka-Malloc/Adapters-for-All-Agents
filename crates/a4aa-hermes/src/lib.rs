@@ -115,6 +115,20 @@ pub fn spec() -> AgentSpec {
     AGENT.spec()
 }
 
+/// The declared SQLite usage surface of the Hermes profile store
+/// (`state.db`): table and column names for session and per-model
+/// counters, kept separate from transcript records.
+pub const STORED_USAGE_JSON: &str = include_str!("stored-usage.json");
+
+/// [`STORED_USAGE_JSON`] parsed once into the shared `acop` usage spec.
+pub fn stored_usage() -> &'static a4aa::card::SqliteUsageSpec {
+    static SPEC: std::sync::OnceLock<a4aa::card::SqliteUsageSpec> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| {
+        a4aa::card::SqliteUsageSpec::from_json(STORED_USAGE_JSON)
+            .expect("valid stored usage declaration")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +150,30 @@ mod tests {
             panic!("hermes drives the acp lane")
         };
         assert!(!prefer_load);
+    }
+
+    #[test]
+    fn stored_usage_is_declared_separately_from_transcript_records() {
+        let usage = stored_usage();
+        assert!(AGENT.history.iter().any(|root| root.kind == usage.root));
+        assert_eq!(usage.file_names, ["state.db"]);
+        assert_eq!(usage.sessions.requests.as_deref(), Some("api_call_count"));
+        assert_eq!(usage.details.requests.as_deref(), Some("api_call_count"));
+        assert!(usage
+            .coverage
+            .included
+            .iter()
+            .any(|task| task == "voice_chat"));
+        assert!(usage
+            .coverage
+            .additional
+            .iter()
+            .any(|task| task == "compression"));
+        assert!(!usage
+            .coverage
+            .additional
+            .iter()
+            .any(|task| task.starts_with("moa_")));
+        assert!(AGENT.usage.transcript.is_none());
     }
 }

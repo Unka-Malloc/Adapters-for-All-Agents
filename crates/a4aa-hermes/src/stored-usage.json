@@ -1,0 +1,65 @@
+{
+  "root": "hermes-profile-store",
+  "fileNames": ["state.db"],
+  "sessions": {
+    "table": "sessions",
+    "id": "id",
+    "model": "model",
+    "startedAt": "started_at",
+    "endedAt": "ended_at",
+    "requests": "api_call_count",
+    "tokens": {
+      "input": "input_tokens",
+      "output": "output_tokens",
+      "cacheRead": "cache_read_tokens",
+      "cacheWrite": "cache_write_tokens"
+    }
+  },
+  "details": {
+    "table": "session_model_usage",
+    "session": "session_id",
+    "model": "model",
+    "task": "task",
+    "firstSeen": "first_seen",
+    "lastSeen": "last_seen",
+    "requests": "api_call_count",
+    "tokens": {
+      "input": "input_tokens",
+      "output": "output_tokens",
+      "cacheRead": "cache_read_tokens",
+      "cacheWrite": "cache_write_tokens"
+    }
+  },
+  "activity": {
+    "table": "messages",
+    "session": "session_id",
+    "timestamp": "timestamp"
+  },
+  "inputAccounting": "excludes-cache",
+  "coverage": {
+    "included": ["", "voice_chat"],
+    "additional": [
+      "approval",
+      "background_review",
+      "call",
+      "compression",
+      "curator",
+      "goal_judge",
+      "image_generation",
+      "kanban_decomposer",
+      "kanban_estimator",
+      "mcp",
+      "memory_query_rewrite",
+      "monitor",
+      "profile_describer",
+      "session_search",
+      "skills_hub",
+      "title_generation",
+      "triage_specifier",
+      "tts_audio_tags",
+      "vision",
+      "web_extract"
+    ]
+  },
+  "unknownModels": ["unknown"]
+}

@@ -176,12 +176,22 @@ dependencies = [
 name = "acop"
 version = "0.1.2"
 dependencies = [
+ "acop-usage-core",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "acop-usage-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
