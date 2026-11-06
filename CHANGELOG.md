@@ -59,6 +59,13 @@ crates together.
   terminates custody-spawned agents.
 - `a4aa-hermes` declares the Hermes profile store's SQLite usage surface
   (`stored_usage()`), separate from transcript records.
+- Restore `a4aa-copilot`, published at 0.4.1 but missing from this line:
+  the GitHub Copilot card (ACP primary `copilot --acp --stdio
+  --no-auto-update`, CLI `-p` JSONL alternate), its dialect and native
+  table rejoin the 0.5.0 family and `a4aa-dialects`. The hook store now
+  resolves through AHE's copilot harness and stays declared unadapted.
+- Add `skills/sdk` and `skills/sidecar`: agent-facing guidance for the
+  embedded-crate and `a4aa serve` integration modes.
 - Add `enforced_permission` to `LaneSpec::Acp` (and `AcpLane`): a
   permission preset the spec's own configuration already enforces — a
   patch or injected config that locks the agent's mutation surface —

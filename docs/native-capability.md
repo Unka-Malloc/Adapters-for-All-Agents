@@ -21,9 +21,6 @@ Cell vocabulary (matches `a4aa::NativeStatus` kebab-case):
 
 Capability ordering for interaction surfaces: Serve > SDK > ACP/RPC > CLI.
 
-Copilot is not in this table: there is no `a4aa-copilot` crate. Its
-installed `copilot --acp` surface is native but unowned here.
-
 ## Interaction surfaces
 
 | Agent | last_verified | serve | sdk | acp | rpc | cli | pty |
@@ -32,6 +29,7 @@ installed `copilot --acp` surface is native but unowned here.
 | claude | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
 | codex | 2026-10-24 | not-offered | not-offered | not-offered | native | native | native |
 | commandcode | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
+| copilot | 2026-10-25 | not-offered | unadapted | native | not-offered | native | native |
 | cursor | 2026-10-21 | not-offered | not-offered | not-offered | not-offered | native | native |
 | devin | 2026-10-21 | not-offered | not-offered | native | not-offered | native | native |
 | dsh | 2026-10-26 | not-offered | native | native | native | not-offered | native |
@@ -53,6 +51,7 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | claude | cli | `claude --print` stream-json | vendored `claude-agent-acp` dropped |
 | codex | rpc | `codex app-server --stdio` | vendored `codex-acp` dropped; host MCP servers installed with `-c mcp_servers.*` |
 | commandcode | cli | `command-code --print --output-format json` | no ACP/SDK/serve |
+| copilot | acp | `copilot --acp --stdio --no-auto-update` | CLI `-p` JSONL is an alternate |
 | cursor | cli | `cursor-agent --print` stream-json | no acp subcommand |
 | devin | acp | `devin acp` | CLI `-p` is an alternate |
 | dsh | rpc (sdk) | `dsh --profile sdk` | capability order ranks SDK above ACP; `dsh acp` is the ordered alternate with durable resume/cancel/streaming |
@@ -74,6 +73,7 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | claude | 2026-10-21 | config-key | `.mcp.json mcpServers` (project, not adapted) | `{home}/.claude/settings.json` | `{home}/.claude/settings.json hooks` | `{home}/.claude/settings.json permissions.defaultMode` | — |
 | codex | 2026-10-24 | config-key | `codex app-server -c mcp_servers.<name>.{command,args,env_vars}`; `default_tools_approval_mode` only for servers named in `mcpConfig.toolsApprovalServers`; config.toml `[mcp_servers]` | `{home}/.codex/config.toml` | `{home}/.codex/hooks.json` | sandbox flags | `model/list` |
 | commandcode | 2026-10-21 | unsupported | `McpSurface::None` | `{home}/.commandcode/config.json` | `{home}/.commandcode/settings.json hooks` | `--permission-mode` | `command-code --list-models` |
+| copilot | 2026-10-25 | config-key | `.copilot/mcp-config.json mcpServers`; `--additional-mcp-config` per session | `{home}/.copilot/settings.json` | `{home}/.copilot/hooks/*.json — {version:1,hooks:{Event:[{type,bash,timeoutSec}]}}, unadapted` | flag-based, not a selector | — |
 | cursor | 2026-10-21 | config-key | `.cursor/mcp.json mcpServers` | `{home}/.cursor/cli-config.json` | `{home}/.cursor/hooks.json` | `{home}/.cursor/cli-config.json permissions` | model-id suffix |
 | devin | 2026-10-21 | config-key | `.config/devin/mcp_config.json mcpServers` | `{home}/.config/devin/config.json` | `{home}/.config/devin/config.json hooks` | `--permission-mode` | `devin models` |
 | dsh | 2026-10-26 | unsupported | `McpSurface::None` | `{home}/.dsh/.credentials.yaml` | — | — | ACP `session/new` configOptions; Command Code route provisioned by `a4aa-dsh mount` |
@@ -95,6 +95,7 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 | claude | 2026-10-21 | native | native | native | native | native | native | native | native | native | native | native | not-offered |
 | codex | 2026-10-24 | native | native | native | native | native | native | native | native | native | native | native | not-offered |
 | commandcode | 2026-10-21 | native | native | native | native | native | native | native | native | native | native | not-offered | not-offered |
+| copilot | 2026-10-25 | native | native | native | native | native | native | native | not-offered | native | unadapted | native | native |
 | cursor | 2026-10-21 | native | native | native | native | native | native | native | not-offered | native | native | native | not-offered |
 | devin | 2026-10-21 | native | not-offered | native | native | native | native | native | native | native | native | native | not-offered |
 | dsh | 2026-10-26 | native | native | native | native | native | native | native | not-offered | native | not-offered | not-offered | not-offered |
@@ -111,14 +112,14 @@ Primary lane on each card (capability-ordered, plugin surfaces dropped):
 ## Remaining native-lane audit
 
 Recorded 2026-10-21 against each dialect crate's `NATIVE` table and the
-installed binaries named in those tables. Copilot has no crate here.
+installed binaries named in those tables.
 
 | Agent | Card primary | Native surfaces | Missing native surface | Plugin / external adapter | Verdict |
 | --- | --- | --- | --- | --- | --- |
 | grok | acp (`grok agent` stdio) | acp, cli (`grok -p` streaming-json), pty | none | none | keep; CLI is the ordered alternate |
 | openclaw | cli (`openclaw agent exec --json`) | cli, acp (Gateway), pty | Gateway serve (unadapted) | none; Gateway ACP is first-party | keep exec primary; adapt Gateway serve later |
 | open-claw | same crate as openclaw (`a4aa-open-claw`, id `openclaw`) | same | same | same | same |
-| copilot | unowned — there is no `a4aa-copilot` crate | installed `copilot --acp` is native on the host | crate and card missing | none owned here | unowned; do not claim adapted |
+| copilot | acp (`copilot --acp --stdio --no-auto-update`) | acp, cli (`-p` JSONL), pty | hook store `~/.copilot/hooks` (bash-field shape) | none | keep; CLI is the ordered alternate |
 | devin | acp (`devin acp`) | acp, cli (`devin -p`), pty | none | none | keep; CLI is an alternate |
 | hermes | acp (`hermes acp`) | acp, pty | no headless print CLI; resume not offered | none | keep; print/resume are not-offered, not unadapted |
 | kimi | acp (`kimi acp`; crate id `kimicode`) | acp, cli (`kimi -p` stream-json), pty | none | none | keep; CLI is the ordered alternate |
