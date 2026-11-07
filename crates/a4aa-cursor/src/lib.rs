@@ -205,6 +205,26 @@ pub const AGENT: AgentCard = AgentCard {
             kind: "cursor-global-storage",
             store: StoreKind::Directory,
         },
+        HistoryRoot {
+            path: "{appdata}/Cursor/User/workspaceStorage",
+            kind: "cursor-workspace-storage",
+            store: StoreKind::Directory,
+        },
+        HistoryRoot {
+            path: "{appdata}/Cursor/User/globalStorage",
+            kind: "cursor-global-storage",
+            store: StoreKind::Directory,
+        },
+        HistoryRoot {
+            path: "{xdg_config}/Cursor/User/workspaceStorage",
+            kind: "cursor-workspace-storage",
+            store: StoreKind::Directory,
+        },
+        HistoryRoot {
+            path: "{xdg_config}/Cursor/User/globalStorage",
+            kind: "cursor-global-storage",
+            store: StoreKind::Directory,
+        },
     ],
 };
 
@@ -255,6 +275,19 @@ mod card_tests {
         assert_eq!(cli.session_id_path.as_deref(), Some("session_id"));
         assert!(cli.capabilities().session_resume);
         assert!(cli.capabilities().cancellation);
+    }
+
+    #[test]
+    fn history_declares_the_ide_stores_under_every_platform_home() {
+        for kind in ["cursor-workspace-storage", "cursor-global-storage"] {
+            let homes: Vec<_> = AGENT
+                .history
+                .iter()
+                .filter(|root| root.kind == kind)
+                .map(|root| root.path.split('/').next().unwrap())
+                .collect();
+            assert_eq!(homes, ["{home}", "{appdata}", "{xdg_config}"], "{kind}");
+        }
     }
 
     #[test]
