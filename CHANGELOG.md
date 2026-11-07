@@ -1,11 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Resolve `ahe`, `acop` and `token-usage-detector` from crates.io instead
+  of sibling checkouts; a fresh clone builds and verifies on its own.
+
 ## 0.5.0
 
-Unreleased. Breaking relative to the published 0.4.x line: hook
+Published 2026-11-07. Breaking relative to the published 0.4.x line: hook
 installation and usage detection moved to their owning crates, the
-conversation-context dependency is renamed `acop` and resolved from the
-`../ACOP` sibling, `TranscriptUsage` gains a required `temporality`
+conversation-context dependency is renamed `acop`, `TranscriptUsage` gains a required `temporality`
 field, and `LaneSpec::Acp`, `AgentSpec` and `FeatureSurface` gain fields
 — the whole a4aa-* family moves to 0.5.0 in lockstep; update dependent
 crates together.
@@ -26,8 +30,6 @@ crates together.
   `acop` crate (repository `Unka-Malloc/Agent-Context-Operators`), and
   the card types — `HistoryRoot`, `StoreKind`, `TranscriptUsage`,
   `UsageTemporality`, `SqliteUsageSpec` — re-export through `a4aa::card`.
-  The path dependency resolves `../ACOP/crates/acop`; clone
-  `Unka-Malloc/Agent-Context-Operators` beside this checkout.
 - `TranscriptUsage` gains `temporality: UsageTemporality`: each card
   declares whether its persisted counters are per-record `Delta`s (all
   current cards) or `Cumulative` totals. Struct literals in dependent

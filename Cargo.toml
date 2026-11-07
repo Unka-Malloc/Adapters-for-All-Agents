@@ -26,10 +26,10 @@ name = "a4aa"
 path = "src/bin/a4aa.rs"
 
 [dependencies]
-ahe = { path = "../Hook-Engine/crates/ahe", version = "0.1.3" }
+ahe = "0.1.3"
 # Agent Context Operators: produced-artifact operators (search, export,
 # transform, import, edit, snapshot) re-exported as `a4aa::context`.
-acop = { path = "../ACOP/crates/acop", version = "0.2.0" }
+acop = "0.2.0"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,7 +58,7 @@ agent-client-protocol = { version = "3.3.0", features = ["unstable_end_turn_toke
 # Cross-platform supervised process trees (process groups on Unix, Job
 # Objects on Windows) with a tokio-facing child handle.
 command-group = { version = "5.0.1", features = ["with-tokio"] }
-token-usage-detector = { version = "0.2.1", path = "../Metera/crates/token-usage-detector" }
+token-usage-detector = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

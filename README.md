@@ -155,14 +155,10 @@ fail closed to `cancelled`. The full method table is
 scripts/verify.sh   # fmt + clippy + cargo test --all-targets
 ```
 
-The workspace builds against three sibling checkouts — Cargo path
-dependencies resolve to `../Hook-Engine` (the
-`Unka-Malloc/Agent-Hook-Engine` repository, providing `ahe`), `../ACOP`
-(the `Unka-Malloc/Agent-Context-Operators` repository, providing `acop`)
-and `../Metera` (the `Unka-Malloc/Metera` repository, providing
-`token-usage-detector`)
-at the versions `Cargo.toml` declares. Clone them beside this checkout
-before building.
+The sibling crates `ahe` (`Unka-Malloc/Agent-Hook-Engine`), `acop`
+(`Unka-Malloc/Agent-Context-Operators`) and `token-usage-detector`
+(`Unka-Malloc/Metera`) resolve from crates.io at the versions
+`Cargo.toml` declares; no sibling checkout is needed.
 
 ## Status
 

@@ -68,14 +68,12 @@ policy is confined to the inert allowlist plus resolved literals.
 
 `scripts/verify.sh` — fmt + clippy + tests across the workspace.
 
-The workspace builds against three sibling checkouts — Cargo path
-dependencies resolve them at the versions `Cargo.toml` declares:
+The workspace depends on three crates from sibling repositories, resolved
+from crates.io at the versions `Cargo.toml` declares; a fresh clone builds
+on its own:
 
-| Path | Repository | Provides |
-| --- | --- | --- |
-| `../Hook-Engine` | `Unka-Malloc/Agent-Hook-Engine` | `ahe` |
-| `../ACOP` | `Unka-Malloc/Agent-Context-Operators` | `acop` |
-| `../Metera` | `Unka-Malloc/Metera` | `token-usage-detector` |
-
-Clone them beside this repository before building; a fresh clone without
-them cannot compile.
+| Crate | Repository |
+| --- | --- |
+| `ahe` | `Unka-Malloc/Agent-Hook-Engine` |
+| `acop` | `Unka-Malloc/Agent-Context-Operators` |
+| `token-usage-detector` | `Unka-Malloc/Metera` |
