@@ -202,6 +202,12 @@ async fn apply_set(
 mod tests {
     use super::*;
 
+    // Synthetic secret references and resolved value: plain words, no
+    // credential shape.
+    const MISSING_REF: &str = "missing-ref";
+    const STORED_REF: &str = "stored-ref";
+    const RESOLVED_VALUE: &str = "resolved-value";
+
     struct Resolver(Option<String>);
     #[async_trait::async_trait]
     impl SecretResolver for Resolver {
@@ -349,7 +355,7 @@ mod tests {
         set.insert(
             "AGENT_TOKEN".to_owned(),
             EnvValue::Source(EnvSource::Secret {
-                secret: "missing-ref".into(),
+                secret: MISSING_REF.into(),
             }),
         );
         let policy = EnvPolicy::Sanitized {
@@ -368,16 +374,20 @@ mod tests {
         set.insert(
             "AGENT_TOKEN".to_owned(),
             EnvValue::Source(EnvSource::Secret {
-                secret: "token-ref".into(),
+                secret: STORED_REF.into(),
             }),
         );
         let policy = EnvPolicy::Sanitized {
             inherit: Vec::new(),
             set,
         };
-        let resolved = resolve(&policy, &BTreeMap::new(), &Resolver(Some("s3cr3t".into())))
-            .await
-            .unwrap();
-        assert_eq!(resolved.get("AGENT_TOKEN").unwrap(), "s3cr3t");
+        let resolved = resolve(
+            &policy,
+            &BTreeMap::new(),
+            &Resolver(Some(RESOLVED_VALUE.into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.get("AGENT_TOKEN").unwrap(), RESOLVED_VALUE);
     }
 }

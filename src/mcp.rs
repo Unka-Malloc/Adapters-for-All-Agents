@@ -344,13 +344,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const ENV_VARS_FIELD: &str = "env_vars";
+    const APPROVAL_MODE_FIELD: &str = "default_tools_approval_mode";
+
     fn config() -> RpcMcpConfig {
         RpcMcpConfig {
             flag: "-c".into(),
             root: "mcp_servers".into(),
-            env_vars_key: "env_vars".into(),
+            env_vars_key: ENV_VARS_FIELD.into(),
             tools_approval: None,
             tools_approval_servers: Vec::new(),
+        }
+    }
+
+    fn approval() -> crate::model::RpcMcpToolApproval {
+        crate::model::RpcMcpToolApproval {
+            key: APPROVAL_MODE_FIELD.into(),
+            value: "approve".into(),
         }
     }
 
@@ -363,10 +373,7 @@ mod tests {
         })])
         .unwrap();
         let mut config = config();
-        config.tools_approval = Some(crate::model::RpcMcpToolApproval {
-            key: "default_tools_approval_mode".into(),
-            value: "approve".into(),
-        });
+        config.tools_approval = Some(approval());
         config.tools_approval_servers = vec!["host-tools".into()];
         let installed = install(&config, &servers).unwrap();
         assert_eq!(
@@ -488,10 +495,7 @@ mod tests {
         ])
         .unwrap();
         let mut config = config();
-        config.tools_approval = Some(crate::model::RpcMcpToolApproval {
-            key: "default_tools_approval_mode".into(),
-            value: "approve".into(),
-        });
+        config.tools_approval = Some(approval());
         config.tools_approval_servers = vec!["trusted".into()];
         let installed = install(&config, &servers).unwrap();
         let approval: Vec<&String> = installed
@@ -515,10 +519,7 @@ mod tests {
         })])
         .unwrap();
         let mut config = config();
-        config.tools_approval = Some(crate::model::RpcMcpToolApproval {
-            key: "default_tools_approval_mode".into(),
-            value: "approve".into(),
-        });
+        config.tools_approval = Some(approval());
         let installed = install(&config, &servers).unwrap();
         assert!(
             installed
@@ -541,10 +542,7 @@ mod tests {
         config.tools_approval_servers = vec!["host-tools".into()];
         let error = install(&config, &servers).expect_err("a named approval needs its key");
         assert_eq!(error.code, "agent_mcp_server_invalid", "{error}");
-        config.tools_approval = Some(crate::model::RpcMcpToolApproval {
-            key: "default_tools_approval_mode".into(),
-            value: "approve".into(),
-        });
+        config.tools_approval = Some(approval());
         config.tools_approval_servers = vec!["bad name".into()];
         let error = install(&config, &servers).expect_err("approval names are validated");
         assert_eq!(error.code, "agent_mcp_server_invalid", "{error}");
@@ -557,11 +555,11 @@ mod tests {
             json!({"name": "blank-name", "command": "/bin/agent", "env": {"  ": "x"}}),
             json!({"name": "equals", "command": "/bin/agent", "env": [{"name": "BAD=NAME", "value": "x"}]}),
             json!({"name": "nul-name", "command": "/bin/agent", "env": [{"name": "BAD\u{0}NAME", "value": "x"}]}),
-            json!({"name": "nul-value", "command": "/bin/agent", "env": [{"name": "TOKEN", "value": "bad\u{0}value"}]}),
+            json!({"name": "nul-value", "command": "/bin/agent", "env": [{"name": "PLAIN", "value": "bad\u{0}value"}]}),
             // The profile object shape goes through the same validation.
             json!({"name": "object-equals", "command": "/bin/agent", "env": {"BAD=NAME": "x"}}),
             json!({"name": "object-nul-name", "command": "/bin/agent", "env": {"BAD\u{0}NAME": "x"}}),
-            json!({"name": "object-nul-value", "command": "/bin/agent", "env": {"TOKEN": "bad\u{0}value"}}),
+            json!({"name": "object-nul-value", "command": "/bin/agent", "env": {"PLAIN": "bad\u{0}value"}}),
         ] {
             let error = McpServer::from_value(&invalid)
                 .expect_err("malformed environment entries must be refused");

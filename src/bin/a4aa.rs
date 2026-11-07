@@ -1184,7 +1184,7 @@ mod tests {
         }
         assert!(!env_source_admitted_over_sidecar(
             &a4aa::EnvSource::Secret {
-                secret: "any".into()
+                secret: String::from("any-ref")
             }
         ));
     }

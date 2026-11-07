@@ -10,13 +10,16 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
+const ENV_VARS_FIELD: &str = "env_vars";
+const APPROVAL_MODE_FIELD: &str = "default_tools_approval_mode";
+
 fn config() -> RpcMcpConfig {
     RpcMcpConfig {
         flag: "-c".into(),
         root: "mcp_servers".into(),
-        env_vars_key: "env_vars".into(),
+        env_vars_key: ENV_VARS_FIELD.into(),
         tools_approval: Some(a4aa::RpcMcpToolApproval {
-            key: "default_tools_approval_mode".into(),
+            key: APPROVAL_MODE_FIELD.into(),
             value: "approve".into(),
         }),
         tools_approval_servers: vec!["probe".into()],
@@ -260,11 +263,11 @@ async fn environment_entries_command_envs_would_panic_on_are_refused_before_spaw
         ),
         (
             "array value with NUL",
-            json!([{"name": "TOKEN", "value": "bad\u{0}value"}]),
+            json!([{"name": "PLAIN", "value": "bad\u{0}value"}]),
         ),
         ("object name with `=`", json!({"BAD=NAME": "x"})),
         ("object name with NUL", json!({"BAD\u{0}NAME": "x"})),
-        ("object value with NUL", json!({"TOKEN": "bad\u{0}value"})),
+        ("object value with NUL", json!({"PLAIN": "bad\u{0}value"})),
         ("object empty name", json!({"": "x"})),
     ] {
         let directory = tempfile::tempdir().unwrap();
