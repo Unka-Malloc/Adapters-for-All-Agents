@@ -53,7 +53,11 @@ crates together.
   validated like any requested mode.
 - Add `a4aa::route`: resolve a provider's model route (catalog, endpoint,
   credential) from the installed supplier configuration, and probe its
-  reachability.
+  reachability. An endpoint comes only from declarations bound to the
+  provider (its own profile patch, catalog, plugin or the adapter package
+  that plugin imports); the probe attaches a credential only over `https`
+  or loopback `http`, follows no redirects, and `Debug` redacts
+  credentials.
 - Drop foreign `*_EXT_HOST_PID` bindings from verbatim environment
   inheritance, so an unrelated editor extension-host restart no longer
   terminates custody-spawned agents.
