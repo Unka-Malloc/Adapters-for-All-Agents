@@ -671,11 +671,12 @@ pub struct FeatureSurface {
     pub permission_modes: &'static [&'static str],
     /// Mode applied when the host selects none.
     pub permission_default: Option<&'static str>,
-    /// The permission preset the agent projects when the host process is
-    /// already inside an OS sandbox that refuses a nested apply — the mode
-    /// whose own confinement is "inherit the ambient sandbox" (for example
-    /// codex's `danger-full-access`, which applies no seatbelt profile of
-    /// its own). `None` where the agent's presets never self-sandbox.
+    /// The preset whose own confinement is "inherit the ambient sandbox"
+    /// (for example codex's `danger-full-access`, which applies no seatbelt
+    /// profile of its own). Inside an OS sandbox that refuses a nested
+    /// apply, every other requested preset is refused as unenforceable and
+    /// only an explicit request for this one launches. `None` where the
+    /// agent's presets never self-sandbox.
     pub seatbelted_permission: Option<&'static str>,
     /// Prompt attachments the agent accepts.
     pub attachments: AttachmentSupport,

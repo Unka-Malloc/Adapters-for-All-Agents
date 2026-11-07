@@ -47,10 +47,12 @@ crates together.
   `protocol_selector` (evidence-pinned lane selection) and an SSH
   transport.
 - Add `seatbelted_permission` to `AgentSpec` and the card's
-  `FeatureSurface`: when the host already runs inside a restrictive OS
-  sandbox, a requested preset that would apply a nested sandbox is
-  swapped for the declared inherit-the-ambient-sandbox preset, then
-  validated like any requested mode.
+  `FeatureSurface`: the preset whose confinement is "inherit the ambient
+  sandbox". When the host already runs inside an OS sandbox that refuses
+  a nested apply, any other requested preset is refused with
+  `agent_permission_unenforceable` instead of being widened; the host
+  requests the declared preset explicitly to run under the ambient
+  sandbox only.
 - Add `a4aa::route`: resolve a provider's model route (catalog, endpoint,
   credential) from the installed supplier configuration, and probe its
   reachability. An endpoint comes only from declarations bound to the

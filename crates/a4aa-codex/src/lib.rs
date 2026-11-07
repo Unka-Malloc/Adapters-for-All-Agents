@@ -331,7 +331,8 @@ mod tests {
         assert_eq!(spec.command.program, "codex");
         // Every preset `read-only`/`workspace-write` self-applies a seatbelt
         // profile, which fails inside an already-sandboxed host process; the
-        // spec declares the inherit-ambient mode for that environment.
+        // spec names the inherit-ambient mode a host may request explicitly
+        // there.
         assert_eq!(
             spec.seatbelted_permission.as_deref(),
             Some("danger-full-access")

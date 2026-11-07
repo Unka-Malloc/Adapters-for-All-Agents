@@ -346,29 +346,41 @@ fn validate_session_config(spec: &AgentSpec, request: &SessionRequest) -> Result
 
 /// When the host process is already inside an OS sandbox that refuses a
 /// nested apply, a preset that makes the agent apply a sandbox profile of
-/// its own can never launch — `sandbox_apply` answers EPERM on macOS. A
-/// spec declaring `seatbelted_permission` swaps in the preset whose
-/// confinement is "inherit the ambient sandbox"; the substituted value
-/// then faces the same allowlist validation as any requested mode.
-fn project_seatbelted_permission(spec: &AgentSpec, config: &mut SessionConfig) {
-    project_seatbelted_permission_when(spec, config, crate::hostenv::restrictive_seatbelt());
+/// its own can never launch — `sandbox_apply` answers EPERM on macOS. The
+/// requested confinement is then unenforceable, and the session is refused
+/// with `agent_permission_unenforceable` rather than silently widened: the
+/// spec's `seatbelted_permission` (the preset whose confinement is "inherit
+/// the ambient sandbox") is admitted only when the host requests it
+/// explicitly.
+fn check_seatbelted_permission(
+    spec: &AgentSpec,
+    config: &SessionConfig,
+) -> Result<(), AdapterError> {
+    check_seatbelted_permission_when(spec, config, crate::hostenv::restrictive_seatbelt())
 }
 
-fn project_seatbelted_permission_when(
+fn check_seatbelted_permission_when(
     spec: &AgentSpec,
-    config: &mut SessionConfig,
+    config: &SessionConfig,
     seatbelted: bool,
-) {
-    let Some(fallback) = &spec.seatbelted_permission else {
-        return;
+) -> Result<(), AdapterError> {
+    let Some(inherit) = &spec.seatbelted_permission else {
+        return Ok(());
     };
-    if config.permission.is_none() || config.permission.as_deref() == Some(fallback) {
-        return;
+    let Some(requested) = config.permission.as_deref() else {
+        return Ok(());
+    };
+    if !seatbelted || requested == inherit {
+        return Ok(());
     }
-    if !seatbelted {
-        return;
-    }
-    config.permission = Some(fallback.clone());
+    Err(
+        AdapterError::permanent("agent_permission_unenforceable", "session/configuration")
+            .with_detail(format!(
+                "the host process is inside an OS sandbox that refuses a nested apply, so \
+                 `{requested}` cannot be enforced; request `{inherit}` explicitly to run \
+                 under the ambient sandbox only"
+            )),
+    )
 }
 
 fn validate_session_selector(
@@ -494,11 +506,11 @@ impl Adapter {
     /// `events`.
     pub async fn open_session(
         &self,
-        mut request: SessionRequest,
+        request: SessionRequest,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<AgentSession, AdapterError> {
-        project_seatbelted_permission(&self.spec, &mut request.config);
         validate_session_config(&self.spec, &request)?;
+        check_seatbelted_permission(&self.spec, &request.config)?;
         if request
             .resume
             .as_deref()
@@ -649,7 +661,7 @@ impl Adapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{project_seatbelted_permission_when, AgentSpec, LaneSpec, SessionConfig};
+    use super::{check_seatbelted_permission_when, AgentSpec, LaneSpec, SessionConfig};
     use crate::env::EnvPolicy;
     use crate::model::CommandSpec;
 
@@ -674,34 +686,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_inherited_sandbox_projects_the_declared_fallback_preset() {
-        let mut config = SessionConfig {
-            permission: Some("read-only".to_owned()),
+    fn requesting(permission: Option<&str>) -> SessionConfig {
+        SessionConfig {
+            permission: permission.map(str::to_owned),
             ..SessionConfig::default()
-        };
-        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut config, true);
-        assert_eq!(config.permission.as_deref(), Some("danger-full-access"));
+        }
+    }
+
+    #[test]
+    fn an_inherited_sandbox_refuses_a_preset_it_cannot_enforce() {
+        for requested in ["read-only", "workspace-write"] {
+            let error = check_seatbelted_permission_when(
+                &spec(Some("danger-full-access")),
+                &requesting(Some(requested)),
+                true,
+            )
+            .expect_err("an unenforceable preset must never be widened silently");
+            assert_eq!(error.code, "agent_permission_unenforceable");
+            assert!(!error.retryable);
+            let detail = error.detail.unwrap();
+            assert!(detail.contains(requested), "{detail}");
+            assert!(detail.contains("danger-full-access"), "{detail}");
+        }
     }
 
     #[test]
     fn without_an_inherited_sandbox_the_preset_reaches_the_lane_verbatim() {
-        let mut config = SessionConfig {
-            permission: Some("read-only".to_owned()),
-            ..SessionConfig::default()
-        };
-        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut config, false);
-        assert_eq!(config.permission.as_deref(), Some("read-only"));
+        for requested in ["read-only", "workspace-write"] {
+            check_seatbelted_permission_when(
+                &spec(Some("danger-full-access")),
+                &requesting(Some(requested)),
+                false,
+            )
+            .unwrap();
+        }
     }
 
     #[test]
-    fn a_spec_without_a_fallback_keeps_the_requested_preset() {
-        let mut config = SessionConfig {
-            permission: Some("read-only".to_owned()),
-            ..SessionConfig::default()
-        };
-        project_seatbelted_permission_when(&spec(None), &mut config, true);
-        assert_eq!(config.permission.as_deref(), Some("read-only"));
+    fn a_spec_without_an_inherit_preset_is_not_judged() {
+        check_seatbelted_permission_when(&spec(None), &requesting(Some("read-only")), true)
+            .unwrap();
     }
 
     #[test]
@@ -723,15 +747,10 @@ mod tests {
     }
 
     #[test]
-    fn unset_permission_and_already_fallback_values_stay_untouched() {
-        let mut unset = SessionConfig::default();
-        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut unset, true);
-        assert!(unset.permission.is_none());
-        let mut settled = SessionConfig {
-            permission: Some("danger-full-access".to_owned()),
-            ..SessionConfig::default()
-        };
-        project_seatbelted_permission_when(&spec(Some("danger-full-access")), &mut settled, true);
-        assert_eq!(settled.permission.as_deref(), Some("danger-full-access"));
+    fn an_explicit_inherit_request_or_no_request_is_admitted() {
+        let spec = spec(Some("danger-full-access"));
+        check_seatbelted_permission_when(&spec, &requesting(None), true).unwrap();
+        check_seatbelted_permission_when(&spec, &requesting(Some("danger-full-access")), true)
+            .unwrap();
     }
 }

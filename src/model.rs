@@ -554,11 +554,13 @@ pub struct AgentSpec {
     /// Per-turn output cap; `None` is unbounded.
     #[serde(default)]
     pub max_output_bytes: Option<usize>,
-    /// The permission preset this agent projects when the host process is
-    /// already inside an OS sandbox that refuses a nested apply — the mode
-    /// whose own confinement is "inherit the ambient sandbox". Agents whose
-    /// presets never self-sandbox leave it unset; a requested preset then
-    /// still reaches the lane verbatim.
+    /// The preset whose own confinement is "inherit the ambient sandbox".
+    /// When the host process is inside an OS sandbox that refuses a nested
+    /// apply, any other requested preset is refused with
+    /// `agent_permission_unenforceable` — never widened — and the host may
+    /// request this preset explicitly. Agents whose presets never
+    /// self-sandbox leave it unset; a requested preset then reaches the lane
+    /// verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seatbelted_permission: Option<String>,
 }
