@@ -745,6 +745,18 @@ impl CliLane {
                     },
                 );
             }
+            if crate::error::session_not_found_refusal(&haystack) {
+                let detail = tail
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::trim)
+                    .unwrap_or("child exited non-zero");
+                return Err(
+                    AdapterError::permanent("agent_session_not_found", "cli/turn")
+                        .with_detail(detail.to_string()),
+                );
+            }
         }
         Ok(TurnOutcome {
             // `ExitStatus::code()` is `None` when a signal killed the child;

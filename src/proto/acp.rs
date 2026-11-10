@@ -1520,6 +1520,13 @@ fn protocol_failure(
             AdapterError::retryable("agent_quota_exhausted", stage).with_detail(error.to_string())
         };
     }
+    // A stale session binding refused at establishment is definitive —
+    // the named session is gone from the agent's store and the remedy is
+    // a fresh open, not another candidate carrying the same address.
+    if crate::error::session_not_found_refusal(&error.to_string()) {
+        return AdapterError::permanent("agent_session_not_found", stage)
+            .with_detail(error.to_string());
+    }
     if error.code == agent_client_protocol::ErrorCode::AuthRequired {
         AdapterError::retryable("agent_auth_required", stage).with_detail(error.to_string())
     } else {
@@ -1750,6 +1757,21 @@ mod protocol_failure_tests {
         );
         assert_eq!(mapped.code, "agent_protocol_failed");
         assert!(mapped.uncertain_effect);
+    }
+
+    #[test]
+    fn a_stale_session_binding_is_a_typed_permanent_refusal() {
+        // `session/load` answered with an unknown id: the address, not
+        // the candidate, failed — custody downgrades the same candidate
+        // to a fresh open, so the refusal stays certain and permanent.
+        let mapped = protocol_failure(
+            "session/load",
+            agent_client_protocol::Error::new(-32603, "Session not found"),
+            false,
+        );
+        assert_eq!(mapped.code, "agent_session_not_found");
+        assert!(!mapped.retryable);
+        assert!(!mapped.uncertain_effect);
     }
 
     #[tokio::test]

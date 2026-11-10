@@ -112,4 +112,29 @@ pub(crate) fn quota_or_capacity_refusal(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// Whether agent output or a protocol error names a missing or stale
+/// session binding — the durable id the host resumed against no longer
+/// exists in the agent's session store. A stale binding is a definitive
+/// non-effect: nothing ran, and the remedy is a fresh open rather than
+/// another candidate, so callers map it with `AdapterError::permanent`.
+/// The needles match the refusal text vendors actually print for unknown
+/// or expired session ids.
+pub(crate) fn session_not_found_refusal(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "session not found",
+        "session_not_found",
+        "no such session",
+        "unknown session",
+        "unknown_session",
+        "session does not exist",
+        "stale session",
+        "session expired",
+        "thread not found",
+        "conversation not found",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 pub type Result<T> = std::result::Result<T, AdapterError>;

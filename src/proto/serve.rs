@@ -175,6 +175,12 @@ fn parse_response(raw: &[u8]) -> Result<Value, AdapterError> {
                     .with_detail(detail),
             );
         }
+        if crate::error::session_not_found_refusal(&text) {
+            return Err(
+                AdapterError::permanent("agent_session_not_found", "session/transport")
+                    .with_detail(detail),
+            );
+        }
         return Err(
             AdapterError::permanent("agent_protocol_failed", "session/transport")
                 .with_detail(detail),

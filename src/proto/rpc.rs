@@ -1228,6 +1228,10 @@ fn call_failure(failure: CallFailure, served: bool) -> AdapterError {
                 AdapterError::retryable("agent_quota_exhausted", "rpc/call").with_detail(detail)
             }
         }
+        CallFailure::Remote(error) if crate::error::session_not_found_refusal(&error.message) => {
+            AdapterError::permanent("agent_session_not_found", "rpc/call")
+                .with_detail(format!("{} ({})", error.message, error.code))
+        }
         CallFailure::Remote(error) => AdapterError::permanent("agent_remote_error", "rpc/call")
             .with_detail(format!("{} ({})", error.message, error.code)),
         CallFailure::Transport(reason) => {
